@@ -39,7 +39,9 @@ class CreatePayrollInput(OpenIMISMutation.Input):
         REJECTED = PayrollStatus.REJECTED
         RECONCILED = PayrollStatus.RECONCILED
 
-    name = graphene.String(required=True, max_length=255)
+    # Names are generated server-side when omitted. Keeping this optional also
+    # preserves API clients that supply a business-specific name themselves.
+    name = graphene.String(required=False, max_length=255)
     payment_plan_id = graphene.UUID(required=True)
     payment_point_id = graphene.UUID(required=False)
     payment_cycle_id = graphene.UUID(required=False)
