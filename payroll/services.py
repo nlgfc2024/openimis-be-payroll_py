@@ -190,7 +190,7 @@ class PayrollService(BaseService):
         json_ext = obj_data.get("json_ext") or {}
         project_ids = json_ext.get("filter_criteria", {}).get("project_ids", [])
         if not project_ids:
-            raise ValidationError("At least one project must be selected for a payroll.")
+            return ["ALL"]
 
         project_model = apps.get_model("project_social_protection", "Project")
         project_names = list(
