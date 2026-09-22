@@ -203,14 +203,13 @@ class PayrollService(BaseService):
         return project_names
 
     def _generate_payroll_name(self, payment_plan, payment_cycle, project_names):
-        sequence = 1
-        while True:
+        for sequence in range(1, PayrollNameGenerator.GENERATION_ATTEMPTS + 1):
             name = PayrollNameGenerator.generate(
                 payment_plan, payment_cycle, project_names, sequence
             )
             if not Payroll.objects.filter(name=name, is_deleted=False).exists():
                 return name
-            sequence += 1
+        raise ValueError("Unable to generate a unique payroll name, please retry.")
 
     def _get_dates_parameter(self, obj_data):
         date_valid_from = obj_data.get('date_valid_from', None)

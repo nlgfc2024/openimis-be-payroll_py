@@ -31,6 +31,7 @@ class PayrollNameGenerator:
 
     PREFIX = "PAYROLL"
     MAX_LENGTH = 255
+    GENERATION_ATTEMPTS = 20
 
     @classmethod
     def generate(cls, payment_plan, payment_cycle, project_names, sequence):
