@@ -2,7 +2,9 @@ import logging
 import pandas as pd
 from io import BytesIO
 
+from django.apps import apps
 from django.contrib.contenttypes.models import ContentType
+from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.db.models import Q
 from django.utils.translation import gettext as _
@@ -25,6 +27,7 @@ from payroll.models import (
     BenefitConsumptionStatus
 )
 from payroll.tasks import send_requests_to_gateway_payment
+from payroll.utils import PayrollNameGenerator
 from payroll.validation import PaymentPointValidation, PayrollValidation, BenefitConsumptionValidation
 from calculation.services import get_calculation_object
 from core.services.utils import output_exception, check_authentication
@@ -71,8 +74,15 @@ class PayrollService(BaseService):
                 from_failed_invoices_payroll_id = obj_data.pop("from_failed_invoices_payroll_id", None)
                 payment_plan = self._get_payment_plan(obj_data)
                 payment_cycle = self._get_payment_cycle(obj_data)
+                project_names = self._get_project_names(obj_data)
+                if not obj_data.get("name"):
+                    obj_data["name"] = self._generate_payroll_name(
+                        payment_plan, payment_cycle, project_names
+                    )
                 date_valid_from, date_valid_to = self._get_dates_parameter(obj_data)
-                payroll, dict_representation = self._save_payroll(obj_data)
+                payroll, dict_representation = self._save_payroll(
+                    obj_data, payment_plan, payment_cycle, project_names
+                )
                 if not bool(from_failed_invoices_payroll_id):
                     beneficiaries_queryset = self._select_beneficiary_based_on_criteria(obj_data, payment_plan)
                     self._generate_benefits(
@@ -157,7 +167,7 @@ class PayrollService(BaseService):
         payroll_id = obj_data['id']
         send_requests_to_gateway_payment.delay(payroll_id, self.user.id)
 
-    def _save_payroll(self, obj_data):
+    def _save_payroll(self, obj_data, payment_plan, payment_cycle, project_names):
         obj_ = self.OBJECT_TYPE(**obj_data)
         dict_representation = self.save_instance(obj_)
         payroll_id = dict_representation["data"]["id"]
@@ -171,8 +181,35 @@ class PayrollService(BaseService):
 
     def _get_payment_cycle(self, obj_data):
         payment_cycle_id = obj_data.get("payment_cycle_id")
-        payment_cycle = PaymentCycle.objects.get(id=payment_cycle_id)
+        # Serialise creations in a cycle so the readable sequence is safe when
+        # two payrolls with identical criteria are submitted concurrently.
+        payment_cycle = PaymentCycle.objects.select_for_update().get(id=payment_cycle_id)
         return payment_cycle
+
+    def _get_project_names(self, obj_data):
+        json_ext = obj_data.get("json_ext") or {}
+        project_ids = json_ext.get("filter_criteria", {}).get("project_ids", [])
+        if not project_ids:
+            return ["ALL"]
+
+        project_model = apps.get_model("project_social_protection", "Project")
+        project_names = list(
+            project_model.objects.filter(id__in=project_ids, is_deleted=False)
+            .order_by("name")
+            .values_list("name", flat=True)
+        )
+        if not project_names:
+            raise ValidationError("The selected project no longer exists.")
+        return project_names
+
+    def _generate_payroll_name(self, payment_plan, payment_cycle, project_names):
+        for sequence in range(1, PayrollNameGenerator.GENERATION_ATTEMPTS + 1):
+            name = PayrollNameGenerator.generate(
+                payment_plan, payment_cycle, project_names, sequence
+            )
+            if not Payroll.objects.filter(name=name, is_deleted=False).exists():
+                return name
+        raise ValueError("Unable to generate a unique payroll name, please retry.")
 
     def _get_dates_parameter(self, obj_data):
         date_valid_from = obj_data.get('date_valid_from', None)
