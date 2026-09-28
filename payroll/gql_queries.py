@@ -56,6 +56,9 @@ class BenefitAttachmentGQLType(DjangoObjectType):
 class BenefitConsumptionGQLType(DjangoObjectType):
     uuid = graphene.String(source='uuid')
     benefit_attachment = graphene.List(BenefitAttachmentGQLType)
+    national_id = graphene.String()
+    form_number = graphene.String()
+    phone_number = graphene.String()
 
     class Meta:
         model = BenefitConsumption
@@ -85,6 +88,19 @@ class BenefitConsumptionGQLType(DjangoObjectType):
             benefit_id=self.id,
             is_deleted=False
         )
+
+    def resolve_national_id(self, info):
+        return (self.individual.json_ext or {}).get('national_id')
+
+    def resolve_form_number(self, info):
+        form_number = (self.individual.json_ext or {}).get('form_number')
+        return str(form_number) if form_number is not None else None
+
+    def resolve_phone_number(self, info):
+        phone_number = (self.individual.json_ext or {}).get('household_mobile_number')
+        if isinstance(phone_number, float) and phone_number.is_integer():
+            return str(int(phone_number))
+        return str(phone_number) if phone_number is not None else None
 
 
 class PayrollGQLType(DjangoObjectType):

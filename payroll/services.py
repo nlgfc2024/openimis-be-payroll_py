@@ -322,6 +322,17 @@ class BenefitConsumptionService(BaseService):
 
 
 class CsvReconciliationService:
+    # These columns help payment providers identify a beneficiary but are not
+    # reconciliation keys. The internal benefit `code` remains the value used
+    # to match an uploaded row to openIMIS.
+    RECONCILIATION_CONTEXT_COLUMNS = {
+        'national_id': 'National ID',
+        'district_name': 'District Name',
+        'micro_catchment': 'Micro Catchment',
+        'form_number': 'Form Number',
+        'phone_number': 'Phone Number',
+    }
+
     def __init__(self, user: InteractiveUser):
         self.user = user
 
@@ -336,9 +347,17 @@ class CsvReconciliationService:
         extra_info_keys = set()
         extra_info_dicts = []  # To store extra_info dicts for each record
         for record in records:
-            bc = bc_qs.get(code=record['code'])
+            bc = bc_qs.select_related(
+                'individual__location__parent__parent__parent'
+            ).get(code=record['code'])
+            record.update(self._get_reconciliation_context(bc))
             extra_info = bc.json_ext.get('extra_info', {}) if bc.json_ext else {}
-            extra_info_keys.update(extra_info.keys())
+            # Context fields are generated from the current source records;
+            # do not replace them with values retained from a prior upload.
+            extra_info_keys.update(
+                key for key in extra_info.keys()
+                if key not in self.RECONCILIATION_CONTEXT_COLUMNS
+            )
             extra_info_dicts.append(extra_info)
 
         # Convert to DataFrame
@@ -352,7 +371,14 @@ class CsvReconciliationService:
         df[PayrollConfig.csv_reconciliation_paid_extra_field] = df.apply(
             lambda row: self._fill_paid_column(row), axis=1
         )
-        df.rename(columns=PayrollConfig.csv_reconciliation_field_mapping, inplace=True)
+        df.rename(
+            columns={
+                **PayrollConfig.csv_reconciliation_field_mapping,
+                **self.RECONCILIATION_CONTEXT_COLUMNS,
+            },
+            inplace=True,
+        )
+        df = df.reindex(columns=self._get_reconciliation_export_columns())
 
         # Add extra_info fields at the end of the DataFrame
         for key in extra_info_keys:
@@ -363,6 +389,77 @@ class CsvReconciliationService:
         # noinspection PyTypeChecker
         df.to_csv(in_memory_file, index=False)
         return in_memory_file
+
+    def _get_reconciliation_export_columns(self):
+        fields = PayrollConfig.csv_reconciliation_field_mapping
+        return [
+            fields['payrollbenefitconsumption__payroll__name'],
+            fields['payrollbenefitconsumption__payroll__status'],
+            self.RECONCILIATION_CONTEXT_COLUMNS['district_name'],
+            self.RECONCILIATION_CONTEXT_COLUMNS['micro_catchment'],
+            self.RECONCILIATION_CONTEXT_COLUMNS['form_number'],
+            self.RECONCILIATION_CONTEXT_COLUMNS['phone_number'],
+            fields['individual__first_name'],
+            fields['individual__last_name'],
+            self.RECONCILIATION_CONTEXT_COLUMNS['national_id'],
+            fields['individual__dob'],
+            fields['code'],
+            fields['status'],
+            fields['amount'],
+            fields['type'],
+            fields['receipt'],
+            PayrollConfig.csv_reconciliation_paid_extra_field,
+        ]
+
+    def _get_reconciliation_context(self, benefit):
+        """Return provider-facing identity and location context for one row."""
+        individual = benefit.individual
+        individual_data = individual.json_ext or {}
+        location = individual.location
+        district_name = None
+        gvh = None
+
+        # The Malawi location hierarchy is Village -> GVH -> TA -> District.
+        # Walk it rather than relying on a fixed number of parent joins so the
+        # export also works for incomplete or differently shaped hierarchies.
+        while location:
+            if location.type == 'R' and not district_name:
+                district_name = location.name
+            if location.type == 'W' and not gvh:
+                gvh = location
+            location = location.parent
+
+        micro_catchment_name = None
+        if gvh:
+            from location.models import MicroCatchmentGVH
+
+            micro_catchment = (
+                MicroCatchmentGVH.objects
+                .filter(location=gvh, validity_to__isnull=True)
+                .select_related('micro_catchment')
+                .order_by('micro_catchment__name')
+                .first()
+            )
+            if micro_catchment:
+                micro_catchment_name = micro_catchment.micro_catchment.name
+
+        return {
+            'national_id': individual_data.get('national_id'),
+            'district_name': district_name,
+            'micro_catchment': micro_catchment_name,
+            'form_number': individual_data.get('form_number'),
+            'phone_number': self._format_phone_number(
+                individual_data.get('household_mobile_number')
+            ),
+        }
+
+    @staticmethod
+    def _format_phone_number(phone_number):
+        if phone_number is None:
+            return None
+        if isinstance(phone_number, float) and phone_number.is_integer():
+            return str(int(phone_number))
+        return str(phone_number)
 
     def upload_reconciliation(self, payroll_id, file, upload):
         payroll = self._resolve_payroll(payroll_id)
