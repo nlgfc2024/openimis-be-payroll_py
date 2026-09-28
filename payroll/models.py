@@ -89,16 +89,42 @@ class PayrollBenefitConsumption(HistoryModel):
 class CsvReconciliationUpload(HistoryModel):
     class Status(models.TextChoices):
         TRIGGERED = 'TRIGGERED', _('Triggered')
+        VALIDATING = 'VALIDATING', _('Validating')
         IN_PROGRESS = 'IN_PROGRESS', _('In progress')
+        PENDING_REVIEW = 'PENDING_REVIEW', _('Pending review')
         SUCCESS = 'SUCCESS', _('Success')
         PARTIAL_SUCCESS = 'PARTIAL_SUCCESS', _('Partial Success')
         WAITING_FOR_VERIFICATION = 'WAITING_FOR_VERIFICATION', _('WAITING_FOR_VERIFICATION')
         FAIL = 'FAIL', _('Fail')
+        DUPLICATE = 'DUPLICATE', _('Duplicate')
 
     payroll = models.ForeignKey(Payroll, models.DO_NOTHING, null=True, blank=True)
     status = models.CharField(max_length=255, choices=Status.choices, default=Status.TRIGGERED)
     error = models.JSONField(blank=True, default=dict)
     file_name = models.CharField(max_length=255, null=True, blank=True)
+    checksum = models.CharField(max_length=64, null=True, blank=True, db_index=True)
+    storage_key = models.CharField(max_length=512, null=True, blank=True)
+    duplicate_of = models.ForeignKey('self', models.DO_NOTHING, null=True, blank=True, related_name='duplicates')
+    total_records = models.PositiveIntegerField(default=0)
+    matched_records = models.PositiveIntegerField(default=0)
+    paid_records = models.PositiveIntegerField(default=0)
+    unpaid_records = models.PositiveIntegerField(default=0)
+    unmatched_records = models.PositiveIntegerField(default=0)
+
+
+class ReconciliationUploadRow(HistoryModel):
+    class Status(models.TextChoices):
+        VALID = 'VALID', _('Valid')
+        INVALID = 'INVALID', _('Invalid')
+
+    upload = models.ForeignKey(CsvReconciliationUpload, models.DO_NOTHING, related_name='rows')
+    row_number = models.PositiveIntegerField()
+    benefit = models.ForeignKey(BenefitConsumption, models.DO_NOTHING, null=True, blank=True)
+    code = models.CharField(max_length=255, null=True, blank=True)
+    national_id = models.CharField(max_length=255, null=True, blank=True)
+    submitted_data = models.JSONField(default=dict)
+    mismatch_reasons = models.JSONField(default=list, blank=True)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.VALID)
 
 
 class PayrollMutation(UUIDModel, ObjectMutation):
