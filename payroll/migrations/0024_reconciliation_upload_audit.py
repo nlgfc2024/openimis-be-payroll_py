@@ -13,7 +13,7 @@ class Migration(migrations.Migration):
 
     dependencies = [
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
-        ('payroll', '0023_alter_benefitattachment_date_created_and_more'),
+        ('payroll', '0022_alter_csvreconciliationupload_user_created_and_more'),
     ]
 
     operations = [

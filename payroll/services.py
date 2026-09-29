@@ -392,6 +392,7 @@ class CsvReconciliationService:
         )
         return micro_catchment.micro_catchment.name if micro_catchment else None
 
+    @transaction.atomic
     def upload_reconciliation(self, payroll_id, file, upload):
         """Validate and audit an upload without changing payment records.
 
@@ -400,6 +401,9 @@ class CsvReconciliationService:
         changed.
         """
         payroll = self._resolve_payroll(payroll_id)
+        # Serialise uploads for a payroll.  This makes superseding a pending
+        # review deterministic even when corrected files arrive concurrently.
+        payroll = Payroll.objects.select_for_update().get(id=payroll.id)
         if not file:
             raise ValueError(_("csv_reconciliation.validation.file_required"))
 
@@ -502,6 +506,26 @@ class CsvReconciliationService:
              == PayrollConfig.csv_reconciliation_paid_no).sum()
         )
         bulk_create_with_history(upload_rows, ReconciliationUploadRow, default_user=self.user, batch_size=1000)
+
+        # A corrected file replaces, rather than competes with, an outstanding
+        # review. The old task may still be completed later, but apply_upload
+        # will safely ignore this non-pending upload.
+        pending_uploads = CsvReconciliationUpload.objects.filter(
+            payroll=payroll,
+            status=CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION,
+            is_deleted=False,
+        ).exclude(id=upload.id)
+        for pending_upload in pending_uploads:
+            pending_upload.status = CsvReconciliationUpload.Status.FAIL
+            pending_upload.error = {
+                **(pending_upload.error or {}),
+                "superseded_by": {
+                    "upload_id": str(upload.id),
+                    "file_name": upload.file_name,
+                },
+            }
+            pending_upload.save(username=self.user.login_name)
+
         upload.error = errors
         upload.status = CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION
         upload.json_ext = {"extra_info": self._upload_summary(upload)}
@@ -569,10 +593,27 @@ class CsvReconciliationService:
         upload = CsvReconciliationUpload.objects.select_for_update().get(id=upload.id)
         if upload.status != CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION:
             return
-        rows = ReconciliationUploadRow.objects.filter(upload=upload, status=ReconciliationUploadRow.Status.VALID, is_deleted=False).select_related("benefit")
-        for row in rows:
-            if self._clean_value(row.submitted_data.get(PayrollConfig.csv_reconciliation_paid_extra_field)) == PayrollConfig.csv_reconciliation_paid_yes and row.benefit.status == BenefitConsumptionStatus.ACCEPTED:
-                self._reconcile_bc(pd.Series(row.submitted_data), row.benefit)
+        rows = list(ReconciliationUploadRow.objects.filter(
+            upload=upload,
+            status=ReconciliationUploadRow.Status.VALID,
+            is_deleted=False,
+        ))
+        paid_rows = [
+            row for row in rows
+            if self._clean_value(row.submitted_data.get(PayrollConfig.csv_reconciliation_paid_extra_field))
+            == PayrollConfig.csv_reconciliation_paid_yes
+        ]
+        locked_benefits = {
+            benefit.id: benefit
+            for benefit in BenefitConsumption.objects.select_for_update().filter(
+                id__in=[row.benefit_id for row in paid_rows if row.benefit_id],
+                is_deleted=False,
+            )
+        }
+        for row in paid_rows:
+            benefit = locked_benefits.get(row.benefit_id)
+            if benefit and benefit.status == BenefitConsumptionStatus.ACCEPTED:
+                self._reconcile_bc(pd.Series(row.submitted_data), benefit)
         upload.status = CsvReconciliationUpload.Status.PARTIAL_SUCCESS if upload.unmatched_records else CsvReconciliationUpload.Status.SUCCESS
         upload.save(username=self.user.login_name)
 
@@ -767,31 +808,6 @@ class CsvReconciliationService:
         if not payroll:
             raise ValueError('csv_reconciliation.validation.payroll_not_found')
         return payroll
-
-    def _reconcile_row(self, payroll, row):
-        errors = []
-        bc = BenefitConsumption.objects.filter(code=row['code'], is_deleted=False).first()
-        if not bc:
-            errors.append(_('benefit_consumption_not_found'))
-        if not bc.payrollbenefitconsumption_set.filter(payroll=payroll).exists():
-            errors.append(_('benefit_consumption_not_in_payroll'))
-        if (row[PayrollConfig.csv_reconciliation_paid_extra_field]
-                and row[PayrollConfig.csv_reconciliation_paid_extra_field]
-                not in [PayrollConfig.csv_reconciliation_paid_yes, PayrollConfig.csv_reconciliation_paid_no]):
-            errors.append(_('paid_column_invalid_value'))
-
-        if not row[PayrollConfig.csv_reconciliation_receipt_column]:
-            errors.append(_('receipt_required'))
-
-        if bc and bc.status != row['status']:
-            errors.append(_('status_not_matching'))
-
-        if (not errors
-                and (row[PayrollConfig.csv_reconciliation_paid_extra_field] == PayrollConfig.csv_reconciliation_paid_yes
-                     and bc.status == BenefitConsumptionStatus.ACCEPTED)):
-            self._reconcile_bc(row, bc)
-
-        return errors if errors else None
 
     def _reconcile_bc(self, row, bc):
         bc.status = BenefitConsumptionStatus.RECONCILED
