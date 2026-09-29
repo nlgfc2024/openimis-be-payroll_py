@@ -6,9 +6,9 @@ from core.signals import bind_service_signal
 from openIMIS.openimisapps import openimis_apps
 from tasks_management.models import Task
 from payroll.apps import PayrollConfig
-from payroll.models import Payroll, BenefitConsumption, BenefitConsumptionStatus
+from payroll.models import Payroll, BenefitConsumption, BenefitConsumptionStatus, CsvReconciliationUpload
 from payroll.payments_registry import PaymentMethodStorage
-from payroll.services import PayrollService
+from payroll.services import PayrollService, CsvReconciliationService
 from payroll.strategies import StrategyOfPaymentInterface
 
 
@@ -58,7 +58,16 @@ def bind_service_signals():
                 task_status = task['status']
                 if task_status == Task.Status.COMPLETED:
                     payroll = Payroll.objects.get(id=task['entity_id'])
-                    reconcile_payroll(payroll, user)
+                    upload_id = task.get('data', {}).get('upload_id')
+                    if upload_id:
+                        upload = CsvReconciliationUpload.objects.get(id=upload_id, payroll=payroll)
+                        CsvReconciliationService(user).apply_upload(upload)
+                    else:
+                        reconcile_payroll(payroll, user)
+                elif task_status == Task.Status.FAILED:
+                    upload_id = task.get('data', {}).get('upload_id')
+                    if upload_id:
+                        CsvReconciliationUpload.objects.filter(id=upload_id, status=CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION).update(status=CsvReconciliationUpload.Status.FAIL)
         except Exception as exc:
             logger.error("Error while executing on_task_complete_payroll_reconciliation", exc_info=exc)
 

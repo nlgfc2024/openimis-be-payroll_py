@@ -1,5 +1,6 @@
 import hashlib
 import logging
+from decimal import Decimal, InvalidOperation
 import pandas as pd
 from io import BytesIO
 
@@ -7,6 +8,7 @@ from django.apps import apps
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError
 from django.db import transaction
+from simple_history.utils import bulk_create_with_history
 from django.db.models import Q
 from django.utils.translation import gettext as _
 
@@ -325,16 +327,7 @@ class BenefitConsumptionService(BaseService):
 
 
 class CsvReconciliationService:
-    # These columns help payment providers identify a beneficiary but are not
-    # reconciliation keys. The internal benefit `code` remains the value used
-    # to match an uploaded row to openIMIS.
-    RECONCILIATION_CONTEXT_COLUMNS = {
-        'national_id': 'National ID',
-        'district_name': 'District Name',
-        'micro_catchment': 'Micro Catchment',
-        'form_number': 'Form Number',
-        'phone_number': 'Phone Number',
-    }
+    MICRO_CATCHMENT_COLUMN = "Micro Catchment"
 
     def __init__(self, user: InteractiveUser):
         self.user = user
@@ -342,127 +335,62 @@ class CsvReconciliationService:
     def download_reconciliation(self, payroll_id) -> BytesIO:
         payroll = self._resolve_payroll(payroll_id)
         bc_qs = self._get_benefit_consumption_qs(payroll)
-        # Retrieve the basic fields
-        field_keys = list(PayrollConfig.csv_reconciliation_field_mapping.keys())
-        records = list(bc_qs.values(*field_keys))
-
-        # Collect all extra_info keys to ensure all columns are present in the DataFrame
-        extra_info_keys = set()
-        extra_info_dicts = []  # To store extra_info dicts for each record
-        for record in records:
-            bc = bc_qs.select_related(
-                'individual__location__parent__parent__parent'
-            ).get(code=record['code'])
-            record.update(self._get_reconciliation_context(bc))
-            extra_info = bc.json_ext.get('extra_info', {}) if bc.json_ext else {}
-            # Context fields are generated from the current source records;
-            # do not replace them with values retained from a prior upload.
-            extra_info_keys.update(
-                key for key in extra_info.keys()
-                if key not in self.RECONCILIATION_CONTEXT_COLUMNS
+        field_mapping = PayrollConfig.csv_reconciliation_field_mapping
+        records = list(bc_qs.values(*field_mapping.keys()))
+        benefits_by_code = {
+            benefit.code: benefit
+            for benefit in bc_qs.select_related(
+                "individual__location__parent__parent__parent"
             )
+        }
+
+        extra_info_keys = set()
+        extra_info_dicts = []
+        mapped_headers = set(field_mapping.values()) | {self.MICRO_CATCHMENT_COLUMN}
+        for record in records:
+            benefit = benefits_by_code[record["code"]]
+            record["micro_catchment"] = self._get_micro_catchment(benefit)
+            extra_info = benefit.json_ext.get("extra_info", {}) if benefit.json_ext else {}
+            extra_info_keys.update(key for key in extra_info if key not in mapped_headers)
             extra_info_dicts.append(extra_info)
 
-        # Convert to DataFrame
         df = pd.DataFrame.from_records(records)
-
-        for key in extra_info_keys:
-            if key not in df.columns:
-                df[key] = None
-
-        # Add paid extra field
         df[PayrollConfig.csv_reconciliation_paid_extra_field] = df.apply(
             lambda row: self._fill_paid_column(row), axis=1
         )
         df.rename(
-            columns={
-                **PayrollConfig.csv_reconciliation_field_mapping,
-                **self.RECONCILIATION_CONTEXT_COLUMNS,
-            },
+            columns={**field_mapping, "micro_catchment": self.MICRO_CATCHMENT_COLUMN},
             inplace=True,
         )
-        df = df.reindex(columns=self._get_reconciliation_export_columns())
-
-        # Add extra_info fields at the end of the DataFrame
+        export_columns = list(field_mapping.values())
+        try:
+            export_columns.insert(export_columns.index("District Name") + 1, self.MICRO_CATCHMENT_COLUMN)
+        except ValueError:
+            export_columns.append(self.MICRO_CATCHMENT_COLUMN)
+        export_columns.append(PayrollConfig.csv_reconciliation_paid_extra_field)
         for key in extra_info_keys:
-            df[key] = [extra_info_dict.get(key, None) for extra_info_dict in extra_info_dicts]
+            df[key] = [extra_info.get(key) for extra_info in extra_info_dicts]
+            export_columns.append(key)
+        df = df.reindex(columns=export_columns)
 
         in_memory_file = BytesIO()
-        # BytesIO is duck-typed as a file object, so it can be passed to df.to_csv
-        # noinspection PyTypeChecker
         df.to_csv(in_memory_file, index=False)
         return in_memory_file
 
-    def _get_reconciliation_export_columns(self):
-        fields = PayrollConfig.csv_reconciliation_field_mapping
-        return [
-            fields['payrollbenefitconsumption__payroll__name'],
-            fields['payrollbenefitconsumption__payroll__status'],
-            self.RECONCILIATION_CONTEXT_COLUMNS['district_name'],
-            self.RECONCILIATION_CONTEXT_COLUMNS['micro_catchment'],
-            self.RECONCILIATION_CONTEXT_COLUMNS['form_number'],
-            self.RECONCILIATION_CONTEXT_COLUMNS['phone_number'],
-            fields['individual__first_name'],
-            fields['individual__last_name'],
-            self.RECONCILIATION_CONTEXT_COLUMNS['national_id'],
-            fields['individual__dob'],
-            fields['code'],
-            fields['status'],
-            fields['amount'],
-            fields['type'],
-            fields['receipt'],
-            PayrollConfig.csv_reconciliation_paid_extra_field,
-        ]
-
-    def _get_reconciliation_context(self, benefit):
-        """Return provider-facing identity and location context for one row."""
-        individual = benefit.individual
-        individual_data = individual.json_ext or {}
-        location = individual.location
-        district_name = None
-        gvh = None
-
-        # The Malawi location hierarchy is Village -> GVH -> TA -> District.
-        # Walk it rather than relying on a fixed number of parent joins so the
-        # export also works for incomplete or differently shaped hierarchies.
-        while location:
-            if location.type == 'R' and not district_name:
-                district_name = location.name
-            if location.type == 'W' and not gvh:
-                gvh = location
+    def _get_micro_catchment(self, benefit):
+        location = benefit.individual.location
+        while location and location.type != "W":
             location = location.parent
-
-        micro_catchment_name = None
-        if gvh:
-            from location.models import MicroCatchmentGVH
-
-            micro_catchment = (
-                MicroCatchmentGVH.objects
-                .filter(location=gvh, validity_to__isnull=True)
-                .select_related('micro_catchment')
-                .order_by('micro_catchment__name')
-                .first()
-            )
-            if micro_catchment:
-                micro_catchment_name = micro_catchment.micro_catchment.name
-
-        return {
-            'national_id': individual_data.get('national_id'),
-            'district_name': district_name,
-            'micro_catchment': micro_catchment_name,
-            'form_number': individual_data.get('form_number'),
-            'phone_number': self._format_phone_number(
-                individual_data.get('household_mobile_number')
-            ),
-        }
-
-    @staticmethod
-    def _format_phone_number(phone_number):
-        if phone_number is None:
+        if not location:
             return None
-        if isinstance(phone_number, float) and phone_number.is_integer():
-            return str(int(phone_number))
-        return str(phone_number)
+        from location.models import MicroCatchmentGVH
+        micro_catchment = (
+            MicroCatchmentGVH.objects.filter(location=location, validity_to__isnull=True)
+            .select_related("micro_catchment")
+            .order_by("micro_catchment__name")
+            .first()
+        )
+        return micro_catchment.micro_catchment.name if micro_catchment else None
 
     def upload_reconciliation(self, payroll_id, file, upload):
         """Validate and audit an upload without changing payment records.
@@ -514,11 +442,15 @@ class CsvReconciliationService:
             inplace=True,
         )
         code_column = PayrollConfig.csv_reconciliation_code_column
-        national_id_column = "National ID"
+        national_id_column = next(
+            (field for field, header in PayrollConfig.csv_reconciliation_field_mapping.items()
+             if header == "National ID"),
+            None,
+        )
         codes = df[code_column].map(self._clean_value)
         national_ids = (
             df[national_id_column].map(self._clean_value)
-            if national_id_column in df.columns
+            if national_id_column and national_id_column in df.columns
             else pd.Series([None] * len(df), index=df.index)
         )
         duplicate_codes = set(codes[codes.notna() & codes.duplicated(keep=False)])
@@ -526,17 +458,22 @@ class CsvReconciliationService:
             national_ids[national_ids.notna() & national_ids.duplicated(keep=False)]
         )
 
+        benefits_by_code, contexts_by_benefit_id = self._load_upload_context(payroll, codes)
         errors = {}
         valid_indexes = []
+        upload_rows = []
         for index, row in df.iterrows():
             row_number = index + 2
             code = self._clean_value(row.get(code_column))
-            national_id = self._clean_value(row.get(national_id_column))
+            national_id = self._clean_value(row.get(national_id_column)) if national_id_column else None
             benefit, reasons = self._validate_upload_row(
                 payroll, row, code, national_id, duplicate_codes, duplicate_national_ids,
+                benefits_by_code, contexts_by_benefit_id,
             )
-            ReconciliationUploadRow(
+            upload_rows.append(ReconciliationUploadRow(
                 upload=upload,
+                user_created=self.user,
+                user_updated=self.user,
                 row_number=row_number,
                 benefit=benefit,
                 code=code,
@@ -545,7 +482,7 @@ class CsvReconciliationService:
                 mismatch_reasons=reasons,
                 status=(ReconciliationUploadRow.Status.INVALID if reasons
                         else ReconciliationUploadRow.Status.VALID),
-            ).save(username=self.user.login_name)
+            ))
             if reasons:
                 errors[str(row_number)] = reasons
             else:
@@ -564,14 +501,80 @@ class CsvReconciliationService:
             (valid_rows[paid_column].map(self._clean_value)
              == PayrollConfig.csv_reconciliation_paid_no).sum()
         )
+        bulk_create_with_history(upload_rows, ReconciliationUploadRow, default_user=self.user, batch_size=1000)
         upload.error = errors
-        upload.status = (
-            CsvReconciliationUpload.Status.PARTIAL_SUCCESS if errors
-            else CsvReconciliationUpload.Status.PENDING_REVIEW
-        )
+        upload.status = CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION
         upload.json_ext = {"extra_info": self._upload_summary(upload)}
         upload.save(username=self.user.login_name)
+        task = TaskService(self.user).create({
+            "source": "payroll_reconciliation", "entity": payroll,
+            "status": Task.Status.RECEIVED,
+            "executor_action_event": TasksManagementConfig.default_executor_event,
+            "business_event": PayrollConfig.payroll_reconciliation_event,
+            "data": _get_std_task_data_payload({"id": payroll.id, "upload_id": upload.id}),
+        })
+        if not task.get("success", False):
+            raise ValueError(task.get("error") or "Unable to create reconciliation review task")
         return BytesIO(contents), errors or None, self._upload_summary(upload)
+
+    def _load_upload_context(self, payroll, codes):
+        from location.models import Location, MicroCatchmentGVH
+
+        benefits = list(
+            BenefitConsumption.objects.filter(
+                code__in=list(codes.dropna().unique()),
+                is_deleted=False,
+                payrollbenefitconsumption__payroll=payroll,
+                payrollbenefitconsumption__is_deleted=False,
+            ).select_related("individual", "individual__location").distinct()
+        )
+        benefits_by_code = {benefit.code: benefit for benefit in benefits}
+        locations = {
+            benefit.individual.location_id: benefit.individual.location
+            for benefit in benefits if benefit.individual.location_id
+        }
+        while True:
+            parent_ids = {
+                location.parent_id for location in locations.values()
+                if location.parent_id and location.parent_id not in locations
+            }
+            if not parent_ids:
+                break
+            parents = {location.id: location for location in Location.objects.filter(id__in=parent_ids)}
+            if not parents:
+                break
+            locations.update(parents)
+
+        gvh_by_benefit = {}
+        for benefit in benefits:
+            location = locations.get(benefit.individual.location_id)
+            while location and location.type != "W":
+                location = locations.get(location.parent_id)
+            gvh_by_benefit[benefit.id] = location.id if location else None
+
+        micro_catchments = {}
+        for item in MicroCatchmentGVH.objects.filter(
+            location_id__in={gvh_id for gvh_id in gvh_by_benefit.values() if gvh_id},
+            validity_to__isnull=True,
+        ).select_related("micro_catchment").order_by("micro_catchment__name"):
+            micro_catchments.setdefault(item.location_id, item.micro_catchment.name)
+        contexts = {
+            benefit.id: {"micro_catchment": micro_catchments.get(gvh_by_benefit[benefit.id])}
+            for benefit in benefits
+        }
+        return benefits_by_code, contexts
+
+    @transaction.atomic
+    def apply_upload(self, upload):
+        upload = CsvReconciliationUpload.objects.select_for_update().get(id=upload.id)
+        if upload.status != CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION:
+            return
+        rows = ReconciliationUploadRow.objects.filter(upload=upload, status=ReconciliationUploadRow.Status.VALID, is_deleted=False).select_related("benefit")
+        for row in rows:
+            if self._clean_value(row.submitted_data.get(PayrollConfig.csv_reconciliation_paid_extra_field)) == PayrollConfig.csv_reconciliation_paid_yes and row.benefit.status == BenefitConsumptionStatus.ACCEPTED:
+                self._reconcile_bc(pd.Series(row.submitted_data), row.benefit)
+        upload.status = CsvReconciliationUpload.Status.PARTIAL_SUCCESS if upload.unmatched_records else CsvReconciliationUpload.Status.SUCCESS
+        upload.save(username=self.user.login_name)
 
     def download_upload_review(self, upload, contents):
         """Return the original CSV annotated with its saved validation result."""
@@ -615,7 +618,7 @@ class CsvReconciliationService:
         review_file.seek(0)
         return review_file
 
-    def _validate_upload_row(self, payroll, row, code, national_id, duplicate_codes, duplicate_national_ids):
+    def _validate_upload_row(self, payroll, row, code, national_id, duplicate_codes, duplicate_national_ids, benefits_by_code=None, contexts_by_benefit_id=None):
         reasons = []
         if not code:
             return None, ["missing_code"]
@@ -624,35 +627,37 @@ class CsvReconciliationService:
         if national_id and national_id in duplicate_national_ids:
             reasons.append("duplicate_national_id_in_file")
 
-        benefit = BenefitConsumption.objects.filter(code=code, is_deleted=False).select_related(
-            "individual",
-        ).first()
+        benefit = (benefits_by_code or {}).get(code)
+        if benefit is None and benefits_by_code is None:
+            benefit = BenefitConsumption.objects.filter(code=code, is_deleted=False).select_related("individual").first()
         if not benefit:
             return None, reasons + ["code_not_found"]
-        if not benefit.payrollbenefitconsumption_set.filter(payroll=payroll).exists():
+        if benefits_by_code is None and not benefit.payrollbenefitconsumption_set.filter(payroll=payroll).exists():
             reasons.append("code_not_in_payroll")
 
         individual = benefit.individual
-        individual_data = individual.json_ext or {}
-        context = self._get_reconciliation_context(benefit)
+        context = (contexts_by_benefit_id or {}).get(benefit.id)
+        if context is None:
+            context = {"micro_catchment": self._get_micro_catchment(benefit)}
         checks = (
             ("payroll_name_mismatch", "payrollbenefitconsumption__payroll__name", payroll.name, self._matches_text),
             ("payroll_status_mismatch", "payrollbenefitconsumption__payroll__status", payroll.status, self._matches_text),
-            ("district_name_mismatch", "District Name", context.get("district_name"), self._matches_text),
-            ("micro_catchment_mismatch", "Micro Catchment", context.get("micro_catchment"), self._matches_text),
-            ("form_number_mismatch", "Form Number", individual_data.get("form_number"), self._matches_text),
-            ("phone_number_mismatch", "Phone Number", context.get("phone_number"), self._matches_text),
             ("first_name_mismatch", "individual__first_name", individual.first_name, self._matches_text),
             ("last_name_mismatch", "individual__last_name", individual.last_name, self._matches_text),
-            ("national_id_mismatch", "National ID", individual_data.get("national_id"), self._matches_text),
             ("date_of_birth_mismatch", "individual__dob", individual.dob, self._matches_date),
             ("status_mismatch", "status", benefit.status, self._matches_text),
             ("amount_mismatch", "amount", benefit.amount, self._amounts_match),
             ("type_mismatch", "type", benefit.type, self._matches_text),
         )
         for mismatch_reason, column, expected_value, comparator in checks:
+            if column not in row.index:
+                continue
             if not comparator(row.get(column), expected_value):
                 reasons.append(mismatch_reason)
+
+        if self.MICRO_CATCHMENT_COLUMN in row.index and not self._matches_text(
+                row.get(self.MICRO_CATCHMENT_COLUMN), context.get("micro_catchment")):
+            reasons.append("micro_catchment_mismatch")
 
         paid = self._clean_value(row.get(PayrollConfig.csv_reconciliation_paid_extra_field))
         if paid not in [PayrollConfig.csv_reconciliation_paid_yes, PayrollConfig.csv_reconciliation_paid_no]:
@@ -704,8 +709,8 @@ class CsvReconciliationService:
     @staticmethod
     def _amounts_match(submitted_amount, benefit_amount):
         try:
-            return float(submitted_amount) == float(benefit_amount)
-        except (TypeError, ValueError):
+            return Decimal(str(submitted_amount).replace(',', '')) == Decimal(str(benefit_amount))
+        except (InvalidOperation, TypeError, ValueError):
             return False
 
 
@@ -734,11 +739,9 @@ class CsvReconciliationService:
             raise ValueError(_("Import file is empty"))
         if PayrollConfig.csv_reconciliation_errors_column in df.columns:
             raise ValueError(_("Column errors in csv."))
-        required_columns = (
-            set(PayrollConfig.csv_reconciliation_field_mapping.values())
-            | set(self.RECONCILIATION_CONTEXT_COLUMNS.values())
-            | {PayrollConfig.csv_reconciliation_paid_extra_field}
-        )
+        required_columns = set(PayrollConfig.csv_reconciliation_field_mapping.values()) | {
+            PayrollConfig.csv_reconciliation_paid_extra_field
+        }
         missing_columns = required_columns - set(df.columns)
         if missing_columns:
             raise ValueError(
@@ -793,8 +796,12 @@ class CsvReconciliationService:
     def _reconcile_bc(self, row, bc):
         bc.status = BenefitConsumptionStatus.RECONCILED
         bc.receipt = row[PayrollConfig.csv_reconciliation_receipt_column]
-        extra_info = {k: row[k] for k in row.index
-                      if k not in PayrollConfig.csv_reconciliation_field_mapping and not pd.isna(row[k])}
+        extra_info = {
+            k: row[k] for k in row.index
+            if k not in PayrollConfig.csv_reconciliation_field_mapping
+            and k != self.MICRO_CATCHMENT_COLUMN
+            and not pd.isna(row[k])
+        }
         bc.json_ext = {'extra_info': extra_info}
         bc.save(username=self.user.login_name)
         bill = Bill.objects.filter(benefitattachment__benefit=bc, is_deleted=False).first()

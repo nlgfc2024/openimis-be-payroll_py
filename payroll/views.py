@@ -82,6 +82,7 @@ class CSVReconciliationAPIView(views.APIView):
                 )
                 file_handler = DefaultStorageFileHandler(path)
                 if upload:
+                    file_name = file_name or upload.file_name
                     service = CsvReconciliationService(request.user)
                     review_file = service.download_upload_review(
                         upload, file_handler.get_file_content(),
