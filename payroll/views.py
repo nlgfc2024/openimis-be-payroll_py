@@ -72,9 +72,27 @@ class CSVReconciliationAPIView(views.APIView):
                 response.content = in_memory_file.getvalue()
                 return response
             else:
-                file_name = request.GET.get('payroll_file_name')
-                path = PayrollConfig.get_payroll_payment_file_path(payroll_id, file_name)
+                upload_id = request.GET.get("upload_id")
+                file_name = request.GET.get("payroll_file_name")
+                upload = CsvReconciliationUpload.objects.filter(
+                    id=upload_id, payroll_id=payroll_id, is_deleted=False,
+                ).first() if upload_id else None
+                path = upload.storage_key if upload and upload.storage_key else (
+                    PayrollConfig.get_payroll_payment_file_path(payroll_id, file_name)
+                )
                 file_handler = DefaultStorageFileHandler(path)
+                if upload:
+                    file_name = file_name or upload.file_name
+                    service = CsvReconciliationService(request.user)
+                    review_file = service.download_upload_review(
+                        upload, file_handler.get_file_content(),
+                    )
+                    response = Response(
+                        headers={"Content-Disposition": f'attachment; filename="{file_name.rsplit(".", 1)[0]}_review.csv"'},
+                        content_type="text/csv",
+                    )
+                    response.content = review_file.getvalue()
+                    return response
                 return file_handler.get_file_response_csv(file_name)
         except ValueError as exc:
             logger.error("Error while generating CSV reconciliation", exc_info=exc)
@@ -91,24 +109,29 @@ class CSVReconciliationAPIView(views.APIView):
         upload = CsvReconciliationUpload()
         payroll_id = request.GET.get('payroll_id')
         try:
+            file = request.FILES.get("file")
+            if not file:
+                raise ValueError("No CSV file was provided")
             upload.save(username=request.user.login_name)
-            file = request.FILES.get('file')
-            target_file_path = PayrollConfig.get_payroll_payment_file_path(payroll_id, file.name)
+            target_file_path = PayrollConfig.get_payroll_payment_file_path(
+                payroll_id, f"{upload.id}_{file.name}",
+            )
             upload.file_name = file.name
+            upload.storage_key = target_file_path
             file_handler = DefaultStorageFileHandler(target_file_path)
             file_handler.check_file_path()
             service = CsvReconciliationService(request.user)
             file_to_upload, errors, summary = service.upload_reconciliation(payroll_id, file, upload)
-            if errors:
-                upload.status = CsvReconciliationUpload.Status.PARTIAL_SUCCESS
-                upload.error = errors
-                upload.json_ext = {'extra_info': summary}
-            else:
-                upload.status = CsvReconciliationUpload.Status.SUCCESS
-                upload.json_ext = {'extra_info': summary}
             upload.save(username=request.user.login_name)
+            file_to_upload.seek(0)
             file_handler.save_file(file_to_upload)
-            return Response({'success': True, 'error': None}, status=201)
+            return Response({
+                "success": True,
+                "error": errors,
+                "upload_id": str(upload.id),
+                "status": upload.status,
+                "summary": summary,
+            }, status=201)
         except Exception as exc:
             logger.error("Error while uploading CSV reconciliation", exc_info=exc)
             if upload:
