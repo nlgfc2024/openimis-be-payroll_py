@@ -508,8 +508,8 @@ class CsvReconciliationService:
         bulk_create_with_history(upload_rows, ReconciliationUploadRow, default_user=self.user, batch_size=1000)
 
         # A corrected file replaces, rather than competes with, an outstanding
-        # review. The old task may still be completed later, but apply_upload
-        # will safely ignore this non-pending upload.
+        # review. Fail its still-open checker task as well, so it cannot later
+        # look completed even though its upload was not applied.
         pending_uploads = CsvReconciliationUpload.objects.filter(
             payroll=payroll,
             status=CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION,
@@ -525,6 +525,14 @@ class CsvReconciliationService:
                 },
             }
             pending_upload.save(username=self.user.login_name)
+            pending_tasks = Task.objects.filter(
+                entity_id=str(payroll.id),
+                business_event=PayrollConfig.payroll_reconciliation_event,
+                data__upload_id=str(pending_upload.id),
+                status__in=[Task.Status.RECEIVED, Task.Status.ACCEPTED],
+            )
+            for pending_task in pending_tasks:
+                TaskService(self.user).complete_task({"id": pending_task.id, "failed": True})
 
         upload.error = errors
         upload.status = CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION
