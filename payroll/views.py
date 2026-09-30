@@ -90,13 +90,17 @@ class CSVReconciliationAPIView(views.APIView):
     def post(self, request):
         upload = CsvReconciliationUpload()
         payroll_id = request.GET.get('payroll_id')
+        processing_started = False
         try:
             upload.save(username=request.user.login_name)
             file = request.FILES.get('file')
+            if file is None:
+                raise ValueError('csv_reconciliation.validation.file_required')
             target_file_path = PayrollConfig.get_payroll_payment_file_path(payroll_id, file.name)
             upload.file_name = file.name
             file_handler = DefaultStorageFileHandler(target_file_path)
             file_handler.check_file_path()
+            processing_started = True
             service = CsvReconciliationService(request.user)
             file_to_upload, errors, summary = service.upload_reconciliation(payroll_id, file, upload)
             if errors:
@@ -108,8 +112,16 @@ class CSVReconciliationAPIView(views.APIView):
                 upload.json_ext = {'extra_info': summary}
             upload.save(username=request.user.login_name)
             file_handler.save_file(file_to_upload)
-            return Response({'success': True, 'error': None}, status=201)
+            return Response({
+                'success': True,
+                'error': None,
+                'status': upload.status,
+                'upload_id': str(upload.pk),
+                'summary': summary,
+                'errors': errors or {},
+            }, status=201)
         except Exception as exc:
+            duplicate_file = isinstance(exc, FileExistsError) and not processing_started
             logger.error("Error while uploading CSV reconciliation", exc_info=exc)
             if upload:
                 upload.error = {'error': str(exc)}
@@ -120,4 +132,10 @@ class CSVReconciliationAPIView(views.APIView):
                 }
                 upload.json_ext = {'extra_info': summary}
                 upload.save(username=request.user.login_name)
-            return Response({'success': False, 'error': str(exc)}, status=500)
+            return Response({
+                'success': False,
+                'error': ('csv_reconciliation.duplicate_file' if duplicate_file
+                          else 'csv_reconciliation.processing_failed'),
+                'status': CsvReconciliationUpload.Status.FAIL,
+                'upload_id': str(upload.pk) if upload.pk else None,
+            }, status=409 if duplicate_file else 500)
