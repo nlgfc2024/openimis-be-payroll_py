@@ -375,26 +375,19 @@ class CsvReconciliationService:
         self._validate_dataframe(df)
         df.rename(columns={v: k for k, v in PayrollConfig.csv_reconciliation_field_mapping.items()}, inplace=True)
 
-        affected_rows = 0
-        skipped_items = 0
-        total_number_of_benefits_in_file = len(df)
-
-        df[PayrollConfig.csv_reconciliation_errors_column] = df.apply(lambda row: self._reconcile_row(payroll, row),
-                                                                      axis=1)
-
-        for __, row in df.iterrows():
-            if not pd.isna(row[PayrollConfig.csv_reconciliation_errors_column]):
-                skipped_items += 1
-            else:
-                affected_rows += 1
-
+        error_column = PayrollConfig.csv_reconciliation_errors_column
+        df[error_column] = df.apply(
+            lambda row: self._reconcile_row(payroll, row), axis=1
+        )
+        error_mask = df[error_column].apply(
+            lambda value: isinstance(value, list) and bool(value)
+        )
         summary = {
-            'affected_rows': affected_rows,
-            'total_number_of_benefits_in_file': total_number_of_benefits_in_file,
-            'skipped_items': skipped_items
+            'affected_rows': int((~error_mask).sum()),
+            'total_number_of_benefits_in_file': int(len(df)),
+            'skipped_items': int(error_mask.sum()),
         }
-
-        error_df = df[df[PayrollConfig.csv_reconciliation_errors_column].apply(lambda x: bool(x))]
+        error_df = df[error_mask]
         if not error_df.empty:
             in_memory_file = BytesIO()
             df.rename(columns={k: v for k, v in PayrollConfig.csv_reconciliation_field_mapping.items()}, inplace=True)
@@ -440,7 +433,7 @@ class CsvReconciliationService:
         errors = []
         bc = BenefitConsumption.objects.filter(code=row['code'], is_deleted=False).first()
         if not bc:
-            errors.append(_('benefit_consumption_not_found'))
+            return [_('benefit_consumption_not_found')]
         if not bc.payrollbenefitconsumption_set.filter(payroll=payroll).exists():
             errors.append(_('benefit_consumption_not_in_payroll'))
         if (row[PayrollConfig.csv_reconciliation_paid_extra_field]
