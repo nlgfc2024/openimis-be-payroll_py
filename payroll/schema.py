@@ -17,11 +17,11 @@ from payroll.gql_mutations import CreatePaymentPointMutation, UpdatePaymentPoint
 from payroll.gql_queries import BenefitConsumptionGQLType, PaymentPointGQLType, \
     PayrollGQLType, PaymentMethodGQLType, \
     PaymentMethodListGQLType, BenefitAttachmentListGQLType, \
-    CsvReconciliationUploadGQLType, PayrollBenefitConsumptionGQLType, \
+    CsvReconciliationUploadGQLType, ReconciliationUploadRowGQLType, PayrollBenefitConsumptionGQLType, \
     PaymentGatewayConfigGQLType, BenefitsSummaryGQLType
 from payroll.models import PaymentPoint, Payroll, \
     BenefitConsumption, BenefitAttachment, \
-    CsvReconciliationUpload, PayrollBenefitConsumption, BenefitConsumptionStatus
+    CsvReconciliationUpload, ReconciliationUploadRow, PayrollBenefitConsumption, BenefitConsumptionStatus
 from payroll.payments_registry import PaymentMethodStorage
 from social_protection.models import BenefitPlan
 
@@ -91,6 +91,11 @@ class Query(graphene.ObjectType):
 
     csv_reconciliation_upload = OrderedDjangoFilterConnectionField(
         CsvReconciliationUploadGQLType,
+        orderBy=graphene.List(of_type=graphene.String),
+    )
+
+    reconciliation_upload_row = OrderedDjangoFilterConnectionField(
+        ReconciliationUploadRowGQLType,
         orderBy=graphene.List(of_type=graphene.String),
     )
 
@@ -256,6 +261,11 @@ class Query(graphene.ObjectType):
 
         query = CsvReconciliationUpload.objects.filter(*filters)
         return gql_optimizer.query(query, info)
+
+    def resolve_reconciliation_upload_row(self, info, **kwargs):
+        Query._check_permissions(info.context.user, PayrollConfig.gql_csv_reconciliation_search_perms)
+        filters = append_validity_filter(**kwargs)
+        return gql_optimizer.query(ReconciliationUploadRow.objects.filter(*filters), info)
 
     def resolve_benefits_summary(self, info, **kwargs):
         Query._check_permissions(info.context.user,

@@ -5,6 +5,7 @@ from core.service_signals import ServiceSignalBindType
 from core.signals import bind_service_signal
 from openIMIS.openimisapps import openimis_apps
 from tasks_management.models import Task
+from tasks_management.services import TaskService
 from payroll.apps import PayrollConfig
 from payroll.models import Payroll, BenefitConsumption, BenefitConsumptionStatus, CsvReconciliationUpload
 from payroll.payments_registry import PaymentMethodStorage

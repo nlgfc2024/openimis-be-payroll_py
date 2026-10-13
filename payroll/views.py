@@ -1,7 +1,7 @@
 import logging
 
 from django.db import transaction
-from rest_framework import views
+from rest_framework import status, views
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 
@@ -120,11 +120,12 @@ class CSVReconciliationAPIView(views.APIView):
             upload.storage_key = target_file_path
             file_handler = DefaultStorageFileHandler(target_file_path)
             file_handler.check_file_path()
+            # Keep the submitted source before validation so a user can
+            # download the reviewed/error file even when validation fails.
+            file_handler.save_file(file)
             service = CsvReconciliationService(request.user)
-            file_to_upload, errors, summary = service.upload_reconciliation(payroll_id, file, upload)
+            _, errors, summary = service.upload_reconciliation(payroll_id, file, upload)
             upload.save(username=request.user.login_name)
-            file_to_upload.seek(0)
-            file_handler.save_file(file_to_upload)
             return Response({
                 "success": True,
                 "error": errors,
@@ -132,15 +133,38 @@ class CSVReconciliationAPIView(views.APIView):
                 "status": upload.status,
                 "summary": summary,
             }, status=201)
-        except Exception as exc:
-            logger.error("Error while uploading CSV reconciliation", exc_info=exc)
+        except ValueError as exc:
+            logger.info("CSV reconciliation upload rejected: %s", exc)
+            error = {"code": "validation_error", "message": str(exc)}
             if upload:
-                upload.error = {'error': str(exc)}
+                upload.error = error
                 upload.payroll = Payroll.objects.filter(id=payroll_id).first()
                 upload.status = CsvReconciliationUpload.Status.FAIL
-                summary = {
-                    'affected_rows': 0,
-                }
-                upload.json_ext = {'extra_info': summary}
+                upload.json_ext = {"extra_info": CsvReconciliationService._upload_summary(upload)}
                 upload.save(username=request.user.login_name)
-            return Response({'success': False, 'error': str(exc)}, status=500)
+            return Response({
+                "success": False,
+                "error": error,
+                "upload_id": str(upload.id),
+                "status": upload.status,
+                "summary": CsvReconciliationService._upload_summary(upload),
+            }, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as exc:
+            logger.error("Error while uploading CSV reconciliation", exc_info=exc)
+            error = {
+                "code": "upload_processing_failed",
+                "message": "The reconciliation file could not be processed. Please correct the file and upload it again.",
+            }
+            if upload:
+                upload.error = error
+                upload.payroll = Payroll.objects.filter(id=payroll_id).first()
+                upload.status = CsvReconciliationUpload.Status.FAIL
+                upload.json_ext = {'extra_info': CsvReconciliationService._upload_summary(upload)}
+                upload.save(username=request.user.login_name)
+            return Response({
+                'success': False,
+                'error': error,
+                'upload_id': str(upload.id),
+                'status': upload.status,
+                'summary': CsvReconciliationService._upload_summary(upload),
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

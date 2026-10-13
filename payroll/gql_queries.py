@@ -7,10 +7,11 @@ from invoice.gql.gql_types.bill_types import BillGQLType
 from location.gql_queries import LocationGQLType
 from individual.gql_queries import IndividualGQLType
 from payroll.models import PaymentPoint, Payroll, BenefitConsumption, \
-    PayrollBenefitConsumption, BenefitAttachment, CsvReconciliationUpload
+    PayrollBenefitConsumption, BenefitAttachment, CsvReconciliationUpload, ReconciliationUploadRow
 from contribution_plan.gql import PaymentPlanGQLType
 from payment_cycle.gql_queries import PaymentCycleGQLType
 from social_protection.models import BenefitPlan
+from tasks_management.models import Task
 
 
 class PaymentPointGQLType(DjangoObjectType):
@@ -174,6 +175,28 @@ class BenefitAttachmentListGQLType(DjangoObjectType):
 
 class CsvReconciliationUploadGQLType(DjangoObjectType):
     uuid = graphene.String(source='uuid')
+    review_task_id = graphene.String()
+    review_task_status = graphene.String()
+
+    @staticmethod
+    def _review_task(upload):
+        if not hasattr(upload, '_reconciliation_review_task'):
+            upload._reconciliation_review_task = Task.objects.filter(
+                source='payroll_reconciliation',
+                data__upload_id=str(upload.id),
+                is_deleted=False,
+            ).order_by('-date_created').first()
+        return upload._reconciliation_review_task
+
+    @classmethod
+    def resolve_review_task_id(cls, upload, info):
+        task = cls._review_task(upload)
+        return str(task.id) if task else None
+
+    @classmethod
+    def resolve_review_task_status(cls, upload, info):
+        task = cls._review_task(upload)
+        return task.status if task else None
 
     class Meta:
         model = CsvReconciliationUpload
@@ -188,6 +211,24 @@ class CsvReconciliationUploadGQLType(DjangoObjectType):
             "is_deleted": ["exact"],
             "version": ["exact"],
             **prefix_filterset("payroll__", PayrollGQLType._meta.filter_fields),
+        }
+        connection_class = ExtendedConnection
+
+
+class ReconciliationUploadRowGQLType(DjangoObjectType):
+    uuid = graphene.String(source='uuid')
+
+    class Meta:
+        model = ReconciliationUploadRow
+        interfaces = (graphene.relay.Node,)
+        filter_fields = {
+            "id": ["exact"],
+            "row_number": ["exact", "lt", "lte", "gt", "gte"],
+            "code": ["exact", "iexact", "istartswith", "icontains"],
+            "national_id": ["exact", "iexact", "istartswith", "icontains"],
+            "status": ["exact", "iexact"],
+            "is_deleted": ["exact"],
+            **prefix_filterset("upload__", CsvReconciliationUploadGQLType._meta.filter_fields),
         }
         connection_class = ExtendedConnection
 
