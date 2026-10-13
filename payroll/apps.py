@@ -115,6 +115,17 @@ class PayrollConfig(AppConfig):
     payment_gateway_class = None
     receipt_length = None
 
+    # Only differences in submitted data may be treated as warnings. Identity,
+    # payroll-membership, payment-state and payment-reference failures must
+    # always block reconciliation.
+    csv_reconciliation_warning_eligible_reasons = {
+        "first_name_mismatch",
+        "last_name_mismatch",
+        "date_of_birth_mismatch",
+        "amount_mismatch",
+        "micro_catchment_mismatch",
+    }
+
     def ready(self):
         from core.models import ModuleConfiguration
 
@@ -130,6 +141,25 @@ class PayrollConfig(AppConfig):
         for field in cfg:
             if hasattr(PayrollConfig, field):
                 setattr(PayrollConfig, field, cfg[field])
+        cls.__validate_reconciliation_config()
+
+    @classmethod
+    def __validate_reconciliation_config(cls):
+        warning_reasons = set(cls.csv_reconciliation_warning_mismatch_reasons or [])
+        unsupported_warnings = warning_reasons - cls.csv_reconciliation_warning_eligible_reasons
+        if unsupported_warnings:
+            raise ValueError(
+                "csv_reconciliation_warning_mismatch_reasons may only contain "
+                f"data mismatches: {', '.join(sorted(unsupported_warnings))}"
+            )
+
+        blocking_reasons = set(cls.csv_reconciliation_blocking_mismatch_reasons or [])
+        overlapping_reasons = warning_reasons & blocking_reasons
+        if overlapping_reasons:
+            raise ValueError(
+                "Reconciliation mismatch reasons cannot be both blocking and warnings: "
+                f"{', '.join(sorted(overlapping_reasons))}"
+            )
 
     def __register_filters_and_payment_methods(cls):
         from social_protection.custom_filters import BenefitPlanCustomFilterWizard

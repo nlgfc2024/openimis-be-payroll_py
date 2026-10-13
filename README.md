@@ -74,6 +74,13 @@
 
 This section details the configuration settings required for integrating with a digital payment gateway. The settings are defined in the application's configuration file (`apps.py`).
 
+## Reconciliation Upload Validation Configuration
+
+- **csv_reconciliation_blocking_mismatch_reasons**: Mismatch reasons that prevent a row from being applied. The default is strict and blocks every known mismatch.
+- **csv_reconciliation_warning_mismatch_reasons**: Safe data mismatches that may remain valid: first name, last name, date of birth, amount, or micro-catchment. Structural and payment-integrity failures cannot be warnings.
+- **csv_reconciliation_amount_tolerance**: Maximum permitted absolute difference between the submitted and expected amount. The default is `0`.
+- **csv_reconciliation_micro_catchment_column**: CSV header containing the micro-catchment value. The default is `Micro Catchment`.
+
 ### Configuration Parameters
 
 - **gateway_base_url**: The base URL of the payment gateway's API.

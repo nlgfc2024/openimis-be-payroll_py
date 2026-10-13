@@ -179,21 +179,23 @@ class CsvReconciliationUploadGQLType(DjangoObjectType):
     review_task_status = graphene.String()
 
     @staticmethod
-    def resolve_review_task_id(upload, info):
-        task = Task.objects.filter(
-            source='payroll_reconciliation',
-            data__upload_id=str(upload.id),
-            is_deleted=False,
-        ).order_by('-date_created').first()
+    def _review_task(upload):
+        if not hasattr(upload, '_reconciliation_review_task'):
+            upload._reconciliation_review_task = Task.objects.filter(
+                source='payroll_reconciliation',
+                data__upload_id=str(upload.id),
+                is_deleted=False,
+            ).order_by('-date_created').first()
+        return upload._reconciliation_review_task
+
+    @classmethod
+    def resolve_review_task_id(cls, upload, info):
+        task = cls._review_task(upload)
         return str(task.id) if task else None
 
-    @staticmethod
-    def resolve_review_task_status(upload, info):
-        task = Task.objects.filter(
-            source='payroll_reconciliation',
-            data__upload_id=str(upload.id),
-            is_deleted=False,
-        ).order_by('-date_created').first()
+    @classmethod
+    def resolve_review_task_status(cls, upload, info):
+        task = cls._review_task(upload)
         return task.status if task else None
 
     class Meta:

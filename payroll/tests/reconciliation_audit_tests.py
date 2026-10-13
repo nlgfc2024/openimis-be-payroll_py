@@ -32,6 +32,18 @@ class ReconciliationAuditPolicyTests(SimpleTestCase):
         self.assertTrue(CsvReconciliationService._has_blocking_reason(["missing_code"]))
         self.assertTrue(CsvReconciliationService._has_blocking_reason(["new_unconfigured_reason"]))
 
+    def test_only_data_mismatches_can_be_configured_as_warnings(self):
+        original_warnings = PayrollConfig.csv_reconciliation_warning_mismatch_reasons
+        original_blocking = PayrollConfig.csv_reconciliation_blocking_mismatch_reasons
+        try:
+            PayrollConfig.csv_reconciliation_warning_mismatch_reasons = ["code_not_in_payroll"]
+            PayrollConfig.csv_reconciliation_blocking_mismatch_reasons = []
+            with self.assertRaises(ValueError):
+                PayrollConfig._PayrollConfig__validate_reconciliation_config()
+        finally:
+            PayrollConfig.csv_reconciliation_warning_mismatch_reasons = original_warnings
+            PayrollConfig.csv_reconciliation_blocking_mismatch_reasons = original_blocking
+
     def test_upload_summary_uses_audited_record_keys(self):
         upload = SimpleNamespace(
             id="upload-id",
