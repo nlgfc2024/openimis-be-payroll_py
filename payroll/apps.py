@@ -43,6 +43,20 @@ DEFAULT_CONFIG = {
     "csv_reconciliation_code_column": "code",
     "csv_reconciliation_paid_yes": "Yes",
     "csv_reconciliation_paid_no": "No",
+    # Reconciliation validation is policy driven.  The defaults deliberately
+    # preserve the current behaviour: every known mismatch blocks application
+    # and amount values must match exactly.
+    "csv_reconciliation_blocking_mismatch_reasons": [
+        "missing_code", "duplicate_code_in_file", "duplicate_national_id_in_file",
+        "code_not_found", "code_not_in_payroll", "payroll_name_mismatch",
+        "payroll_status_mismatch", "first_name_mismatch", "last_name_mismatch",
+        "date_of_birth_mismatch", "status_mismatch", "amount_mismatch",
+        "type_mismatch", "micro_catchment_mismatch", "invalid_paid_value",
+        "missing_payment_reference",
+    ],
+    "csv_reconciliation_warning_mismatch_reasons": [],
+    "csv_reconciliation_amount_tolerance": "0",
+    "csv_reconciliation_micro_catchment_column": "Micro Catchment",
     "payroll_delete_event": "payroll.payroll_delete",
     "benefit_delete_event": "payroll.benefit_delete",
 
@@ -83,6 +97,10 @@ class PayrollConfig(AppConfig):
     csv_reconciliation_code_column = None
     csv_reconciliation_paid_yes = None
     csv_reconciliation_paid_no = None
+    csv_reconciliation_blocking_mismatch_reasons = None
+    csv_reconciliation_warning_mismatch_reasons = None
+    csv_reconciliation_amount_tolerance = None
+    csv_reconciliation_micro_catchment_column = None
     payroll_delete_event = None
     benefit_delete_event = None
 

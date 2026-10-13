@@ -327,10 +327,16 @@ class BenefitConsumptionService(BaseService):
 
 
 class CsvReconciliationService:
-    MICRO_CATCHMENT_COLUMN = "Micro Catchment"
 
     def __init__(self, user: InteractiveUser):
         self.user = user
+
+    @property
+    def micro_catchment_column(self):
+        # Existing deployments can have a persisted module configuration that
+        # predates this setting, so retain the historical header until it is
+        # explicitly configured.
+        return PayrollConfig.csv_reconciliation_micro_catchment_column or "Micro Catchment"
 
     def download_reconciliation(self, payroll_id) -> BytesIO:
         payroll = self._resolve_payroll(payroll_id)
@@ -346,7 +352,7 @@ class CsvReconciliationService:
 
         extra_info_keys = set()
         extra_info_dicts = []
-        mapped_headers = set(field_mapping.values()) | {self.MICRO_CATCHMENT_COLUMN}
+        mapped_headers = set(field_mapping.values()) | {self.micro_catchment_column}
         for record in records:
             benefit = benefits_by_code[record["code"]]
             record["micro_catchment"] = self._get_micro_catchment(benefit)
@@ -359,14 +365,14 @@ class CsvReconciliationService:
             lambda row: self._fill_paid_column(row), axis=1
         )
         df.rename(
-            columns={**field_mapping, "micro_catchment": self.MICRO_CATCHMENT_COLUMN},
+            columns={**field_mapping, "micro_catchment": self.micro_catchment_column},
             inplace=True,
         )
         export_columns = list(field_mapping.values())
         try:
-            export_columns.insert(export_columns.index("District Name") + 1, self.MICRO_CATCHMENT_COLUMN)
+            export_columns.insert(export_columns.index("District Name") + 1, self.micro_catchment_column)
         except ValueError:
-            export_columns.append(self.MICRO_CATCHMENT_COLUMN)
+            export_columns.append(self.micro_catchment_column)
         export_columns.append(PayrollConfig.csv_reconciliation_paid_extra_field)
         for key in extra_info_keys:
             df[key] = [extra_info.get(key) for extra_info in extra_info_dicts]
@@ -474,7 +480,7 @@ class CsvReconciliationService:
                 payroll, row, code, national_id, duplicate_codes, duplicate_national_ids,
                 benefits_by_code, contexts_by_benefit_id,
             )
-            upload_rows.append(ReconciliationUploadRow(
+            upload_row = ReconciliationUploadRow(
                 upload=upload,
                 user_created=self.user,
                 user_updated=self.user,
@@ -484,10 +490,14 @@ class CsvReconciliationService:
                 national_id=national_id,
                 submitted_data={str(key): self._json_value(value) for key, value in row.items()},
                 mismatch_reasons=reasons,
-                status=(ReconciliationUploadRow.Status.INVALID if reasons
+                status=(ReconciliationUploadRow.Status.INVALID if self._has_blocking_reason(reasons)
                         else ReconciliationUploadRow.Status.VALID),
-            ))
-            if reasons:
+            )
+            # HistoryModel deliberately has no database UUID default.  These rows
+            # are inserted in bulk, so assign the primary key before bulk_create.
+            upload_row.set_pk()
+            upload_rows.append(upload_row)
+            if self._has_blocking_reason(reasons):
                 errors[str(row_number)] = reasons
             else:
                 valid_indexes.append(index)
@@ -704,8 +714,8 @@ class CsvReconciliationService:
             if not comparator(row.get(column), expected_value):
                 reasons.append(mismatch_reason)
 
-        if self.MICRO_CATCHMENT_COLUMN in row.index and not self._matches_text(
-                row.get(self.MICRO_CATCHMENT_COLUMN), context.get("micro_catchment")):
+        if self.micro_catchment_column in row.index and not self._matches_text(
+                row.get(self.micro_catchment_column), context.get("micro_catchment")):
             reasons.append("micro_catchment_mismatch")
 
         paid = self._clean_value(row.get(PayrollConfig.csv_reconciliation_paid_extra_field))
@@ -758,9 +768,18 @@ class CsvReconciliationService:
     @staticmethod
     def _amounts_match(submitted_amount, benefit_amount):
         try:
-            return Decimal(str(submitted_amount).replace(',', '')) == Decimal(str(benefit_amount))
+            tolerance = Decimal(str(PayrollConfig.csv_reconciliation_amount_tolerance or "0"))
+            return abs(Decimal(str(submitted_amount).replace(',', '')) - Decimal(str(benefit_amount))) <= tolerance
         except (InvalidOperation, TypeError, ValueError):
             return False
+
+    @staticmethod
+    def _has_blocking_reason(reasons):
+        blocking_reasons = set(PayrollConfig.csv_reconciliation_blocking_mismatch_reasons or [])
+        warning_reasons = set(PayrollConfig.csv_reconciliation_warning_mismatch_reasons or [])
+        # Unknown reasons stay blocking so a new validator cannot silently
+        # make an upload applicable before policy has been configured.
+        return any(reason in blocking_reasons or reason not in warning_reasons for reason in reasons)
 
 
 
@@ -823,7 +842,7 @@ class CsvReconciliationService:
         extra_info = {
             k: row[k] for k in row.index
             if k not in PayrollConfig.csv_reconciliation_field_mapping
-            and k != self.MICRO_CATCHMENT_COLUMN
+            and k != self.micro_catchment_column
             and not pd.isna(row[k])
         }
         bc.json_ext = {'extra_info': extra_info}
