@@ -14,6 +14,18 @@ from social_protection.models import BenefitPlan
 from tasks_management.models import Task
 
 
+def _malawi_locations(individual):
+    """Return a beneficiary's village and ancestors keyed by location type."""
+    locations = {}
+    location = individual.location
+    # The supported hierarchy is District (R) -> TA (D) -> GVH (W) -> Village (V).
+    # The guard also makes incomplete or malformed historical hierarchies safe to display.
+    while location and location.id not in {item.id for item in locations.values()}:
+        locations[location.type] = location
+        location = location.parent
+    return locations
+
+
 class PaymentPointGQLType(DjangoObjectType):
     uuid = graphene.String(source='uuid')
 
@@ -60,6 +72,11 @@ class BenefitConsumptionGQLType(DjangoObjectType):
     national_id = graphene.String()
     form_number = graphene.String()
     phone_number = graphene.String()
+    district_name = graphene.String()
+    traditional_authority_name = graphene.String()
+    group_village_head_name = graphene.String()
+    catchment_name = graphene.String()
+    project_name = graphene.String()
 
     class Meta:
         model = BenefitConsumption
@@ -100,6 +117,62 @@ class BenefitConsumptionGQLType(DjangoObjectType):
     def resolve_phone_number(self, info):
         phone_number = (self.individual.json_ext or {}).get("household_mobile_number")
         return str(phone_number) if phone_number is not None else None
+
+    def resolve_district_name(self, info):
+        location = _malawi_locations(self.individual).get("R")
+        return location.name if location else None
+
+    def resolve_traditional_authority_name(self, info):
+        location = _malawi_locations(self.individual).get("D")
+        return location.name if location else None
+
+    def resolve_group_village_head_name(self, info):
+        location = _malawi_locations(self.individual).get("W")
+        return location.name if location else None
+
+    def resolve_catchment_name(self, info):
+        """Resolve catchment by GVH, with TA as the fallback mapping."""
+        from location.models import MicroCatchmentGVH, MicroCatchmentTA
+
+        locations = _malawi_locations(self.individual)
+        gvh = locations.get("W")
+        ta = locations.get("D")
+        if gvh:
+            link = MicroCatchmentGVH.objects.filter(
+                location_id=gvh.id, validity_to__isnull=True,
+            ).select_related("micro_catchment").first()
+            if link:
+                return link.micro_catchment.name
+        if ta:
+            link = MicroCatchmentTA.objects.filter(
+                location_id=ta.id, validity_to__isnull=True,
+            ).select_related("micro_catchment").first()
+            if link:
+                return link.micro_catchment.name
+        return None
+
+    def resolve_project_name(self, info):
+        """Return the project(s) that selected this beneficiary for the payroll."""
+        from project_social_protection.models import Project
+
+        payroll_link = self.payrollbenefitconsumption_set.filter(
+            is_deleted=False, payroll__is_deleted=False,
+        ).select_related("payroll").order_by("-date_created").first()
+        project_ids = (
+            (payroll_link.payroll.json_ext or {}).get("filter_criteria", {}).get("project_ids", [])
+            if payroll_link else []
+        )
+        if project_ids:
+            # A payroll is created from these selected projects. Do not require an
+            # individual enrollment here: legacy payroll rows can predate it.
+            projects = Project.objects.filter(id__in=project_ids, is_deleted=False)
+        else:
+            projects = Project.objects.filter(
+                beneficiary_enrollments__beneficiary__individual_id=self.individual_id,
+                beneficiary_enrollments__is_deleted=False,
+                is_deleted=False,
+            )
+        return ", ".join(projects.order_by("name").values_list("name", flat=True).distinct()) or None
 
 
 class PayrollGQLType(DjangoObjectType):
