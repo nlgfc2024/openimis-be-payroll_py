@@ -28,6 +28,7 @@ from payroll.models import (
     BenefitConsumption,
     BenefitAttachment,
     BenefitConsumptionStatus,
+    PayrollStatus,
     CsvReconciliationUpload,
     ReconciliationUploadRow
 )
@@ -145,8 +146,17 @@ class PayrollService(BaseService):
     @register_service_signal('payroll_service.close_payroll')
     def close_payroll(self, obj_data):
         payroll_to_close = Payroll.objects.get(id=obj_data['id'])
+        existing_task = Task.objects.filter(
+            source='payroll_reconciliation',
+            entity_id=str(payroll_to_close.id),
+            business_event=PayrollConfig.payroll_reconciliation_event,
+            status__in=[Task.Status.RECEIVED, Task.Status.ACCEPTED],
+            is_deleted=False,
+        ).exists()
+        if existing_task:
+            raise ValueError('A reconciliation review task is already pending for this payroll.')
         data = {'id': payroll_to_close.id}
-        TaskService(self.user).create({
+        task = TaskService(self.user).create({
             'source': 'payroll_reconciliation',
             'entity': payroll_to_close,
             'status': Task.Status.RECEIVED,
@@ -154,6 +164,12 @@ class PayrollService(BaseService):
             'business_event': PayrollConfig.payroll_reconciliation_event,
             'data': _get_std_task_data_payload(data)
         })
+        if not task.get('success', False):
+            raise ValueError(task.get('error') or 'Unable to create reconciliation review task')
+        # Creating the task is not reconciliation. Keep the payroll visible in
+        # a dedicated queue until a reviewer completes that task.
+        payroll_to_close.status = PayrollStatus.PENDING_RECONCILIATION
+        payroll_to_close.save(username=self.user.login_name)
 
     @register_service_signal('payroll_service.reject_approve_payroll')
     def reject_approved_payroll(self, obj_data):
@@ -236,7 +252,7 @@ class PayrollService(BaseService):
         if project_ids:
             beneficiaries_queryset = beneficiaries_queryset.filter(
                 project_enrollments__project__id__in=project_ids,
-                project_enrollments__is_deleted=False
+                project_enrollments__is_deleted=False,
             )
 
         location_ids = filter_criteria.get("location_ids", [])
