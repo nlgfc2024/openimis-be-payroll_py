@@ -7,7 +7,7 @@ from openIMIS.openimisapps import openimis_apps
 from tasks_management.models import Task
 from tasks_management.services import TaskService
 from payroll.apps import PayrollConfig
-from payroll.models import Payroll, BenefitConsumption, BenefitConsumptionStatus, CsvReconciliationUpload
+from payroll.models import Payroll, PayrollStatus, BenefitConsumption, BenefitConsumptionStatus, CsvReconciliationUpload
 from payroll.payments_registry import PaymentMethodStorage
 from payroll.services import PayrollService, CsvReconciliationService
 from payroll.strategies import StrategyOfPaymentInterface
@@ -47,8 +47,9 @@ def bind_service_signals():
     def on_task_complete_payroll_reconcilation(**kwargs):
         def reconcile_payroll(payroll, user):
             strategy = PaymentMethodStorage.get_chosen_payment_method(payroll.payment_method)
-            if strategy:
-                strategy.reconcile_payroll(payroll, user)
+            if not strategy:
+                raise ValueError(f'No payment strategy is registered for {payroll.payment_method}.')
+            strategy.reconcile_payroll(payroll, user)
         result = None
         user = None
         task = None
@@ -72,6 +73,13 @@ def bind_service_signals():
                     upload_id = task.get('data', {}).get('upload_id')
                     if upload_id:
                         CsvReconciliationUpload.objects.filter(id=upload_id, status=CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION).update(status=CsvReconciliationUpload.Status.FAIL)
+                    else:
+                        payroll = Payroll.objects.get(id=task['entity_id'])
+                        # A failed close/reconciliation review must not leave
+                        # a payroll hidden in the pending queue.
+                        if payroll.status == PayrollStatus.PENDING_RECONCILIATION:
+                            payroll.status = PayrollStatus.APPROVE_FOR_PAYMENT
+                            payroll.save(username=user.login_name)
         except Exception as exc:
             logger.error("Error while executing on_task_complete_payroll_reconciliation", exc_info=exc)
             # A completed checker task has already emitted its completion
@@ -95,8 +103,13 @@ def bind_service_signals():
                             "apply_error": str(exc),
                         }
                         failed_upload.save(username=user.login_name if user else None)
-                    if user:
-                        TaskService(user).complete_task({"id": task["id"], "failed": True})
+                else:
+                    payroll = Payroll.objects.filter(id=task['entity_id']).first()
+                    if payroll and payroll.status == PayrollStatus.PENDING_RECONCILIATION:
+                        payroll.status = PayrollStatus.APPROVE_FOR_PAYMENT
+                        payroll.save(username=user.login_name if user else None)
+                if user:
+                    TaskService(user).complete_task({"id": task["id"], "failed": True})
 
     def on_task_complete_payroll_reject_approved_payroll(**kwargs):
         def reject_approved_payroll(payroll, user):

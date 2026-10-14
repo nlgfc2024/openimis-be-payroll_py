@@ -36,6 +36,7 @@ class CreatePayrollInput(OpenIMISMutation.Input):
     class PayrollStatusEnum(graphene.Enum):
         PENDING_APPROVAL = PayrollStatus.PENDING_APPROVAL
         APPROVE_FOR_PAYMENT = PayrollStatus.APPROVE_FOR_PAYMENT
+        PENDING_RECONCILIATION = PayrollStatus.PENDING_RECONCILIATION
         REJECTED = PayrollStatus.REJECTED
         RECONCILED = PayrollStatus.RECONCILED
 
