@@ -1,5 +1,7 @@
 import graphene
 from graphene_django import DjangoObjectType
+from django.apps import apps
+from django.db.models import Prefetch
 
 from core import prefix_filterset, ExtendedConnection
 from core.gql_queries import UserGQLType
@@ -12,6 +14,48 @@ from contribution_plan.gql import PaymentPlanGQLType
 from payment_cycle.gql_queries import PaymentCycleGQLType
 from social_protection.models import BenefitPlan
 from tasks_management.models import Task
+from payroll.utils import get_micro_catchment_name
+
+
+def _malawi_locations(individual):
+    """Return a beneficiary's village and ancestors keyed by location type."""
+    locations = {}
+    location = individual.location
+    # The supported hierarchy is District (R) -> TA (D) -> GVH (W) -> Village (V).
+    # The guard also makes incomplete or malformed historical hierarchies safe to display.
+    while location and location.id not in {item.id for item in locations.values()}:
+        locations[location.type] = location
+        location = location.parent
+    return locations
+
+
+def benefit_consumption_queryset(queryset):
+    """Load data used by payroll-context resolvers in fixed-size queries."""
+    BeneficiaryProjectEnrollment = apps.get_model(
+        "project_social_protection", "BeneficiaryProjectEnrollment",
+    )
+    from social_protection.models import Beneficiary
+
+    enrollments = BeneficiaryProjectEnrollment.objects.filter(
+        is_deleted=False,
+        project__is_deleted=False,
+    ).select_related("project")
+    beneficiaries = Beneficiary.objects.filter(is_deleted=False).prefetch_related(
+        Prefetch("project_enrollments", queryset=enrollments, to_attr="active_project_enrollments"),
+    )
+    return queryset.select_related(
+        "individual__location__parent__parent__parent",
+    ).prefetch_related(
+        Prefetch("individual__beneficiary_set", queryset=beneficiaries, to_attr="active_beneficiaries"),
+        Prefetch(
+            "payrollbenefitconsumption_set",
+            queryset=PayrollBenefitConsumption.objects.filter(
+                is_deleted=False,
+                payroll__is_deleted=False,
+            ).select_related("payroll").order_by("-date_created"),
+            to_attr="active_payroll_links",
+        ),
+    )
 
 
 class PaymentPointGQLType(DjangoObjectType):
@@ -60,6 +104,11 @@ class BenefitConsumptionGQLType(DjangoObjectType):
     national_id = graphene.String()
     form_number = graphene.String()
     phone_number = graphene.String()
+    district_name = graphene.String()
+    traditional_authority_name = graphene.String()
+    group_village_head_name = graphene.String()
+    catchment_name = graphene.String()
+    project_name = graphene.String()
 
     class Meta:
         model = BenefitConsumption
@@ -101,6 +150,57 @@ class BenefitConsumptionGQLType(DjangoObjectType):
         phone_number = (self.individual.json_ext or {}).get("household_mobile_number")
         return str(phone_number) if phone_number is not None else None
 
+    def resolve_district_name(self, info):
+        location = _malawi_locations(self.individual).get("R")
+        return location.name if location else None
+
+    def resolve_traditional_authority_name(self, info):
+        location = _malawi_locations(self.individual).get("D")
+        return location.name if location else None
+
+    def resolve_group_village_head_name(self, info):
+        location = _malawi_locations(self.individual).get("W")
+        return location.name if location else None
+
+    def resolve_catchment_name(self, info):
+        return get_micro_catchment_name(self.individual.location)
+
+    def resolve_project_name(self, info):
+        """Return the project(s) that selected this beneficiary for the payroll."""
+        from project_social_protection.models import Project
+
+        payroll_links = getattr(self, "active_payroll_links", None)
+        payroll_link = payroll_links[0] if payroll_links else self.payrollbenefitconsumption_set.filter(
+            is_deleted=False, payroll__is_deleted=False,
+        ).select_related("payroll").order_by("-date_created").first()
+        project_ids = (
+            (payroll_link.payroll.json_ext or {}).get("filter_criteria", {}).get("project_ids", [])
+            if payroll_link else []
+        )
+        beneficiaries = getattr(self.individual, "active_beneficiaries", None)
+        if beneficiaries is None:
+            beneficiaries = self.individual.beneficiary_set.filter(is_deleted=False).prefetch_related(
+                "project_enrollments__project",
+            )
+        enrolled_projects = []
+        for beneficiary in beneficiaries:
+            enrollments = getattr(beneficiary, "active_project_enrollments", None)
+            if enrollments is None:
+                enrollments = beneficiary.project_enrollments.filter(
+                    is_deleted=False,
+                    project__is_deleted=False,
+                ).select_related("project")
+            enrolled_projects.extend(enrollment.project for enrollment in enrollments)
+        if project_ids and enrolled_projects:
+            selected_ids = {str(id_) for id_ in project_ids}
+            projects = [project for project in enrolled_projects if str(project.id) in selected_ids]
+        elif enrolled_projects:
+            projects = enrolled_projects
+        else:
+            projects = Project.objects.filter(id__in=project_ids, is_deleted=False) if project_ids else []
+        names = sorted({project.name for project in projects})
+        return ", ".join(names) or None
+
 
 class PayrollGQLType(DjangoObjectType):
     uuid = graphene.String(source='uuid')
@@ -129,9 +229,13 @@ class PayrollGQLType(DjangoObjectType):
         connection_class = ExtendedConnection
 
     def resolve_benefit_consumption(self, info):
-        return BenefitConsumption.objects.filter(payrollbenefitconsumption__payroll__id=self.id,
-                                                 is_deleted=False,
-                                                 payrollbenefitconsumption__is_deleted=False)
+        return benefit_consumption_queryset(BenefitConsumption.objects.filter(
+            payrollbenefitconsumption__payroll__id=self.id,
+            is_deleted=False,
+            payrollbenefitconsumption__is_deleted=False,
+            individual__groupindividuals__recipient_type="PRIMARY",
+            individual__groupindividuals__is_deleted=False,
+        ).distinct())
 
     def resolve_benefit_plan_name_code(self, info):
         benefit_plan = BenefitPlan.objects.get(id=self.payment_plan.benefit_plan.id, is_deleted=False)

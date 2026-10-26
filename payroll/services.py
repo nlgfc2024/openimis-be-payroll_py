@@ -126,6 +126,16 @@ class PayrollService(BaseService):
     @check_authentication
     @register_service_signal('payroll_service.attach_benefit_to_payroll')
     def attach_benefit_to_payroll(self, payroll_id, benefit_id):
+        active_links = PayrollBenefitConsumption.objects.filter(
+            benefit_id=benefit_id,
+            is_deleted=False,
+        )
+        if active_links.exclude(payroll_id=payroll_id).exists():
+            raise ValidationError(
+                "A benefit consumption can belong to only one active payroll."
+            )
+        if active_links.filter(payroll_id=payroll_id).exists():
+            return
         payroll_benefit = PayrollBenefitConsumption(payroll_id=payroll_id, benefit_id=benefit_id)
         payroll_benefit.save(user=self.user)
 
@@ -232,8 +242,18 @@ class PayrollService(BaseService):
 
         filter_criteria = json_ext.get("filter_criteria", {})
 
+        # Payrolls are paid to the primary recipient for a household, never
+        # to every member of the household.
+        beneficiaries_queryset = beneficiaries_queryset.filter(
+            individual__groupindividuals__recipient_type="PRIMARY",
+            individual__groupindividuals__is_deleted=False,
+        )
+
         project_ids = filter_criteria.get("project_ids", [])
         if project_ids:
+            # Project-scoped payrolls use the intersection: the household's
+            # primary recipient must also be explicitly enrolled in one of
+            # the projects selected for the payroll.
             beneficiaries_queryset = beneficiaries_queryset.filter(
                 project_enrollments__project__id__in=project_ids,
                 project_enrollments__is_deleted=False
@@ -568,6 +588,8 @@ class CsvReconciliationService:
                 is_deleted=False,
                 payrollbenefitconsumption__payroll=payroll,
                 payrollbenefitconsumption__is_deleted=False,
+                individual__groupindividuals__recipient_type="PRIMARY",
+                individual__groupindividuals__is_deleted=False,
             ).select_related("individual", "individual__location").distinct()
         )
         benefits_by_code = {benefit.code: benefit for benefit in benefits}
@@ -688,7 +710,12 @@ class CsvReconciliationService:
 
         benefit = (benefits_by_code or {}).get(code)
         if benefit is None and benefits_by_code is None:
-            benefit = BenefitConsumption.objects.filter(code=code, is_deleted=False).select_related("individual").first()
+            benefit = BenefitConsumption.objects.filter(
+                code=code,
+                is_deleted=False,
+                individual__groupindividuals__recipient_type="PRIMARY",
+                individual__groupindividuals__is_deleted=False,
+            ).select_related("individual").first()
         if not benefit:
             return None, reasons + ["code_not_found"]
         if benefits_by_code is None and not benefit.payrollbenefitconsumption_set.filter(payroll=payroll).exists():
@@ -795,7 +822,12 @@ class CsvReconciliationService:
         }
 
     def _get_benefit_consumption_qs(self, payroll):
-        qs = BenefitConsumption.objects.filter(payrollbenefitconsumption__payroll=payroll, is_deleted=False)
+        qs = BenefitConsumption.objects.filter(
+            payrollbenefitconsumption__payroll=payroll,
+            is_deleted=False,
+            individual__groupindividuals__recipient_type="PRIMARY",
+            individual__groupindividuals__is_deleted=False,
+        ).distinct()
         if not qs.exists():
             raise ValueError('csv_reconciliation.validation.no_benefit_consumption_for_payroll')
         return qs

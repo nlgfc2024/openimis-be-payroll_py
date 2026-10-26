@@ -2,6 +2,32 @@ import random
 from django.apps import apps
 
 
+def get_micro_catchment_name(location):
+    """Return the active micro-catchment mapped to a beneficiary's GVH.
+
+    A TA may belong to more than one micro-catchment, so it is deliberately
+    not used as a fallback. This keeps payroll views and CSV reconciliation
+    exports deterministic.
+    """
+    while location and location.type != "W":
+        location = location.parent
+    if not location:
+        return None
+
+    MicroCatchmentGVH = apps.get_model("location", "MicroCatchmentGVH")
+    link = (
+        MicroCatchmentGVH.objects.filter(
+            location_id=location.id,
+            validity_to__isnull=True,
+            micro_catchment__validity_to__isnull=True,
+        )
+        .select_related("micro_catchment")
+        .order_by("micro_catchment__name")
+        .first()
+    )
+    return link.micro_catchment.name if link else None
+
+
 class CodeGenerator:
     @classmethod
     def generate_unique_code(cls, app_label, model_name, code_field_name, length):
