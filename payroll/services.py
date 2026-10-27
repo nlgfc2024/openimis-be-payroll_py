@@ -1,5 +1,6 @@
 import hashlib
 import logging
+import uuid
 from decimal import Decimal, InvalidOperation
 import pandas as pd
 from io import BytesIO
@@ -24,12 +25,16 @@ from payroll.apps import PayrollConfig
 from payroll.models import (
     PaymentPoint,
     Payroll,
+    PayrollStatus,
     PayrollBenefitConsumption,
     BenefitConsumption,
     BenefitAttachment,
     BenefitConsumptionStatus,
     CsvReconciliationUpload,
-    ReconciliationUploadRow
+    ReconciliationUploadRow,
+    DistrictPayrollBatch,
+    DistrictPayrollBatchPayroll,
+    DistrictPayrollBatchStatus,
 )
 from payroll.tasks import send_requests_to_gateway_payment
 from payroll.utils import PayrollNameGenerator
@@ -346,6 +351,280 @@ class BenefitConsumptionService(BaseService):
             benefit_attachment.save(user=self.user)
 
 
+class DistrictPayrollBatchService:
+    """Build a district payment file without merging the source project payrolls."""
+
+    source_payroll_id_column = "Source Payroll ID"
+    source_payroll_name_column = "Source Payroll Name"
+    project_name_column = "Project Name"
+    catchment_column = "Catchment Name"
+
+    def __init__(self, user: InteractiveUser):
+        self.user = user
+
+    @staticmethod
+    def _project_id(payroll):
+        criteria = (payroll.json_ext or {}).get("filter_criteria", {})
+        project_ids = {str(project_id) for project_id in criteria.get("project_ids", []) if project_id}
+        # District reconciliation is only safe for a single-project payroll.
+        return next(iter(project_ids)) if len(project_ids) == 1 else None
+
+    @staticmethod
+    def _district_id(project):
+        from location.models import Location
+
+        location = project.location
+        while location and location.type != "R":
+            location = Location.objects.filter(id=location.parent_id).only("id", "type", "parent_id").first()
+        return str(location.id) if location else None
+
+    def _eligible_payrolls(self, district_id, benefit_plan_id):
+        project_model = apps.get_model("project_social_protection", "Project")
+        payrolls = Payroll.objects.filter(
+            payment_plan__benefit_plan_id=str(benefit_plan_id),
+            status=PayrollStatus.APPROVE_FOR_PAYMENT,
+            is_deleted=False,
+        ).select_related("payment_cycle", "payment_plan")
+        project_ids = {project_id for payroll in payrolls if (project_id := self._project_id(payroll))}
+        projects = {
+            str(project.id): project
+            for project in project_model.objects.filter(id__in=project_ids, is_deleted=False).select_related("location")
+        }
+        return [
+            payroll for payroll in payrolls
+            if (project := projects.get(self._project_id(payroll)))
+            and self._district_id(project) == str(district_id)
+        ]
+
+    @transaction.atomic
+    def get_or_create_batch(self, district_id, benefit_plan_id):
+        eligible_payrolls = self._eligible_payrolls(district_id, benefit_plan_id)
+        if not eligible_payrolls:
+            raise ValueError("No approved, single-project payrolls were found for this district, payment cycle, and payment plan.")
+
+        batch = DistrictPayrollBatch.objects.select_for_update().filter(
+            district_id=district_id,
+            benefit_plan_id=str(benefit_plan_id),
+        ).first()
+        if not batch:
+            batch = DistrictPayrollBatch(
+                district_id=district_id,
+                benefit_plan_id=str(benefit_plan_id),
+                status=DistrictPayrollBatchStatus.DRAFT,
+            )
+            batch.id = uuid.uuid4()
+            batch.save(force_insert=True)
+
+        if batch.status != DistrictPayrollBatchStatus.DRAFT:
+            return batch
+
+        DistrictPayrollBatchPayroll.objects.filter(batch=batch).delete()
+        links = []
+        total_records = 0
+        reconciliation_service = CsvReconciliationService(self.user)
+        for payroll in eligible_payrolls:
+            total_records += reconciliation_service._get_benefit_consumption_qs(payroll).count()
+            link = DistrictPayrollBatchPayroll(batch=batch, payroll=payroll)
+            link.id = uuid.uuid4()
+            links.append(link)
+        DistrictPayrollBatchPayroll.objects.bulk_create(links)
+        batch.total_records = total_records
+        batch.save(update_fields=["total_records", "updated_at"])
+        return batch
+
+    @transaction.atomic
+    def download_reconciliation(self, district_id, benefit_plan_id):
+        batch = self.get_or_create_batch(district_id, benefit_plan_id)
+        records = []
+        reconciliation_service = CsvReconciliationService(self.user)
+        project_model = apps.get_model("project_social_protection", "Project")
+        project_ids = {
+            self._project_id(link.payroll)
+            for link in DistrictPayrollBatchPayroll.objects.filter(batch=batch).select_related("payroll")
+            if self._project_id(link.payroll)
+        }
+        projects = {
+            str(project.id): project
+            for project in project_model.objects.filter(id__in=project_ids, is_deleted=False).select_related("micro_catchment")
+        }
+        field_mapping = PayrollConfig.csv_reconciliation_field_mapping
+        for link in DistrictPayrollBatchPayroll.objects.filter(batch=batch).select_related("payroll"):
+            payroll = link.payroll
+            project = projects.get(self._project_id(payroll))
+            benefits = reconciliation_service._get_benefit_consumption_qs(payroll)
+            for benefit in benefits.select_related("individual", "individual__location"):
+                record = BenefitConsumption.objects.filter(id=benefit.id).values(*field_mapping.keys()).first()
+                record[self.source_payroll_id_column] = str(payroll.id)
+                record[self.source_payroll_name_column] = payroll.name
+                record[self.project_name_column] = project.name if project else None
+                record[self.catchment_column] = (
+                    project.micro_catchment.name if project and project.micro_catchment else None
+                )
+                record[PayrollConfig.csv_reconciliation_paid_extra_field] = reconciliation_service._fill_paid_column(record)
+                records.append(record)
+
+        df = pd.DataFrame.from_records(records)
+        df.rename(columns=field_mapping, inplace=True)
+        export_columns = [
+            self.source_payroll_id_column,
+            self.source_payroll_name_column,
+            "Payroll Name",
+            "Payroll Status",
+            "District Name",
+            self.catchment_column,
+            self.project_name_column,
+            "Form Number",
+            "Phone Number",
+            "First Name",
+            "Last Name",
+            "National ID",
+            "Date of Birth",
+            "Code",
+            "Status",
+            "Amount",
+            "Type",
+            "Receipt",
+            PayrollConfig.csv_reconciliation_paid_extra_field,
+        ]
+        df = df.reindex(columns=export_columns)
+        in_memory_file = BytesIO()
+        df.to_csv(in_memory_file, index=False)
+        batch.status = DistrictPayrollBatchStatus.DOWNLOADED
+        batch.save(update_fields=["status", "updated_at"])
+        return batch, in_memory_file
+
+    @transaction.atomic
+    def upload_reconciliation(self, district_id, benefit_plan_id, file, upload):
+        """Validate a returned provider file against the immutable batch membership."""
+        if not file:
+            raise ValueError("A reconciliation CSV file is required.")
+        contents = file.read()
+        if not contents:
+            raise ValueError("Import file is empty")
+        batch = self.get_or_create_batch(district_id, benefit_plan_id)
+        if batch.status not in (DistrictPayrollBatchStatus.DOWNLOADED, DistrictPayrollBatchStatus.DRAFT):
+            raise ValueError("This district batch is not available for a new reconciliation upload.")
+        try:
+            df = pd.read_csv(BytesIO(contents), dtype=str, keep_default_na=False)
+        except Exception as exc:
+            raise ValueError(_("Unable to read CSV file: %(error)s") % {"error": str(exc)})
+
+        required = set(PayrollConfig.csv_reconciliation_field_mapping.values()) | {
+            self.source_payroll_id_column, PayrollConfig.csv_reconciliation_paid_extra_field,
+        }
+        missing = required - set(df.columns)
+        if missing:
+            raise ValueError("Missing required columns: %s" % ", ".join(sorted(missing)))
+
+        df.rename(columns={v: k for k, v in PayrollConfig.csv_reconciliation_field_mapping.items()}, inplace=True)
+        links = {
+            str(link.payroll_id): link.payroll
+            for link in DistrictPayrollBatchPayroll.objects.select_related("payroll").filter(batch=batch)
+        }
+        upload.district_batch = batch
+        upload.checksum = hashlib.sha256(contents).hexdigest()
+        upload.status = CsvReconciliationUpload.Status.VALIDATING
+        upload.save(username=self.user.login_name)
+        duplicate = CsvReconciliationUpload.objects.filter(
+            district_batch=batch,
+            checksum=upload.checksum,
+            is_deleted=False,
+        ).exclude(id=upload.id).exclude(
+            status__in=[CsvReconciliationUpload.Status.FAIL, CsvReconciliationUpload.Status.DUPLICATE],
+        ).first()
+        if duplicate:
+            upload.duplicate_of = duplicate
+            upload.status = CsvReconciliationUpload.Status.DUPLICATE
+            upload.error = {"duplicate_file": {"upload_id": str(duplicate.id), "file_name": duplicate.file_name}}
+            upload.save(username=self.user.login_name)
+            return upload, CsvReconciliationService._upload_summary(upload)
+
+        rows, errors = [], {}
+        paid_column = PayrollConfig.csv_reconciliation_paid_extra_field
+        code_column = PayrollConfig.csv_reconciliation_code_column
+        for index, row in df.iterrows():
+            row_number = index + 2
+            payroll = links.get(str(row.get(self.source_payroll_id_column)).strip())
+            code = CsvReconciliationService._clean_value(row.get(code_column))
+            reasons = []
+            benefit = None
+            if not payroll:
+                reasons.append("source_payroll_not_in_district_batch")
+            elif not code:
+                reasons.append("missing_code")
+            else:
+                benefit = BenefitConsumption.objects.filter(
+                    code=code,
+                    is_deleted=False,
+                    payrollbenefitconsumption__payroll=payroll,
+                    payrollbenefitconsumption__is_deleted=False,
+                ).select_related("individual").first()
+                if not benefit:
+                    reasons.append("code_not_in_source_payroll")
+                else:
+                    if not CsvReconciliationService._amounts_match(row.get("amount"), benefit.amount):
+                        reasons.append("amount_mismatch")
+                    paid = CsvReconciliationService._clean_value(row.get(paid_column))
+                    if paid not in (PayrollConfig.csv_reconciliation_paid_yes, PayrollConfig.csv_reconciliation_paid_no):
+                        reasons.append("invalid_paid_value")
+                    if not CsvReconciliationService._clean_value(row.get(PayrollConfig.csv_reconciliation_receipt_column)):
+                        reasons.append("missing_payment_reference")
+            record = ReconciliationUploadRow(
+                upload=upload, user_created=self.user, user_updated=self.user,
+                row_number=row_number, benefit=benefit, code=code,
+                submitted_data={str(key): CsvReconciliationService._json_value(value) for key, value in row.items()},
+                mismatch_reasons=reasons,
+                status=ReconciliationUploadRow.Status.INVALID if reasons else ReconciliationUploadRow.Status.VALID,
+            )
+            record.set_pk()
+            rows.append(record)
+            if reasons:
+                errors[str(row_number)] = reasons
+
+        bulk_create_with_history(rows, ReconciliationUploadRow, default_user=self.user, batch_size=1000)
+        upload.total_records = len(rows)
+        upload.unmatched_records = len(errors)
+        upload.matched_records = len(rows) - len(errors)
+        valid_rows = [row for row in rows if row.status == ReconciliationUploadRow.Status.VALID]
+        upload.paid_records = sum(row.submitted_data.get(paid_column) == PayrollConfig.csv_reconciliation_paid_yes for row in valid_rows)
+        upload.unpaid_records = sum(row.submitted_data.get(paid_column) == PayrollConfig.csv_reconciliation_paid_no for row in valid_rows)
+        upload.error = errors
+        upload.status = CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION
+        upload.save(username=self.user.login_name)
+        batch.status = DistrictPayrollBatchStatus.PENDING_REVIEW
+        batch.total_records = upload.total_records
+        batch.matched_records = upload.matched_records
+        batch.paid_records = upload.paid_records
+        batch.unpaid_records = upload.unpaid_records
+        batch.unmatched_records = upload.unmatched_records
+        batch.save()
+        benefit_plan = apps.get_model("social_protection", "BenefitPlan").objects.filter(
+            id=benefit_plan_id, is_deleted=False,
+        ).first()
+        included_payrolls = [
+            {"id": str(link.payroll_id), "name": link.payroll.name}
+            for link in DistrictPayrollBatchPayroll.objects.filter(batch=batch).select_related("payroll")
+        ]
+        task = TaskService(self.user).create({
+            "source": "payroll_reconciliation",
+            "entity": batch,
+            "status": Task.Status.RECEIVED,
+            "executor_action_event": TasksManagementConfig.default_executor_event,
+            "business_event": PayrollConfig.payroll_reconciliation_event,
+            "data": _get_std_task_data_payload({
+                "id": batch.id,
+                "upload_id": upload.id,
+                "district": batch.district.name,
+                "phase": f"{benefit_plan.code} {benefit_plan.name}" if benefit_plan else batch.benefit_plan_id,
+                "included_payrolls": included_payrolls,
+                "summary": CsvReconciliationService._upload_summary(upload),
+            }),
+        })
+        if not task.get("success", False):
+            raise ValueError(task.get("error") or "Unable to create district reconciliation review task")
+        return upload, CsvReconciliationService._upload_summary(upload)
+
+
 class CsvReconciliationService:
 
     def __init__(self, user: InteractiveUser):
@@ -656,6 +935,18 @@ class CsvReconciliationService:
                 self._reconcile_bc(pd.Series(row.submitted_data), benefit)
         upload.status = CsvReconciliationUpload.Status.PARTIAL_SUCCESS if upload.unmatched_records else CsvReconciliationUpload.Status.SUCCESS
         upload.save(username=self.user.login_name)
+        if upload.district_batch_id:
+            batch = upload.district_batch
+            for link in DistrictPayrollBatchPayroll.objects.filter(batch=batch).select_related("payroll"):
+                unresolved = PayrollBenefitConsumption.objects.filter(
+                    payroll=link.payroll,
+                    is_deleted=False,
+                ).exclude(benefit__status=BenefitConsumptionStatus.RECONCILED).exists()
+                if not unresolved:
+                    link.payroll.status = PayrollStatus.RECONCILED
+                    link.payroll.save(username=self.user.login_name)
+            batch.status = DistrictPayrollBatchStatus.APPLIED
+            batch.save()
 
     def download_upload_review(self, upload, contents):
         """Return the original CSV annotated with its saved validation result."""

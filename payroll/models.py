@@ -47,6 +47,57 @@ class Payroll(HistoryBusinessModel):
         return f"Payroll {self.name} - {self.uuid}"
 
 
+class DistrictPayrollBatchStatus(models.TextChoices):
+    DRAFT = "DRAFT", _("Draft")
+    DOWNLOADED = "DOWNLOADED", _("Downloaded")
+    PENDING_REVIEW = "PENDING_REVIEW", _("Pending review")
+    APPLIED = "APPLIED", _("Applied")
+    FAILED = "FAILED", _("Failed")
+
+
+class DistrictPayrollBatch(UUIDModel):
+    """A district payment file made up of separate approved project payrolls."""
+
+    district = models.ForeignKey(Location, models.DO_NOTHING)
+    # Payment plans are implementation details.  A district file is scoped by
+    # the social-protection Benefit Plan (the business "Phase") and can carry
+    # every approved project/activity payroll under that phase.
+    benefit_plan_id = models.CharField(max_length=255)
+    status = models.CharField(
+        max_length=32,
+        choices=DistrictPayrollBatchStatus.choices,
+        default=DistrictPayrollBatchStatus.DRAFT,
+    )
+    total_records = models.PositiveIntegerField(default=0)
+    matched_records = models.PositiveIntegerField(default=0)
+    paid_records = models.PositiveIntegerField(default=0)
+    unpaid_records = models.PositiveIntegerField(default=0)
+    unmatched_records = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=("district", "benefit_plan_id"),
+                name="payroll_district_batch_scope_unique",
+            ),
+        ]
+
+
+class DistrictPayrollBatchPayroll(UUIDModel):
+    batch = models.ForeignKey(DistrictPayrollBatch, models.DO_NOTHING, related_name="payroll_links")
+    payroll = models.ForeignKey(Payroll, models.DO_NOTHING)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=("batch", "payroll"),
+                name="payroll_district_batch_payroll_unique",
+            ),
+        ]
+
+
 class PayrollBill(HistoryModel):
     # 1:n it is ensured by the service
     payroll = models.ForeignKey(Payroll, on_delete=models.DO_NOTHING)
@@ -99,6 +150,7 @@ class CsvReconciliationUpload(HistoryModel):
         DUPLICATE = 'DUPLICATE', _('Duplicate')
 
     payroll = models.ForeignKey(Payroll, models.DO_NOTHING, null=True, blank=True)
+    district_batch = models.ForeignKey(DistrictPayrollBatch, models.DO_NOTHING, null=True, blank=True)
     status = models.CharField(max_length=255, choices=Status.choices, default=Status.TRIGGERED)
     error = models.JSONField(blank=True, default=dict)
     file_name = models.CharField(max_length=255, null=True, blank=True)

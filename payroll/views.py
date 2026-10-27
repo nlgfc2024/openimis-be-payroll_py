@@ -10,7 +10,7 @@ from core.views import check_user_rights
 from payroll.apps import PayrollConfig
 from payroll.models import Payroll, CsvReconciliationUpload
 from payroll.payments_registry import PaymentMethodStorage
-from payroll.services import CsvReconciliationService
+from payroll.services import CsvReconciliationService, DistrictPayrollBatchService
 
 logger = logging.getLogger(__name__)
 
@@ -168,3 +168,63 @@ class CSVReconciliationAPIView(views.APIView):
                 'status': upload.status,
                 'summary': CsvReconciliationService._upload_summary(upload),
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class DistrictReconciliationBatchAPIView(views.APIView):
+    """Download the approved project payrolls for one district as one payment file.
+
+    Upload/review is deliberately added to this endpoint only after the batch
+    identity is present in the exported file.  That keeps district feedback
+    routable to its source payroll rather than accidentally consolidating the
+    payroll records themselves.
+    """
+
+    permission_classes = [check_user_rights(PayrollConfig.gql_csv_reconciliation_create_perms, )]
+
+    def get(self, request):
+        try:
+            district_id = request.GET.get("district_id")
+            benefit_plan_id = request.GET.get("benefit_plan_id")
+            if not all([district_id, benefit_plan_id]):
+                raise ValueError("district_id and benefit_plan_id are required.")
+            service = DistrictPayrollBatchService(request.user)
+            batch, in_memory_file = service.download_reconciliation(
+                district_id, benefit_plan_id,
+            )
+            response = Response(
+                headers={
+                    "Content-Disposition": f'attachment; filename="district_reconciliation_{batch.id}.csv"',
+                },
+                content_type="text/csv",
+            )
+            response.content = in_memory_file.getvalue()
+            return response
+        except ValueError as exc:
+            return Response({"success": False, "error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as exc:
+            logger.error("Error while generating district reconciliation CSV", exc_info=exc)
+            return Response({"success": False, "error": str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @transaction.atomic
+    def post(self, request):
+        upload = CsvReconciliationUpload()
+        try:
+            district_id = request.GET.get("district_id")
+            benefit_plan_id = request.GET.get("benefit_plan_id")
+            file = request.FILES.get("file")
+            if not all([district_id, benefit_plan_id, file]):
+                raise ValueError("district_id, benefit_plan_id, and file are required.")
+            upload.file_name = file.name
+            upload.save(username=request.user.login_name)
+            path = PayrollConfig.get_payroll_payment_file_path("district", f"{upload.id}_{file.name}")
+            upload.storage_key = path
+            handler = DefaultStorageFileHandler(path)
+            handler.check_file_path()
+            handler.save_file(file)
+            file.seek(0)
+            upload, summary = DistrictPayrollBatchService(request.user).upload_reconciliation(
+                district_id, benefit_plan_id, file, upload,
+            )
+            return Response({"success": True, "upload_id": str(upload.id), "status": upload.status, "summary": summary}, status=201)
+        except ValueError as exc:
+            return Response({"success": False, "error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)

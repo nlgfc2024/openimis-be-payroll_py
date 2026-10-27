@@ -61,12 +61,12 @@ def bind_service_signals():
                     and task['business_event'] == PayrollConfig.payroll_reconciliation_event:
                 task_status = task['status']
                 if task_status == Task.Status.COMPLETED:
-                    payroll = Payroll.objects.get(id=task['entity_id'])
                     upload_id = task.get('data', {}).get('upload_id')
                     if upload_id:
-                        upload = CsvReconciliationUpload.objects.get(id=upload_id, payroll=payroll)
+                        upload = CsvReconciliationUpload.objects.get(id=upload_id)
                         CsvReconciliationService(user).apply_upload(upload)
                     else:
+                        payroll = Payroll.objects.get(id=task['entity_id'])
                         reconcile_payroll(payroll, user)
                 elif task_status == Task.Status.FAILED:
                     upload_id = task.get('data', {}).get('upload_id')
