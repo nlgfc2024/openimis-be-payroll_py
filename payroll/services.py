@@ -522,6 +522,17 @@ class DistrictWagesheetService:
         except (InvalidOperation, TypeError, ValueError):
             return Decimal("0")
 
+    @staticmethod
+    def _payment_outcome(due, received):
+        """Classify a provider result against the participant's entitlement."""
+        due = DistrictWagesheetService._payment_amount(due)
+        received = DistrictWagesheetService._payment_amount(received)
+        if received >= due:
+            return "Paid"
+        if received > Decimal("0"):
+            return "Partially paid"
+        return "Not paid"
+
     def _payment_outcomes(self, batch):
         """Return the latest applied provider outcome for each benefit code."""
         outcomes = {}
@@ -539,21 +550,12 @@ class DistrictWagesheetService:
                 continue
             submitted = row.submitted_data or {}
             due = row.benefit.amount or Decimal("0")
-            paid_value = CsvReconciliationService._clean_value(
-                submitted.get(PayrollConfig.csv_reconciliation_paid_extra_field)
-            )
             received_value = submitted.get(self.amount_received_column)
-            received = (
-                self._payment_amount(received_value)
-                if CsvReconciliationService._clean_value(received_value) is not None
-                else (due if paid_value == PayrollConfig.csv_reconciliation_paid_yes else Decimal("0"))
-            )
-            if paid_value == PayrollConfig.csv_reconciliation_paid_yes and received >= due:
-                status_label = "Paid"
-            elif received > Decimal("0"):
-                status_label = "Partially paid"
-            else:
-                status_label = "Not paid"
+            # District uploads require this value.  The reconciliation result is
+            # therefore always calculated from what the participant was due and
+            # what the PSP says was actually received, never from a Yes/No flag.
+            received = self._payment_amount(received_value)
+            status_label = self._payment_outcome(due, received)
             outcomes[row.benefit.code] = {
                 "status": status_label,
                 "amount_received": str(received),
@@ -775,6 +777,7 @@ class DistrictWagesheetService:
 
         required = set(PayrollConfig.csv_reconciliation_field_mapping.values()) | {
             self.source_payroll_id_column, PayrollConfig.csv_reconciliation_paid_extra_field,
+            self.amount_received_column,
         }
         missing = required - set(df.columns)
         if missing:
@@ -834,13 +837,13 @@ class DistrictWagesheetService:
                     received_value = CsvReconciliationService._clean_value(
                         row.get(self.amount_received_column)
                     )
-                    if received_value is not None:
+                    if received_value is None:
+                        reasons.append("missing_amount_received")
+                    else:
                         try:
                             received_amount = Decimal(str(received_value).replace(",", ""))
                             if received_amount < 0 or received_amount > (benefit.amount or Decimal("0")):
                                 reasons.append("invalid_amount_received")
-                            elif paid == PayrollConfig.csv_reconciliation_paid_yes and received_amount == 0:
-                                reasons.append("paid_amount_inconsistent")
                         except (InvalidOperation, TypeError, ValueError):
                             reasons.append("invalid_amount_received")
                     if not CsvReconciliationService._clean_value(row.get(PayrollConfig.csv_reconciliation_receipt_column)):
@@ -1245,24 +1248,31 @@ class CsvReconciliationService:
         paid_value = CsvReconciliationService._clean_value(
             row.submitted_data.get(PayrollConfig.csv_reconciliation_paid_extra_field)
         )
-        if paid_value != PayrollConfig.csv_reconciliation_paid_yes:
-            return False
         received_value = row.submitted_data.get(DistrictWagesheetService.amount_received_column)
-        if CsvReconciliationService._clean_value(received_value) is None:
-            # Files created before Amount Received was added represented a Yes
-            # as payment of the full entitlement.
-            return True
-        try:
-            return Decimal(str(received_value).replace(',', '')) >= (row.benefit.amount or Decimal('0'))
-        except (InvalidOperation, TypeError, ValueError):
-            return False
+        if CsvReconciliationService._clean_value(received_value) is not None:
+            try:
+                return Decimal(str(received_value).replace(',', '')) >= (row.benefit.amount or Decimal('0'))
+            except (InvalidOperation, TypeError, ValueError):
+                return False
+        # The original, per-payroll reconciliation file has no Amount Received
+        # field. Preserve its existing Yes/No contract while district files use
+        # the amount-based branch above.
+        return paid_value == PayrollConfig.csv_reconciliation_paid_yes
 
-    def download_upload_review(self, upload, contents):
+    def download_upload_review(self, upload, contents, file_error=None):
         """Return the original CSV annotated with its saved validation result."""
         try:
             df = pd.read_csv(BytesIO(contents), dtype=str, keep_default_na=False)
         except Exception:
-            return BytesIO(contents)
+            # A malformed CSV cannot be safely reconstructed as its original
+            # rows.  Still provide a downloadable, actionable error report.
+            review_file = BytesIO()
+            pd.DataFrame([{
+                "Validation Status": "INVALID",
+                "Mismatch Reasons": file_error or "unable_to_read_csv",
+            }]).to_csv(review_file, index=False)
+            review_file.seek(0)
+            return review_file
 
         row_results = {
             row.row_number: row
@@ -1275,21 +1285,41 @@ class CsvReconciliationService:
         unpaid_records = []
         unmatched_records = []
         paid_column = PayrollConfig.csv_reconciliation_paid_extra_field
+        amount_received_column = DistrictWagesheetService.amount_received_column
+        expected_amounts = []
+        amount_received = []
+        calculated_outcomes = []
 
         for index, row in df.iterrows():
             result = row_results.get(index + 2)
             reasons = result.mismatch_reasons if result else []
             is_valid = result and result.status == ReconciliationUploadRow.Status.VALID
             paid_value = self._clean_value(row.get(paid_column))
+            expected_amount = result.benefit.amount if result and result.benefit else None
+            received_value = row.get(amount_received_column)
+            is_district_upload = bool(upload.district_wagesheet_id)
+            if is_district_upload:
+                outcome = DistrictWagesheetService._payment_outcome(expected_amount, received_value)
+            else:
+                outcome = "Paid" if paid_value == PayrollConfig.csv_reconciliation_paid_yes else "Not paid"
             validation_status.append(result.status if result else "NOT_VALIDATED")
             mismatch_reasons.append("; ".join(reasons) if reasons else "")
             matched_records.append("Yes" if is_valid else "")
-            paid_records.append("Yes" if is_valid and paid_value == PayrollConfig.csv_reconciliation_paid_yes else "")
-            unpaid_records.append("Yes" if is_valid and paid_value == PayrollConfig.csv_reconciliation_paid_no else "")
+            paid_records.append("Yes" if is_valid and outcome == "Paid" else "")
+            unpaid_records.append("Yes" if is_valid and outcome != "Paid" else "")
             unmatched_records.append("Yes" if result and not is_valid else "")
+            expected_amounts.append(str(expected_amount) if expected_amount is not None else "")
+            amount_received.append(str(received_value or ""))
+            calculated_outcomes.append(outcome if is_valid else "")
 
         df["Validation Status"] = validation_status
         df["Mismatch Reasons"] = mismatch_reasons
+        if file_error:
+            df["File Validation Error"] = file_error
+        if upload.district_wagesheet_id:
+            df["Expected Amount"] = expected_amounts
+            df["Amount Received"] = amount_received
+            df["Calculated Outcome"] = calculated_outcomes
         df["Matched Record"] = matched_records
         df["Paid Record"] = paid_records
         df["Unpaid Record"] = unpaid_records

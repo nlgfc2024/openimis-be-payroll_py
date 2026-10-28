@@ -219,6 +219,40 @@ class DistrictReconciliationBatchAPIView(views.APIView):
                     }
                     for batch in batches
                 ]})
+            if request.GET.get("action") == "review":
+                upload_id = request.GET.get("upload_id")
+                if not upload_id:
+                    raise ValueError("upload_id is required.")
+                upload = CsvReconciliationUpload.objects.select_related(
+                    "district_wagesheet",
+                ).filter(id=upload_id, is_deleted=False).first()
+                if not upload or not upload.district_wagesheet_id:
+                    raise ValueError("District reconciliation upload was not found.")
+                batch = upload.district_wagesheet
+                # Keep the report bound to its exact district wagesheet.  A
+                # caller cannot use an upload identifier to download another
+                # district, phase, or financial year's reconciliation data.
+                for field, value in (
+                    ("district_id", request.GET.get("district_id")),
+                    ("benefit_plan_id", request.GET.get("benefit_plan_id")),
+                    ("financial_year", request.GET.get("financial_year")),
+                ):
+                    if value and str(getattr(batch, field)) != str(value):
+                        raise ValueError("The reconciliation upload does not belong to the selected District Wagesheet.")
+                contents = DefaultStorageFileHandler(upload.storage_key).get_file_content()
+                upload_error = upload.error if isinstance(upload.error, dict) else {}
+                review_file = CsvReconciliationService(request.user).download_upload_review(
+                    upload,
+                    contents,
+                    upload_error.get("message"),
+                )
+                file_name = (upload.file_name or "district_reconciliation.csv").rsplit(".", 1)[0]
+                response = Response(
+                    headers={"Content-Disposition": f'attachment; filename="{file_name}_error_report.csv"'},
+                    content_type="text/csv",
+                )
+                response.content = review_file.getvalue()
+                return response
             district_id = request.GET.get("district_id")
             benefit_plan_id = request.GET.get("benefit_plan_id")
             financial_year = request.GET.get("financial_year")
@@ -248,6 +282,9 @@ class DistrictReconciliationBatchAPIView(views.APIView):
     @transaction.atomic
     def post(self, request):
         upload = CsvReconciliationUpload()
+        district_id = None
+        benefit_plan_id = None
+        financial_year = None
         try:
             district_id = request.GET.get("district_id")
             benefit_plan_id = request.GET.get("benefit_plan_id")
@@ -290,10 +327,50 @@ class DistrictReconciliationBatchAPIView(views.APIView):
             )
             return Response({"success": True, "upload_id": str(upload.id), "status": upload.status, "summary": summary}, status=201)
         except ValueError as exc:
-            return Response({"success": False, "error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+            # The file is saved before validation.  Preserve every rejected
+            # district upload too, so users can download an error report and
+            # correct exactly the file they submitted.
+            error = {"code": "validation_error", "message": str(exc)}
+            if upload.id:
+                upload.district_wagesheet = DistrictPayrollBatch.objects.filter(
+                    district_id=district_id,
+                    benefit_plan_id=str(benefit_plan_id),
+                    financial_year=financial_year,
+                ).first()
+                upload.error = error
+                upload.status = CsvReconciliationUpload.Status.FAIL
+                upload.json_ext = {"extra_info": CsvReconciliationService._upload_summary(upload)}
+                upload.save(username=request.user.login_name)
+            return Response({
+                "success": False,
+                "error": error,
+                "upload_id": str(upload.id) if upload.id else None,
+                "status": upload.status,
+                "summary": CsvReconciliationService._upload_summary(upload),
+            }, status=status.HTTP_400_BAD_REQUEST)
         except Exception as exc:
             logger.error("Error while creating or uploading a district wagesheet", exc_info=exc)
+            error = {
+                "code": "upload_processing_failed",
+                "message": "The district reconciliation file could not be processed. Please correct the file and upload it again.",
+            }
+            if upload.id:
+                upload.district_wagesheet = DistrictPayrollBatch.objects.filter(
+                    district_id=district_id,
+                    benefit_plan_id=str(benefit_plan_id),
+                    financial_year=financial_year,
+                ).first()
+                upload.error = error
+                upload.status = CsvReconciliationUpload.Status.FAIL
+                upload.json_ext = {"extra_info": CsvReconciliationService._upload_summary(upload)}
+                upload.save(username=request.user.login_name)
             return Response(
-                {"success": False, "error": str(exc) or "District Wagesheet processing failed."},
+                {
+                    "success": False,
+                    "error": error,
+                    "upload_id": str(upload.id) if upload.id else None,
+                    "status": upload.status,
+                    "summary": CsvReconciliationService._upload_summary(upload),
+                },
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )

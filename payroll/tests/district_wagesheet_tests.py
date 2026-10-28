@@ -54,6 +54,12 @@ class DistrictWagesheetPolicyTests(SimpleTestCase):
         self.assertEqual(DistrictWagesheetStatus.READY_FOR_PSP, "READY_FOR_PSP")
         self.assertEqual(DistrictWagesheetStatus.SUBMITTED_TO_PSP, "SUBMITTED_TO_PSP")
 
+    def test_payment_outcome_is_calculated_from_amount_received(self):
+        due = Decimal("100.00")
+        self.assertEqual(DistrictWagesheetService._payment_outcome(due, Decimal("100.00")), "Paid")
+        self.assertEqual(DistrictWagesheetService._payment_outcome(due, Decimal("40.00")), "Partially paid")
+        self.assertEqual(DistrictWagesheetService._payment_outcome(due, Decimal("0")), "Not paid")
+
 
 class DistrictWagesheetReconciliationTests(TestCase):
     """Regression coverage for applying reviewed district PSP feedback."""
