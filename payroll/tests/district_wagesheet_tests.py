@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from django.test import SimpleTestCase, TestCase
+from django.core.exceptions import ValidationError
 
 from payroll.apps import PayrollConfig
 from payroll.models import (
@@ -128,6 +129,16 @@ class DistrictWagesheetReconciliationTests(TestCase):
             wagesheet_name,
             f"District Wagesheet - {self.district.name} - phase-wagesheet-test - 2026/27",
         )
+
+    def test_wagesheet_cannot_report_pending_approval_without_a_task(self):
+        """A task-creation failure must roll back the pending wagesheet state."""
+        service = DistrictWagesheetService(self.user)
+        with patch("payroll.services.TaskService.create", return_value={
+            "success": False,
+            "detail": "No Task Management group is configured.",
+        }):
+            with self.assertRaises(ValidationError):
+                service._create_approval_task(self.wagesheet, "district")
 
     def test_approved_feedback_reconciles_only_fully_resolved_source_payrolls(self):
         resolved_payroll, [resolved_benefit] = self._payroll_with_benefits("resolved", 1)

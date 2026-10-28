@@ -149,7 +149,7 @@ class PayrollService(BaseService):
     def create_accept_payroll_task(self, payroll_id, obj_data):
         payroll_to_accept = Payroll.objects.get(id=payroll_id)
         data = {**obj_data, 'id': payroll_id}
-        TaskService(self.user).create({
+        task_result = TaskService(self.user).create({
             'source': 'payroll',
             'entity': payroll_to_accept,
             'status': Task.Status.RECEIVED,
@@ -157,6 +157,11 @@ class PayrollService(BaseService):
             'business_event': PayrollConfig.payroll_accept_event,
             'data': _get_std_task_data_payload(data)
         })
+        if not task_result.get('success'):
+            raise ValidationError(
+                task_result.get('detail') or 'Unable to create the payroll approval task.'
+            )
+        return task_result
 
     @register_service_signal('payroll_service.close_payroll')
     def close_payroll(self, obj_data):
@@ -359,6 +364,7 @@ class DistrictWagesheetService:
     source_payroll_name_column = "Source Payroll Name"
     project_name_column = "Project Name"
     catchment_column = "Catchment Name"
+    amount_received_column = "Amount Received"
     district_approval_source = "district_wagesheet_district_approval"
     national_approval_source = "district_wagesheet_national_approval"
 
@@ -458,6 +464,17 @@ class DistrictWagesheetService:
 
     @transaction.atomic
     def get_or_create_batch(self, district_id, benefit_plan_id, financial_year=None):
+        # A completed batch must remain downloadable even after its source
+        # project payrolls have moved to RECONCILED and are no longer eligible
+        # for creating a new wagesheet.
+        if financial_year:
+            existing_batch = DistrictPayrollBatch.objects.select_for_update().filter(
+                district_id=district_id,
+                benefit_plan_id=str(benefit_plan_id),
+                financial_year=financial_year,
+            ).first()
+            if existing_batch and existing_batch.status != DistrictPayrollBatchStatus.DRAFT:
+                return existing_batch
         financial_years = self.available_financial_years(district_id, benefit_plan_id)
         if not financial_year:
             if len(financial_years) != 1:
@@ -498,9 +515,54 @@ class DistrictWagesheetService:
         self._refresh_summary(batch)
         return batch
 
+    @staticmethod
+    def _payment_amount(value):
+        try:
+            return Decimal(str(value).replace(",", ""))
+        except (InvalidOperation, TypeError, ValueError):
+            return Decimal("0")
+
+    def _payment_outcomes(self, batch):
+        """Return the latest applied provider outcome for each benefit code."""
+        outcomes = {}
+        rows = ReconciliationUploadRow.objects.filter(
+            upload__district_wagesheet=batch,
+            upload__status__in=[
+                CsvReconciliationUpload.Status.SUCCESS,
+                CsvReconciliationUpload.Status.PARTIAL_SUCCESS,
+            ],
+            status=ReconciliationUploadRow.Status.VALID,
+            is_deleted=False,
+        ).select_related("benefit", "upload").order_by("upload__date_created", "row_number")
+        for row in rows:
+            if not row.benefit_id:
+                continue
+            submitted = row.submitted_data or {}
+            due = row.benefit.amount or Decimal("0")
+            paid_value = CsvReconciliationService._clean_value(
+                submitted.get(PayrollConfig.csv_reconciliation_paid_extra_field)
+            )
+            received_value = submitted.get(self.amount_received_column)
+            received = (
+                self._payment_amount(received_value)
+                if CsvReconciliationService._clean_value(received_value) is not None
+                else (due if paid_value == PayrollConfig.csv_reconciliation_paid_yes else Decimal("0"))
+            )
+            if paid_value == PayrollConfig.csv_reconciliation_paid_yes and received >= due:
+                status_label = "Paid"
+            elif received > Decimal("0"):
+                status_label = "Partially paid"
+            else:
+                status_label = "Not paid"
+            outcomes[row.benefit.code] = {
+                "status": status_label,
+                "amount_received": str(received),
+            }
+        return outcomes
+
     def _create_approval_task(self, batch, stage):
         district_stage = stage == "district"
-        TaskService(self.user).create({
+        task_result = TaskService(self.user).create({
             "source": self.district_approval_source if district_stage else self.national_approval_source,
             "entity": batch,
             "status": Task.Status.RECEIVED,
@@ -517,6 +579,11 @@ class DistrictWagesheetService:
                 "approval_stage": stage,
             }),
         })
+        if not task_result.get("success"):
+            raise ValidationError(
+                task_result.get("detail") or "Unable to create the District Wagesheet approval task."
+            )
+        return task_result
 
     @transaction.atomic
     def submit_for_district_approval(
@@ -561,30 +628,37 @@ class DistrictWagesheetService:
             batch.save(update_fields=["status", "updated_at"])
         return batch
 
-    @transaction.atomic
-    def download_reconciliation(self, district_id, benefit_plan_id, financial_year=None):
-        batch = self.get_or_create_batch(district_id, benefit_plan_id, financial_year)
-        if batch.status != DistrictPayrollBatchStatus.READY_FOR_PSP:
-            raise ValueError("The District Wagesheet must complete district and national approval before the PSP file can be downloaded.")
+    def _consolidated_records(self, batch):
+        """Return the immutable batch membership as reconciliation export rows.
+
+        Both the PSP CSV and the wagesheet detail screen use this method.  This
+        prevents the screen from accidentally showing all beneficiaries in a
+        district instead of only the participants linked to this wagesheet.
+        """
         records = []
         reconciliation_service = CsvReconciliationService(self.user)
         project_model = apps.get_model("project_social_protection", "Project")
+        links = list(DistrictPayrollBatchPayroll.objects.filter(batch=batch).select_related("payroll"))
         project_ids = {
             self._project_id(link.payroll)
-            for link in DistrictPayrollBatchPayroll.objects.filter(batch=batch).select_related("payroll")
+            for link in links
             if self._project_id(link.payroll)
         }
         projects = {
             str(project.id): project
-            for project in project_model.objects.filter(id__in=project_ids, is_deleted=False).select_related("micro_catchment")
+            for project in project_model.objects.filter(
+                id__in=project_ids, is_deleted=False,
+            ).select_related("micro_catchment")
         }
         field_mapping = PayrollConfig.csv_reconciliation_field_mapping
-        for link in DistrictPayrollBatchPayroll.objects.filter(batch=batch).select_related("payroll"):
+        for link in links:
             payroll = link.payroll
             project = projects.get(self._project_id(payroll))
             benefits = reconciliation_service._get_benefit_consumption_qs(payroll)
             for benefit in benefits.select_related("individual", "individual__location"):
                 record = BenefitConsumption.objects.filter(id=benefit.id).values(*field_mapping.keys()).first()
+                if not record:
+                    continue
                 record[self.source_payroll_id_column] = str(payroll.id)
                 record[self.source_payroll_name_column] = payroll.name
                 record[self.project_name_column] = project.name if project else None
@@ -593,6 +667,63 @@ class DistrictWagesheetService:
                 )
                 record[PayrollConfig.csv_reconciliation_paid_extra_field] = reconciliation_service._fill_paid_column(record)
                 records.append(record)
+        return records
+
+    def wagesheet_details(self, batch_id):
+        """Return a wagesheet and its consolidated participant rows for display."""
+        batch = DistrictPayrollBatch.objects.select_related("district").get(id=batch_id)
+        field_mapping = PayrollConfig.csv_reconciliation_field_mapping
+        participant_columns = [
+            "District Name", self.catchment_column, self.project_name_column,
+            "Form Number", "Phone Number", "First Name", "Last Name",
+            "National ID", "Date of Birth", "Code", "Status", "Amount",
+            "Type", "Receipt", self.amount_received_column,
+            PayrollConfig.csv_reconciliation_paid_extra_field,
+        ]
+        outcomes = self._payment_outcomes(batch)
+        participants = []
+        for record in self._consolidated_records(batch):
+            display_record = {
+                field_mapping.get(key, key): CsvReconciliationService._json_value(value)
+                for key, value in record.items()
+            }
+            outcome = outcomes.get(record.get("code"))
+            display_record[self.amount_received_column] = (
+                outcome["amount_received"] if outcome else "0"
+            )
+            display_record[PayrollConfig.csv_reconciliation_paid_extra_field] = (
+                outcome["status"] if outcome else "Not paid"
+            )
+            participants.append({column: display_record.get(column) for column in participant_columns})
+        return {
+            "id": str(batch.id),
+            "name": self._wagesheet_name(batch.district, batch.benefit_plan_id, batch.financial_year),
+            "district": batch.district.name,
+            "financial_year": batch.financial_year,
+            "status": batch.status,
+            "summary": batch.summary or {},
+            "participants": participants,
+        }
+
+    @transaction.atomic
+    def download_reconciliation(self, district_id, benefit_plan_id, financial_year=None):
+        batch = self.get_or_create_batch(district_id, benefit_plan_id, financial_year)
+        if batch.status not in (
+            DistrictPayrollBatchStatus.READY_FOR_PSP,
+            DistrictPayrollBatchStatus.SUBMITTED_TO_PSP,
+            DistrictPayrollBatchStatus.APPLIED,
+        ):
+            raise ValueError("The District Wagesheet must complete district and national approval before the PSP file can be downloaded.")
+        field_mapping = PayrollConfig.csv_reconciliation_field_mapping
+        records = self._consolidated_records(batch)
+        if batch.status == DistrictPayrollBatchStatus.APPLIED:
+            outcomes = self._payment_outcomes(batch)
+            for record in records:
+                outcome = outcomes.get(record.get("code"))
+                record[self.amount_received_column] = outcome["amount_received"] if outcome else "0"
+                record[PayrollConfig.csv_reconciliation_paid_extra_field] = (
+                    outcome["status"] if outcome else "Not paid"
+                )
 
         df = pd.DataFrame.from_records(records)
         df.rename(columns=field_mapping, inplace=True)
@@ -613,6 +744,7 @@ class DistrictWagesheetService:
             "Code",
             "Status",
             "Amount",
+            self.amount_received_column,
             "Type",
             "Receipt",
             PayrollConfig.csv_reconciliation_paid_extra_field,
@@ -620,8 +752,9 @@ class DistrictWagesheetService:
         df = df.reindex(columns=export_columns)
         in_memory_file = BytesIO()
         df.to_csv(in_memory_file, index=False)
-        batch.status = DistrictPayrollBatchStatus.SUBMITTED_TO_PSP
-        batch.save(update_fields=["status", "updated_at"])
+        if batch.status == DistrictPayrollBatchStatus.READY_FOR_PSP:
+            batch.status = DistrictPayrollBatchStatus.SUBMITTED_TO_PSP
+            batch.save(update_fields=["status", "updated_at"])
         return batch, in_memory_file
 
     @transaction.atomic
@@ -698,6 +831,18 @@ class DistrictWagesheetService:
                     paid = CsvReconciliationService._clean_value(row.get(paid_column))
                     if paid not in (PayrollConfig.csv_reconciliation_paid_yes, PayrollConfig.csv_reconciliation_paid_no):
                         reasons.append("invalid_paid_value")
+                    received_value = CsvReconciliationService._clean_value(
+                        row.get(self.amount_received_column)
+                    )
+                    if received_value is not None:
+                        try:
+                            received_amount = Decimal(str(received_value).replace(",", ""))
+                            if received_amount < 0 or received_amount > (benefit.amount or Decimal("0")):
+                                reasons.append("invalid_amount_received")
+                            elif paid == PayrollConfig.csv_reconciliation_paid_yes and received_amount == 0:
+                                reasons.append("paid_amount_inconsistent")
+                        except (InvalidOperation, TypeError, ValueError):
+                            reasons.append("invalid_amount_received")
                     if not CsvReconciliationService._clean_value(row.get(PayrollConfig.csv_reconciliation_receipt_column)):
                         reasons.append("missing_payment_reference")
             record = ReconciliationUploadRow(
@@ -1067,8 +1212,7 @@ class CsvReconciliationService:
         ))
         paid_rows = [
             row for row in rows
-            if self._clean_value(row.submitted_data.get(PayrollConfig.csv_reconciliation_paid_extra_field))
-            == PayrollConfig.csv_reconciliation_paid_yes
+            if self._is_full_payment(row)
         ]
         locked_benefits = {
             benefit.id: benefit
@@ -1095,6 +1239,23 @@ class CsvReconciliationService:
                     link.payroll.save(username=self.user.login_name)
             batch.status = DistrictPayrollBatchStatus.APPLIED
             batch.save()
+
+    @staticmethod
+    def _is_full_payment(row):
+        paid_value = CsvReconciliationService._clean_value(
+            row.submitted_data.get(PayrollConfig.csv_reconciliation_paid_extra_field)
+        )
+        if paid_value != PayrollConfig.csv_reconciliation_paid_yes:
+            return False
+        received_value = row.submitted_data.get(DistrictWagesheetService.amount_received_column)
+        if CsvReconciliationService._clean_value(received_value) is None:
+            # Files created before Amount Received was added represented a Yes
+            # as payment of the full entitlement.
+            return True
+        try:
+            return Decimal(str(received_value).replace(',', '')) >= (row.benefit.amount or Decimal('0'))
+        except (InvalidOperation, TypeError, ValueError):
+            return False
 
     def download_upload_review(self, upload, contents):
         """Return the original CSV annotated with its saved validation result."""

@@ -184,6 +184,13 @@ class DistrictReconciliationBatchAPIView(views.APIView):
 
     def get(self, request):
         try:
+            if request.GET.get("action") == "details":
+                batch_id = request.GET.get("batch_id")
+                if not batch_id:
+                    raise ValueError("batch_id is required.")
+                return Response(
+                    DistrictWagesheetService(request.user).wagesheet_details(batch_id)
+                )
             if request.GET.get("action") == "list":
                 batches = list(
                     DistrictPayrollBatch.objects.select_related("district").order_by("-updated_at")
@@ -199,6 +206,8 @@ class DistrictReconciliationBatchAPIView(views.APIView):
                 return Response({"wagesheets": [
                     {
                         "id": str(batch.id),
+                        "district_id": str(batch.district_id),
+                        "benefit_plan_id": batch.benefit_plan_id,
                         "name": DistrictWagesheetService._wagesheet_name(
                             batch.district, batch.benefit_plan_id, batch.financial_year,
                         ),
@@ -224,6 +233,7 @@ class DistrictReconciliationBatchAPIView(views.APIView):
             response = Response(
                 headers={
                     "Content-Disposition": f'attachment; filename="district_reconciliation_{batch.id}.csv"',
+                    "X-District-Wagesheet-Status": batch.status,
                 },
                 content_type="text/csv",
             )
