@@ -9,7 +9,7 @@ from tasks_management.services import TaskService
 from payroll.apps import PayrollConfig
 from payroll.models import Payroll, BenefitConsumption, BenefitConsumptionStatus, CsvReconciliationUpload
 from payroll.payments_registry import PaymentMethodStorage
-from payroll.services import PayrollService, CsvReconciliationService
+from payroll.services import PayrollService, CsvReconciliationService, DistrictWagesheetService
 from payroll.strategies import StrategyOfPaymentInterface
 
 
@@ -98,6 +98,27 @@ def bind_service_signals():
                     if user:
                         TaskService(user).complete_task({"id": task["id"], "failed": True})
 
+    def on_task_complete_district_wagesheet_approval(**kwargs):
+        try:
+            result = kwargs.get('result')
+            if not result or not result.get('success'):
+                return
+            task = result['data']['task']
+            event = task.get('business_event')
+            if event not in (
+                PayrollConfig.district_wagesheet_district_approval_event,
+                PayrollConfig.district_wagesheet_national_approval_event,
+            ):
+                return
+            user = User.objects.get(id=result['data']['user']['id'])
+            DistrictWagesheetService(user).resolve_approval(
+                task['entity_id'],
+                'district' if event == PayrollConfig.district_wagesheet_district_approval_event else 'national',
+                task['status'] == Task.Status.COMPLETED,
+            )
+        except Exception as exc:
+            logger.error("Error while resolving district wagesheet approval", exc_info=exc)
+
     def on_task_complete_payroll_reject_approved_payroll(**kwargs):
         def reject_approved_payroll(payroll, user):
             strategy = PaymentMethodStorage.get_chosen_payment_method(payroll.payment_method)
@@ -167,6 +188,12 @@ def bind_service_signals():
     bind_service_signal(
         'task_service.complete_task',
         on_task_complete_payroll_reconcilation,
+        bind_type=ServiceSignalBindType.AFTER
+    )
+
+    bind_service_signal(
+        'task_service.complete_task',
+        on_task_complete_district_wagesheet_approval,
         bind_type=ServiceSignalBindType.AFTER
     )
 

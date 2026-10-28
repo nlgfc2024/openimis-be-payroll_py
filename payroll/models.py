@@ -47,11 +47,15 @@ class Payroll(HistoryBusinessModel):
         return f"Payroll {self.name} - {self.uuid}"
 
 
-class DistrictPayrollBatchStatus(models.TextChoices):
+class DistrictWagesheetStatus(models.TextChoices):
     DRAFT = "DRAFT", _("Draft")
-    DOWNLOADED = "DOWNLOADED", _("Downloaded")
+    PENDING_DISTRICT_APPROVAL = "PENDING_DISTRICT_APPROVAL", _("Pending district approval")
+    PENDING_NATIONAL_APPROVAL = "PENDING_NATIONAL_APPROVAL", _("Pending national approval")
+    READY_FOR_PSP = "READY_FOR_PSP", _("Ready for PSP")
+    SUBMITTED_TO_PSP = "SUBMITTED_TO_PSP", _("Submitted to PSP")
     PENDING_REVIEW = "PENDING_REVIEW", _("Pending review")
     APPLIED = "APPLIED", _("Applied")
+    REJECTED = "REJECTED", _("Rejected")
     FAILED = "FAILED", _("Failed")
 
 
@@ -59,14 +63,21 @@ class DistrictPayrollBatch(UUIDModel):
     """A district payment file made up of separate approved project payrolls."""
 
     district = models.ForeignKey(Location, models.DO_NOTHING)
-    # Payment plans are implementation details.  A district file is scoped by
-    # the social-protection Benefit Plan (the business "Phase") and can carry
-    # every approved project/activity payroll under that phase.
+    # This is the technical representation of a District Wagesheet. Payment
+    # plans are implementation details; the business scope is District, Phase
+    # and Financial Year, and source payrolls remain separate records.
     benefit_plan_id = models.CharField(max_length=255)
+    financial_year = models.CharField(max_length=9)
+    bank_name = models.CharField(max_length=255, blank=True, null=True)
+    account_number = models.CharField(max_length=255, blank=True, null=True)
+    cash_out_fee_per_participant = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    total_wages = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    total_cash_out_fees = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    summary = models.JSONField(default=dict)
     status = models.CharField(
         max_length=32,
-        choices=DistrictPayrollBatchStatus.choices,
-        default=DistrictPayrollBatchStatus.DRAFT,
+        choices=DistrictWagesheetStatus.choices,
+        default=DistrictWagesheetStatus.DRAFT,
     )
     total_records = models.PositiveIntegerField(default=0)
     matched_records = models.PositiveIntegerField(default=0)
@@ -79,7 +90,7 @@ class DistrictPayrollBatch(UUIDModel):
     class Meta:
         constraints = [
             models.UniqueConstraint(
-                fields=("district", "benefit_plan_id"),
+                fields=("district", "benefit_plan_id", "financial_year"),
                 name="payroll_district_batch_scope_unique",
             ),
         ]
@@ -150,7 +161,11 @@ class CsvReconciliationUpload(HistoryModel):
         DUPLICATE = 'DUPLICATE', _('Duplicate')
 
     payroll = models.ForeignKey(Payroll, models.DO_NOTHING, null=True, blank=True)
-    district_batch = models.ForeignKey(DistrictPayrollBatch, models.DO_NOTHING, null=True, blank=True)
+    district_wagesheet = models.ForeignKey(
+        DistrictPayrollBatch, models.DO_NOTHING, null=True, blank=True,
+        db_column="district_batch_id",
+    )
+
     status = models.CharField(max_length=255, choices=Status.choices, default=Status.TRIGGERED)
     error = models.JSONField(blank=True, default=dict)
     file_name = models.CharField(max_length=255, null=True, blank=True)
@@ -162,6 +177,13 @@ class CsvReconciliationUpload(HistoryModel):
     paid_records = models.PositiveIntegerField(default=0)
     unpaid_records = models.PositiveIntegerField(default=0)
     unmatched_records = models.PositiveIntegerField(default=0)
+
+
+# District Wagesheet is the business name.  Preserve the established technical
+# model name so ContentType-backed Task Management records remain resolvable.
+DistrictPayrollBatchStatus = DistrictWagesheetStatus
+DistrictWagesheet = DistrictPayrollBatch
+DistrictWagesheetPayroll = DistrictPayrollBatchPayroll
 
 
 class ReconciliationUploadRow(HistoryModel):

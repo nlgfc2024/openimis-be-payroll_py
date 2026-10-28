@@ -10,7 +10,7 @@ from core.views import check_user_rights
 from payroll.apps import PayrollConfig
 from payroll.models import Payroll, CsvReconciliationUpload
 from payroll.payments_registry import PaymentMethodStorage
-from payroll.services import CsvReconciliationService, DistrictPayrollBatchService
+from payroll.services import CsvReconciliationService, DistrictWagesheetService
 
 logger = logging.getLogger(__name__)
 
@@ -185,11 +185,14 @@ class DistrictReconciliationBatchAPIView(views.APIView):
         try:
             district_id = request.GET.get("district_id")
             benefit_plan_id = request.GET.get("benefit_plan_id")
+            financial_year = request.GET.get("financial_year")
             if not all([district_id, benefit_plan_id]):
                 raise ValueError("district_id and benefit_plan_id are required.")
-            service = DistrictPayrollBatchService(request.user)
+            service = DistrictWagesheetService(request.user)
+            if request.GET.get("options") == "financial_years":
+                return Response({"financial_years": service.available_financial_years(district_id, benefit_plan_id)})
             batch, in_memory_file = service.download_reconciliation(
-                district_id, benefit_plan_id,
+                district_id, benefit_plan_id, financial_year,
             )
             response = Response(
                 headers={
@@ -211,9 +214,22 @@ class DistrictReconciliationBatchAPIView(views.APIView):
         try:
             district_id = request.GET.get("district_id")
             benefit_plan_id = request.GET.get("benefit_plan_id")
+            financial_year = request.GET.get("financial_year")
             file = request.FILES.get("file")
-            if not all([district_id, benefit_plan_id, file]):
-                raise ValueError("district_id, benefit_plan_id, and file are required.")
+            if request.GET.get("action") == "submit_for_approval":
+                if not all([district_id, benefit_plan_id]):
+                    raise ValueError("district_id and benefit_plan_id are required.")
+                batch = DistrictWagesheetService(request.user).submit_for_district_approval(
+                    district_id,
+                    benefit_plan_id,
+                    financial_year,
+                    request.data.get("bank_name"),
+                    request.data.get("account_number"),
+                    request.data.get("cash_out_fee_per_participant"),
+                )
+                return Response({"success": True, "status": batch.status, "batch_id": str(batch.id)}, status=201)
+            if not all([district_id, benefit_plan_id, financial_year, file]):
+                raise ValueError("district_id, benefit_plan_id, financial_year, and file are required.")
             upload.file_name = file.name
             upload.save(username=request.user.login_name)
             path = PayrollConfig.get_payroll_payment_file_path("district", f"{upload.id}_{file.name}")
@@ -222,9 +238,15 @@ class DistrictReconciliationBatchAPIView(views.APIView):
             handler.check_file_path()
             handler.save_file(file)
             file.seek(0)
-            upload, summary = DistrictPayrollBatchService(request.user).upload_reconciliation(
-                district_id, benefit_plan_id, file, upload,
+            upload, summary = DistrictWagesheetService(request.user).upload_reconciliation(
+                district_id, benefit_plan_id, file, upload, financial_year,
             )
             return Response({"success": True, "upload_id": str(upload.id), "status": upload.status, "summary": summary}, status=201)
         except ValueError as exc:
             return Response({"success": False, "error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as exc:
+            logger.error("Error while creating or uploading a district wagesheet", exc_info=exc)
+            return Response(
+                {"success": False, "error": str(exc) or "District Wagesheet processing failed."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )

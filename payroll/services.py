@@ -351,13 +351,15 @@ class BenefitConsumptionService(BaseService):
             benefit_attachment.save(user=self.user)
 
 
-class DistrictPayrollBatchService:
-    """Build a district payment file without merging the source project payrolls."""
+class DistrictWagesheetService:
+    """Build and reconcile a District Wagesheet without merging source payrolls."""
 
     source_payroll_id_column = "Source Payroll ID"
     source_payroll_name_column = "Source Payroll Name"
     project_name_column = "Project Name"
     catchment_column = "Catchment Name"
+    district_approval_source = "district_wagesheet_district_approval"
+    national_approval_source = "district_wagesheet_national_approval"
 
     def __init__(self, user: InteractiveUser):
         self.user = user
@@ -378,7 +380,18 @@ class DistrictPayrollBatchService:
             location = Location.objects.filter(id=location.parent_id).only("id", "type", "parent_id").first()
         return str(location.id) if location else None
 
-    def _eligible_payrolls(self, district_id, benefit_plan_id):
+    @staticmethod
+    def _financial_year(payment_cycle):
+        """Return the government financial year containing the cycle start date."""
+        if not payment_cycle or not payment_cycle.start_date:
+            return None
+        start_month = int(PayrollConfig.financial_year_start_month or 7)
+        start_year = payment_cycle.start_date.year
+        if payment_cycle.start_date.month < start_month:
+            start_year -= 1
+        return f"{start_year}/{str(start_year + 1)[-2:]}"
+
+    def _eligible_payrolls(self, district_id, benefit_plan_id, financial_year=None):
         project_model = apps.get_model("project_social_protection", "Project")
         payrolls = Payroll.objects.filter(
             payment_plan__benefit_plan_id=str(benefit_plan_id),
@@ -394,22 +407,64 @@ class DistrictPayrollBatchService:
             payroll for payroll in payrolls
             if (project := projects.get(self._project_id(payroll)))
             and self._district_id(project) == str(district_id)
+            and (not financial_year or self._financial_year(payroll.payment_cycle) == financial_year)
         ]
 
+    def available_financial_years(self, district_id, benefit_plan_id):
+        return sorted({
+            year for payroll in self._eligible_payrolls(district_id, benefit_plan_id)
+            if (year := self._financial_year(payroll.payment_cycle))
+        }, reverse=True)
+
+    def _refresh_summary(self, batch):
+        links = list(DistrictPayrollBatchPayroll.objects.filter(batch=batch).select_related("payroll"))
+        reconciliation_service = CsvReconciliationService(self.user)
+        project_model = apps.get_model("project_social_protection", "Project")
+        project_ids = {self._project_id(link.payroll) for link in links if self._project_id(link.payroll)}
+        projects = project_model.objects.filter(id__in=project_ids, is_deleted=False).select_related("micro_catchment")
+        catchments = sorted({project.micro_catchment.name for project in projects if project.micro_catchment})
+        participants = 0
+        total_wages = Decimal("0")
+        for link in links:
+            benefits = reconciliation_service._get_benefit_consumption_qs(link.payroll)
+            participants += benefits.count()
+            total_wages += sum((benefit.amount or Decimal("0") for benefit in benefits.only("amount")), Decimal("0"))
+        total_fees = Decimal(batch.cash_out_fee_per_participant or 0) * participants
+        batch.total_records = participants
+        batch.total_wages = total_wages
+        batch.total_cash_out_fees = total_fees
+        batch.summary = {
+            "catchments": catchments,
+            "projects": projects.count(),
+            "participants": participants,
+            "total_wages": str(total_wages),
+            "total_cash_out_fees": str(total_fees),
+        }
+        batch.save(update_fields=[
+            "total_records", "total_wages", "total_cash_out_fees", "summary", "updated_at",
+        ])
+
     @transaction.atomic
-    def get_or_create_batch(self, district_id, benefit_plan_id):
-        eligible_payrolls = self._eligible_payrolls(district_id, benefit_plan_id)
+    def get_or_create_batch(self, district_id, benefit_plan_id, financial_year=None):
+        financial_years = self.available_financial_years(district_id, benefit_plan_id)
+        if not financial_year:
+            if len(financial_years) != 1:
+                raise ValueError("Select a Financial Year for this district and phase.")
+            financial_year = financial_years[0]
+        eligible_payrolls = self._eligible_payrolls(district_id, benefit_plan_id, financial_year)
         if not eligible_payrolls:
-            raise ValueError("No approved, single-project payrolls were found for this district, payment cycle, and payment plan.")
+            raise ValueError("No approved, single-project payrolls were found for this district, phase, and Financial Year.")
 
         batch = DistrictPayrollBatch.objects.select_for_update().filter(
             district_id=district_id,
             benefit_plan_id=str(benefit_plan_id),
+            financial_year=financial_year,
         ).first()
         if not batch:
             batch = DistrictPayrollBatch(
                 district_id=district_id,
                 benefit_plan_id=str(benefit_plan_id),
+                financial_year=financial_year,
                 status=DistrictPayrollBatchStatus.DRAFT,
             )
             batch.id = uuid.uuid4()
@@ -420,21 +475,82 @@ class DistrictPayrollBatchService:
 
         DistrictPayrollBatchPayroll.objects.filter(batch=batch).delete()
         links = []
-        total_records = 0
-        reconciliation_service = CsvReconciliationService(self.user)
         for payroll in eligible_payrolls:
-            total_records += reconciliation_service._get_benefit_consumption_qs(payroll).count()
             link = DistrictPayrollBatchPayroll(batch=batch, payroll=payroll)
             link.id = uuid.uuid4()
             links.append(link)
         DistrictPayrollBatchPayroll.objects.bulk_create(links)
-        batch.total_records = total_records
-        batch.save(update_fields=["total_records", "updated_at"])
+        self._refresh_summary(batch)
+        return batch
+
+    def _create_approval_task(self, batch, stage):
+        district_stage = stage == "district"
+        TaskService(self.user).create({
+            "source": self.district_approval_source if district_stage else self.national_approval_source,
+            "entity": batch,
+            "status": Task.Status.RECEIVED,
+            "executor_action_event": TasksManagementConfig.default_executor_event,
+            "business_event": (
+                PayrollConfig.district_wagesheet_district_approval_event
+                if district_stage else PayrollConfig.district_wagesheet_national_approval_event
+            ),
+            "data": _get_std_task_data_payload({
+                "id": batch.id,
+                "district": batch.district.name,
+                "phase": batch.benefit_plan_id,
+                "financial_year": batch.financial_year,
+                "approval_stage": stage,
+            }),
+        })
+
+    @transaction.atomic
+    def submit_for_district_approval(
+        self, district_id, benefit_plan_id, financial_year=None,
+        bank_name=None, account_number=None, cash_out_fee_per_participant=None,
+    ):
+        batch = self.get_or_create_batch(district_id, benefit_plan_id, financial_year)
+        if batch.status == DistrictPayrollBatchStatus.DRAFT:
+            batch.bank_name = bank_name or batch.bank_name
+            batch.account_number = account_number or batch.account_number
+            if cash_out_fee_per_participant not in (None, ""):
+                try:
+                    batch.cash_out_fee_per_participant = Decimal(str(cash_out_fee_per_participant))
+                except InvalidOperation as exc:
+                    raise ValueError("Cash-out fee per participant must be a valid amount.") from exc
+            batch.save(update_fields=["bank_name", "account_number", "cash_out_fee_per_participant", "updated_at"])
+            self._refresh_summary(batch)
+            batch.status = DistrictPayrollBatchStatus.PENDING_DISTRICT_APPROVAL
+            batch.save(update_fields=["status", "updated_at"])
+            self._create_approval_task(batch, "district")
         return batch
 
     @transaction.atomic
-    def download_reconciliation(self, district_id, benefit_plan_id):
-        batch = self.get_or_create_batch(district_id, benefit_plan_id)
+    def resolve_approval(self, batch_id, stage, approved):
+        batch = DistrictPayrollBatch.objects.select_for_update().get(id=batch_id)
+        expected = (
+            DistrictPayrollBatchStatus.PENDING_DISTRICT_APPROVAL
+            if stage == "district" else DistrictPayrollBatchStatus.PENDING_NATIONAL_APPROVAL
+        )
+        if batch.status != expected:
+            return batch
+        if not approved:
+            batch.status = DistrictPayrollBatchStatus.DRAFT
+            batch.save(update_fields=["status", "updated_at"])
+            return batch
+        if stage == "district":
+            batch.status = DistrictPayrollBatchStatus.PENDING_NATIONAL_APPROVAL
+            batch.save(update_fields=["status", "updated_at"])
+            self._create_approval_task(batch, "national")
+        else:
+            batch.status = DistrictPayrollBatchStatus.READY_FOR_PSP
+            batch.save(update_fields=["status", "updated_at"])
+        return batch
+
+    @transaction.atomic
+    def download_reconciliation(self, district_id, benefit_plan_id, financial_year=None):
+        batch = self.get_or_create_batch(district_id, benefit_plan_id, financial_year)
+        if batch.status != DistrictPayrollBatchStatus.READY_FOR_PSP:
+            raise ValueError("The District Wagesheet must complete district and national approval before the PSP file can be downloaded.")
         records = []
         reconciliation_service = CsvReconciliationService(self.user)
         project_model = apps.get_model("project_social_protection", "Project")
@@ -489,20 +605,20 @@ class DistrictPayrollBatchService:
         df = df.reindex(columns=export_columns)
         in_memory_file = BytesIO()
         df.to_csv(in_memory_file, index=False)
-        batch.status = DistrictPayrollBatchStatus.DOWNLOADED
+        batch.status = DistrictPayrollBatchStatus.SUBMITTED_TO_PSP
         batch.save(update_fields=["status", "updated_at"])
         return batch, in_memory_file
 
     @transaction.atomic
-    def upload_reconciliation(self, district_id, benefit_plan_id, file, upload):
+    def upload_reconciliation(self, district_id, benefit_plan_id, file, upload, financial_year=None):
         """Validate a returned provider file against the immutable batch membership."""
         if not file:
             raise ValueError("A reconciliation CSV file is required.")
         contents = file.read()
         if not contents:
             raise ValueError("Import file is empty")
-        batch = self.get_or_create_batch(district_id, benefit_plan_id)
-        if batch.status not in (DistrictPayrollBatchStatus.DOWNLOADED, DistrictPayrollBatchStatus.DRAFT):
+        batch = self.get_or_create_batch(district_id, benefit_plan_id, financial_year)
+        if batch.status != DistrictPayrollBatchStatus.SUBMITTED_TO_PSP:
             raise ValueError("This district batch is not available for a new reconciliation upload.")
         try:
             df = pd.read_csv(BytesIO(contents), dtype=str, keep_default_na=False)
@@ -521,12 +637,12 @@ class DistrictPayrollBatchService:
             str(link.payroll_id): link.payroll
             for link in DistrictPayrollBatchPayroll.objects.select_related("payroll").filter(batch=batch)
         }
-        upload.district_batch = batch
+        upload.district_wagesheet = batch
         upload.checksum = hashlib.sha256(contents).hexdigest()
         upload.status = CsvReconciliationUpload.Status.VALIDATING
         upload.save(username=self.user.login_name)
         duplicate = CsvReconciliationUpload.objects.filter(
-            district_batch=batch,
+            district_wagesheet=batch,
             checksum=upload.checksum,
             is_deleted=False,
         ).exclude(id=upload.id).exclude(
@@ -625,6 +741,10 @@ class DistrictPayrollBatchService:
         return upload, CsvReconciliationService._upload_summary(upload)
 
 
+# Backwards-compatible import name for this unmerged feature branch.
+DistrictPayrollBatchService = DistrictWagesheetService
+
+
 class CsvReconciliationService:
 
     def __init__(self, user: InteractiveUser):
@@ -709,6 +829,19 @@ class CsvReconciliationService:
         # Serialise uploads for a payroll.  This makes superseding a pending
         # review deterministic even when corrected files arrive concurrently.
         payroll = Payroll.objects.select_for_update().get(id=payroll.id)
+        if DistrictPayrollBatchPayroll.objects.filter(
+            payroll=payroll,
+            batch__status__in=[
+                DistrictPayrollBatchStatus.PENDING_DISTRICT_APPROVAL,
+                DistrictPayrollBatchStatus.PENDING_NATIONAL_APPROVAL,
+                DistrictPayrollBatchStatus.READY_FOR_PSP,
+                DistrictPayrollBatchStatus.SUBMITTED_TO_PSP,
+                DistrictPayrollBatchStatus.PENDING_REVIEW,
+            ],
+        ).exists():
+            raise ValueError(
+                "This payroll belongs to an active District Wagesheet and must be reconciled through that wagesheet."
+            )
         if not file:
             raise ValueError(_("csv_reconciliation.validation.file_required"))
 
@@ -935,8 +1068,8 @@ class CsvReconciliationService:
                 self._reconcile_bc(pd.Series(row.submitted_data), benefit)
         upload.status = CsvReconciliationUpload.Status.PARTIAL_SUCCESS if upload.unmatched_records else CsvReconciliationUpload.Status.SUCCESS
         upload.save(username=self.user.login_name)
-        if upload.district_batch_id:
-            batch = upload.district_batch
+        if upload.district_wagesheet_id:
+            batch = upload.district_wagesheet
             for link in DistrictPayrollBatchPayroll.objects.filter(batch=batch).select_related("payroll"):
                 unresolved = PayrollBenefitConsumption.objects.filter(
                     payroll=link.payroll,

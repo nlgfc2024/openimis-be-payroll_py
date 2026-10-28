@@ -19,6 +19,12 @@ DEFAULT_CONFIG = {
     "gql_csv_reconciliation_create_perms": ["206002"],
     "payroll_accept_event": "payroll.accept_payroll",
     "payroll_reconciliation_event": "payroll.payroll_reconciliation",
+    # Task groups are configured by their task source in Task Management.  The
+    # deployment assigns the district source to DPD/Director of Agriculture and
+    # the national source to EPS/National Coordinator; no user is hard-coded.
+    "district_wagesheet_district_approval_event": "payroll.district_wagesheet_district_approval",
+    "district_wagesheet_national_approval_event": "payroll.district_wagesheet_national_approval",
+    "financial_year_start_month": 7,
     "payroll_reject_event": "payroll.payroll_reject",
     "csv_reconciliation_field_mapping": {
         "payrollbenefitconsumption__payroll__name": "Payroll Name",
@@ -88,6 +94,9 @@ class PayrollConfig(AppConfig):
     gql_csv_reconciliation_create_perms = None
     payroll_accept_event = None
     payroll_reconciliation_event = None
+    district_wagesheet_district_approval_event = None
+    district_wagesheet_national_approval_event = None
+    financial_year_start_month = None
     payroll_reject_event = None
     csv_reconciliation_field_mapping = None
     csv_reconciliation_status_column = None
