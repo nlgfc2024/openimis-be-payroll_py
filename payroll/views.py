@@ -1,5 +1,6 @@
 import logging
 
+from django.apps import apps
 from django.db import transaction
 from rest_framework import status, views
 from rest_framework.decorators import api_view, permission_classes
@@ -8,7 +9,7 @@ from rest_framework.response import Response
 from core.utils import DefaultStorageFileHandler
 from core.views import check_user_rights
 from payroll.apps import PayrollConfig
-from payroll.models import Payroll, CsvReconciliationUpload
+from payroll.models import Payroll, CsvReconciliationUpload, DistrictPayrollBatch
 from payroll.payments_registry import PaymentMethodStorage
 from payroll.services import CsvReconciliationService, DistrictWagesheetService
 
@@ -183,6 +184,32 @@ class DistrictReconciliationBatchAPIView(views.APIView):
 
     def get(self, request):
         try:
+            if request.GET.get("action") == "list":
+                batches = list(
+                    DistrictPayrollBatch.objects.select_related("district").order_by("-updated_at")
+                )
+                benefit_plan_ids = {batch.benefit_plan_id for batch in batches}
+                benefit_plans = {
+                    str(plan.id): f"{plan.code} {plan.name}"
+                    for plan in apps.get_model("social_protection", "BenefitPlan").objects.filter(
+                        id__in=benefit_plan_ids,
+                        is_deleted=False,
+                    )
+                }
+                return Response({"wagesheets": [
+                    {
+                        "id": str(batch.id),
+                        "name": DistrictWagesheetService._wagesheet_name(
+                            batch.district, batch.benefit_plan_id, batch.financial_year,
+                        ),
+                        "district": batch.district.name,
+                        "phase": benefit_plans.get(batch.benefit_plan_id, batch.benefit_plan_id),
+                        "financial_year": batch.financial_year,
+                        "status": batch.status,
+                        "updated_at": batch.updated_at,
+                    }
+                    for batch in batches
+                ]})
             district_id = request.GET.get("district_id")
             benefit_plan_id = request.GET.get("benefit_plan_id")
             financial_year = request.GET.get("financial_year")
@@ -219,7 +246,8 @@ class DistrictReconciliationBatchAPIView(views.APIView):
             if request.GET.get("action") == "submit_for_approval":
                 if not all([district_id, benefit_plan_id]):
                     raise ValueError("district_id and benefit_plan_id are required.")
-                batch = DistrictWagesheetService(request.user).submit_for_district_approval(
+                service = DistrictWagesheetService(request.user)
+                batch = service.submit_for_district_approval(
                     district_id,
                     benefit_plan_id,
                     financial_year,
@@ -227,7 +255,16 @@ class DistrictReconciliationBatchAPIView(views.APIView):
                     request.data.get("account_number"),
                     request.data.get("cash_out_fee_per_participant"),
                 )
-                return Response({"success": True, "status": batch.status, "batch_id": str(batch.id)}, status=201)
+                return Response({
+                    "success": True,
+                    "status": batch.status,
+                    "batch_id": str(batch.id),
+                    "name": service._wagesheet_name(
+                        batch.district,
+                        batch.benefit_plan_id,
+                        batch.financial_year,
+                    ),
+                }, status=201)
             if not all([district_id, benefit_plan_id, financial_year, file]):
                 raise ValueError("district_id, benefit_plan_id, financial_year, and file are required.")
             upload.file_name = file.name

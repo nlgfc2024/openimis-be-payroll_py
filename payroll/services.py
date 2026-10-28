@@ -42,6 +42,7 @@ from payroll.validation import PaymentPointValidation, PayrollValidation, Benefi
 from calculation.services import get_calculation_object
 from core.services.utils import output_exception, check_authentication
 from contribution_plan.models import PaymentPlan
+from location.models import Location
 from social_protection.models import Beneficiary, BeneficiaryStatus
 from tasks_management.apps import TasksManagementConfig
 from tasks_management.models import Task
@@ -391,6 +392,17 @@ class DistrictWagesheetService:
             start_year -= 1
         return f"{start_year}/{str(start_year + 1)[-2:]}"
 
+    @staticmethod
+    def _wagesheet_name(district, benefit_plan_id, financial_year):
+        benefit_plan = apps.get_model("social_protection", "BenefitPlan").objects.filter(
+            id=benefit_plan_id, is_deleted=False,
+        ).first()
+        phase = (
+            f"{benefit_plan.code} {benefit_plan.name}"
+            if benefit_plan else str(benefit_plan_id)
+        )
+        return f"District Wagesheet - {district.name} - {phase} - {financial_year}"
+
     def _eligible_payrolls(self, district_id, benefit_plan_id, financial_year=None):
         project_model = apps.get_model("project_social_protection", "Project")
         payrolls = Payroll.objects.filter(
@@ -455,6 +467,9 @@ class DistrictWagesheetService:
         if not eligible_payrolls:
             raise ValueError("No approved, single-project payrolls were found for this district, phase, and Financial Year.")
 
+        district = Location.objects.filter(id=district_id).only("id", "name").first()
+        if not district:
+            raise ValueError("District was not found.")
         batch = DistrictPayrollBatch.objects.select_for_update().filter(
             district_id=district_id,
             benefit_plan_id=str(benefit_plan_id),

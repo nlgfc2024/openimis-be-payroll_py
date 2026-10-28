@@ -117,6 +117,18 @@ class DistrictWagesheetReconciliationTests(TestCase):
             self.wagesheet.refresh_from_db()
             self.assertEqual(self.wagesheet.status, DistrictWagesheetStatus.READY_FOR_PSP)
 
+    def test_wagesheet_name_contains_district_phase_and_financial_year(self):
+        wagesheet_name = DistrictWagesheetService._wagesheet_name(
+            self.district,
+            self.wagesheet.benefit_plan_id,
+            self.wagesheet.financial_year,
+        )
+
+        self.assertEqual(
+            wagesheet_name,
+            f"District Wagesheet - {self.district.name} - phase-wagesheet-test - 2026/27",
+        )
+
     def test_approved_feedback_reconciles_only_fully_resolved_source_payrolls(self):
         resolved_payroll, [resolved_benefit] = self._payroll_with_benefits("resolved", 1)
         partial_payroll, partial_benefits = self._payroll_with_benefits("partial", 2)
