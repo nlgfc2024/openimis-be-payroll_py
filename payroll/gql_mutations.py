@@ -54,6 +54,12 @@ class CreatePayrollInput(OpenIMISMutation.Input):
     json_ext = graphene.JSONString(required=False)
 
 
+class CreateConsolidatedPayrollInput(OpenIMISMutation.Input):
+    district_id = graphene.UUID(required=True)
+    payment_plan_id = graphene.UUID(required=True)
+    source_payroll_ids = graphene.List(graphene.UUID, required=True)
+
+
 class DeletePayrollInputType(DeletePaymentPointInputType):
     pass
 
@@ -166,6 +172,25 @@ class CreatePayrollMutation(BaseHistoryModelCreateMutationMixin, BaseMutation):
         return None
 
     class Input(CreatePayrollInput):
+        pass
+
+
+class CreateConsolidatedPayrollMutation(BaseMutation):
+    _mutation_class = "CreateConsolidatedPayrollMutation"
+    _mutation_module = "payroll"
+
+    @classmethod
+    def _validate_mutation(cls, user, **data):
+        if type(user) is AnonymousUser or not user.has_perms(PayrollConfig.gql_payroll_create_perms):
+            raise ValidationError("mutation.authentication_required")
+
+    @classmethod
+    def _mutate(cls, user, **data):
+        data.pop('client_mutation_id', None)
+        data.pop('client_mutation_label', None)
+        PayrollService(user).create_consolidated_payroll(**data)
+
+    class Input(CreateConsolidatedPayrollInput):
         pass
 
 

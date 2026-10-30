@@ -34,6 +34,10 @@ class PaymentPoint(HistoryModel):
 
 
 class Payroll(HistoryBusinessModel):
+    class PayrollType(models.TextChoices):
+        STANDARD = "STANDARD", _("STANDARD")
+        CONSOLIDATED = "CONSOLIDATED", _("CONSOLIDATED")
+
     name = models.CharField(max_length=255, blank=False, null=False)
     payment_plan = models.ForeignKey(PaymentPlan, on_delete=models.DO_NOTHING, blank=True, null=True)
     payment_cycle = models.ForeignKey(PaymentCycle, on_delete=models.DO_NOTHING, blank=True, null=True)
@@ -42,6 +46,10 @@ class Payroll(HistoryBusinessModel):
         max_length=100, choices=PayrollStatus.choices, default=PayrollStatus.PENDING_APPROVAL, null=False
     )
     payment_method = models.CharField(max_length=255, blank=True, null=True)
+    payroll_type = models.CharField(
+        max_length=32, choices=PayrollType.choices, default=PayrollType.STANDARD,
+    )
+    district = models.ForeignKey(Location, models.DO_NOTHING, blank=True, null=True)
 
     def __str__(self):
         return f"Payroll {self.name} - {self.uuid}"
@@ -84,6 +92,18 @@ class PayrollBenefitConsumption(HistoryModel):
     # 1:n it is ensured by the service
     payroll = models.ForeignKey(Payroll, on_delete=models.DO_NOTHING)
     benefit = models.ForeignKey(BenefitConsumption, on_delete=models.DO_NOTHING)
+
+
+class ConsolidatedPayrollMember(HistoryModel):
+    """Audit-preserving membership of source payrolls in a consolidated payroll."""
+    consolidated_payroll = models.ForeignKey(
+        Payroll, models.DO_NOTHING, related_name="consolidation_members",
+    )
+    source_payroll = models.ForeignKey(
+        Payroll, models.DO_NOTHING, related_name="consolidated_memberships",
+    )
+    beneficiaries_count = models.PositiveIntegerField(default=0)
+    total_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
 
 
 class CsvReconciliationUpload(HistoryModel):
