@@ -9,7 +9,7 @@ from invoice.gql.gql_types.bill_types import BillGQLType
 from location.gql_queries import LocationGQLType
 from individual.gql_queries import IndividualGQLType
 from payroll.models import PaymentPoint, Payroll, BenefitConsumption, \
-    PayrollBenefitConsumption, BenefitAttachment, CsvReconciliationUpload, ReconciliationUploadRow
+    PayrollBenefitConsumption, BenefitAttachment, CsvReconciliationUpload, ReconciliationUploadRow, ConsolidatedPayrollMember
 from contribution_plan.gql import PaymentPlanGQLType
 from payment_cycle.gql_queries import PaymentCycleGQLType
 from social_protection.models import BenefitPlan
@@ -202,10 +202,19 @@ class BenefitConsumptionGQLType(DjangoObjectType):
         return ", ".join(names) or None
 
 
+class ConsolidatedPayrollMemberGQLType(graphene.ObjectType):
+    source_payroll_id = graphene.String()
+    source_payroll_name = graphene.String()
+    source_payroll_status = graphene.String()
+    beneficiaries_count = graphene.Int()
+    total_amount = graphene.Decimal()
+
+
 class PayrollGQLType(DjangoObjectType):
     uuid = graphene.String(source='uuid')
     benefit_consumption = graphene.List(BenefitConsumptionGQLType)
     benefit_plan_name_code = graphene.String()
+    consolidated_members = graphene.List(ConsolidatedPayrollMemberGQLType)
 
     class Meta:
         model = Payroll
@@ -240,6 +249,19 @@ class PayrollGQLType(DjangoObjectType):
     def resolve_benefit_plan_name_code(self, info):
         benefit_plan = BenefitPlan.objects.get(id=self.payment_plan.benefit_plan.id, is_deleted=False)
         return f"{benefit_plan.code} - {benefit_plan.name}"
+
+    def resolve_consolidated_members(self, info):
+        if self.payroll_type != Payroll.PayrollType.CONSOLIDATED:
+            return []
+        return [{
+            "source_payroll_id": str(member.source_payroll_id),
+            "source_payroll_name": member.source_payroll.name,
+            "source_payroll_status": member.source_payroll.status,
+            "beneficiaries_count": member.beneficiaries_count,
+            "total_amount": member.total_amount,
+        } for member in ConsolidatedPayrollMember.objects.filter(
+            consolidated_payroll=self, is_deleted=False,
+        ).select_related("source_payroll")]
 
 
 class PaymentMethodGQLType(graphene.ObjectType):
