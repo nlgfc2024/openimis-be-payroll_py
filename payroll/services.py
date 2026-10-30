@@ -202,7 +202,7 @@ class PayrollService(BaseService):
         """Create a parent payroll without cloning the source benefits."""
         if not source_payroll_ids:
             raise ValidationError("Select at least one approved payroll to consolidate.")
-        sources = list(Payroll.objects.select_for_update().filter(
+        sources = list(Payroll.objects.select_for_update(of=("self",)).filter(
             id__in=source_payroll_ids,
             payment_plan__benefit_plan_id=benefit_plan_id,
             status=PayrollStatus.APPROVE_FOR_PAYMENT,
@@ -212,13 +212,16 @@ class PayrollService(BaseService):
         if len(sources) != len(set(source_payroll_ids)):
             raise ValidationError("Every selected payroll must still be approved and belong to the selected phase.")
         if ConsolidatedPayrollMember.objects.filter(
-                source_payroll_id__in=[source.id for source in sources], is_deleted=False).exists():
+                source_payroll_id__in=[source.id for source in sources],
+                is_deleted=False,
+                consolidated_payroll__is_deleted=False,
+        ).exclude(consolidated_payroll__status=PayrollStatus.REJECTED).exists():
             raise ValidationError("A selected payroll already belongs to a consolidated payroll.")
         first = sources[0]
         if any((source.payment_method, source.payment_point_id, source.payment_cycle_id) !=
                (first.payment_method, first.payment_point_id, first.payment_cycle_id) for source in sources):
             raise ValidationError("Selected payrolls must use the same payment method, point, and cycle.")
-        district = Location.objects.get(uuid=district_id, is_deleted=False)
+        district = Location.objects.get(uuid=district_id, validity_to__isnull=True)
         phase = first.payment_plan.benefit_plan.name or first.payment_plan.benefit_plan.code
         name_base = f"{district.name}-{phase}-Consolidated Payroll"
         sequence = Payroll.objects.filter(name__startswith=name_base, is_deleted=False).count() + 1
@@ -644,7 +647,31 @@ class CsvReconciliationService:
             export_columns.append(self.micro_catchment_column)
         export_columns.append(PayrollConfig.csv_reconciliation_paid_extra_field)
         if source_payroll_by_benefit:
-            export_columns.append("Source Payroll")
+            export_columns.insert(0, "Source Payroll")
+            preferred_columns = [
+                "Source Payroll",
+                "Payroll Name",
+                "Payroll Status",
+                "District Name",
+                self.micro_catchment_column,
+                "Form Number",
+                "Phone Number",
+                "First Name",
+                "Last Name",
+                "National ID",
+                "Date of Birth",
+                "Code",
+                "Status",
+                "Amount",
+                "Type",
+                "Receipt",
+                PayrollConfig.csv_reconciliation_paid_extra_field,
+            ]
+            export_columns = [
+                column for column in preferred_columns if column in export_columns
+            ] + [
+                column for column in export_columns if column not in preferred_columns
+            ]
         for key in extra_info_keys:
             df[key] = [extra_info.get(key) for extra_info in extra_info_dicts]
             export_columns.append(key)
@@ -816,6 +843,13 @@ class CsvReconciliationService:
         )
         bulk_create_with_history(upload_rows, ReconciliationUploadRow, default_user=self.user, batch_size=1000)
 
+        if errors:
+            upload.error = errors
+            upload.status = CsvReconciliationUpload.Status.FAIL
+            upload.json_ext = {"extra_info": self._upload_summary(upload)}
+            upload.save(username=self.user.login_name)
+            return BytesIO(contents), errors, self._upload_summary(upload)
+
         # A corrected file replaces, rather than competes with, an outstanding
         # review. Fail its still-open checker task as well, so it cannot later
         # look completed even though its upload was not applied.
@@ -857,7 +891,8 @@ class CsvReconciliationService:
                 "id": payroll.id,
                 "upload_id": upload.id,
                 "payroll_name": payroll.name,
-                "included_payrolls": [{"id": str(payroll.id), "name": payroll.name}],
+                "included_payrolls": task_context["included_payrolls"],
+                "consolidated": task_context["consolidated"],
                 "district": task_context["district"],
                 "phase": task_context["phase"],
                 "summary": self._upload_summary(upload),
@@ -869,29 +904,106 @@ class CsvReconciliationService:
 
     @staticmethod
     def _reconciliation_task_context(payroll):
-        """Return the selected-project district and the payroll's benefit-plan phase."""
-        project_ids = (payroll.json_ext or {}).get("filter_criteria", {}).get("project_ids", [])
+        """Return the payroll's phase, district, and source-payroll review context."""
+        consolidated = payroll.payroll_type == Payroll.PayrollType.CONSOLIDATED
+        if consolidated:
+            members = list(ConsolidatedPayrollMember.objects.filter(
+                consolidated_payroll=payroll,
+                is_deleted=False,
+                source_payroll__is_deleted=False,
+            ).select_related("source_payroll").order_by("source_payroll__name"))
+            source_payrolls = [member.source_payroll for member in members]
+        else:
+            members = []
+            source_payrolls = [payroll]
+
+        project_ids_by_payroll = {}
+        for source_payroll in source_payrolls:
+            extension = source_payroll.json_ext or {}
+            filter_criteria = extension.get("filter_criteria", {}) if isinstance(extension, dict) else {}
+            project_ids = filter_criteria.get("project_ids", []) if isinstance(filter_criteria, dict) else []
+            if isinstance(project_ids, (list, tuple)):
+                project_ids_by_payroll[str(source_payroll.id)] = set(project_ids)
+            else:
+                project_ids_by_payroll[str(source_payroll.id)] = set()
+
+        all_project_ids = set().union(*project_ids_by_payroll.values()) if project_ids_by_payroll else set()
         project_model = apps.get_model("project_social_protection", "Project")
         projects = project_model.objects.filter(
-            id__in=project_ids,
+            id__in=all_project_ids,
             is_deleted=False,
-        ).select_related("location__parent__parent__parent")
+        ).select_related("location__parent__parent__parent") if all_project_ids else []
 
-        districts = set()
+        districts_by_payroll = {payroll_id: set() for payroll_id in project_ids_by_payroll}
+        project_ids_to_payrolls = {}
+        for payroll_id, project_ids in project_ids_by_payroll.items():
+            for project_id in project_ids:
+                project_ids_to_payrolls.setdefault(str(project_id), set()).add(payroll_id)
         for project in projects:
-            location = project.location
-            while location:
-                if location.type == "R":
-                    districts.add(location.name)
-                    break
-                location = location.parent
+            district = CsvReconciliationService._district_name_for_location(project.location)
+            if district:
+                for payroll_id in project_ids_to_payrolls.get(str(project.id), set()):
+                    districts_by_payroll[payroll_id].add(district)
+
+        # Older payrolls may not have retained their project criteria. In that
+        # case derive the district from the beneficiaries actually linked to
+        # each source payroll instead of leaving the task district blank.
+        fallback_payroll_ids = {
+            str(source_payroll.id)
+            for source_payroll in source_payrolls
+            if not project_ids_by_payroll.get(str(source_payroll.id))
+            or not districts_by_payroll.get(str(source_payroll.id))
+        }
+        source_payroll_id_by_value = {
+            str(source_payroll.id): source_payroll.id for source_payroll in source_payrolls
+        }
+        if fallback_payroll_ids:
+            fallback_memberships = PayrollBenefitConsumption.objects.filter(
+                payroll_id__in=[
+                    source_payroll_id_by_value[payroll_id] for payroll_id in fallback_payroll_ids
+                ],
+                is_deleted=False,
+                benefit__is_deleted=False,
+                benefit__individual__groupindividuals__recipient_type="PRIMARY",
+                benefit__individual__groupindividuals__is_deleted=False,
+            ).select_related(
+                "benefit__individual__location__parent__parent__parent",
+            )
+            for membership in fallback_memberships:
+                payroll_id = str(membership.payroll_id)
+                district = CsvReconciliationService._district_name_for_location(
+                    membership.benefit.individual.location,
+                )
+                if district:
+                    districts_by_payroll.setdefault(payroll_id, set()).add(district)
+
+        districts = set().union(*districts_by_payroll.values()) if districts_by_payroll else set()
 
         payment_plan = payroll.payment_plan
         benefit_plan = payment_plan.benefit_plan if payment_plan else None
+        if consolidated:
+            included_payrolls = [
+                {"id": str(member.source_payroll_id), "name": member.source_payroll.name}
+                for member in members
+            ]
+        else:
+            included_payrolls = [{"id": str(payroll.id), "name": payroll.name}]
         return {
             "district": ", ".join(sorted(districts)) or None,
             "phase": benefit_plan.name if benefit_plan else None,
+            "consolidated": consolidated,
+            "included_payrolls": included_payrolls,
         }
+
+    @staticmethod
+    def _district_name_for_location(location):
+        visited = set()
+        while location and location.id not in visited:
+            visited.add(location.id)
+            if location.type == "R":
+                return location.name
+            location = location.parent
+        return None
 
     def _load_upload_context(self, payroll, codes):
         benefits = list(
@@ -954,7 +1066,8 @@ class CsvReconciliationService:
     @transaction.atomic
     def apply_upload(self, upload):
         upload = CsvReconciliationUpload.objects.select_for_update().get(id=upload.id)
-        if upload.status != CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION:
+        if (upload.status != CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION
+                or upload.unmatched_records):
             return
         rows = list(ReconciliationUploadRow.objects.filter(
             upload=upload,
@@ -1075,6 +1188,8 @@ class CsvReconciliationService:
             ("payroll_status_mismatch", "payrollbenefitconsumption__payroll__status", payroll.status, self._matches_text),
             ("first_name_mismatch", "individual__first_name", individual.first_name, self._matches_text),
             ("last_name_mismatch", "individual__last_name", individual.last_name, self._matches_text),
+            ("national_id_mismatch", "individual__json_ext__national_id",
+             (individual.json_ext or {}).get("national_id"), self._matches_text),
             ("date_of_birth_mismatch", "individual__dob", individual.dob, self._matches_date),
             ("status_mismatch", "status", benefit.status, self._matches_text),
             ("amount_mismatch", "amount", benefit.amount, self._amounts_match),

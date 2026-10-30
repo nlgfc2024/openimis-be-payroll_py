@@ -50,6 +50,7 @@ DEFAULT_CONFIG = {
         "missing_code", "duplicate_code_in_file", "duplicate_national_id_in_file",
         "code_not_found", "code_not_in_payroll", "payroll_name_mismatch",
         "payroll_status_mismatch", "first_name_mismatch", "last_name_mismatch",
+        "national_id_mismatch",
         "date_of_birth_mismatch", "status_mismatch", "amount_mismatch",
         "type_mismatch", "micro_catchment_mismatch", "invalid_paid_value",
         "missing_payment_reference",

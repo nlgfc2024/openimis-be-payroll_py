@@ -3,7 +3,7 @@ import graphene_django_optimizer as gql_optimizer
 from gettext import gettext as _
 from django.apps import apps
 from django.contrib.auth.models import AnonymousUser
-from django.db.models import Q, Sum
+from django.db.models import Exists, OuterRef, Q, Sum
 
 from core.schema import OrderedDjangoFilterConnectionField
 from core.services import wait_for_mutation
@@ -22,7 +22,8 @@ from payroll.gql_queries import BenefitConsumptionGQLType, PaymentPointGQLType, 
     PaymentGatewayConfigGQLType, BenefitsSummaryGQLType
 from payroll.models import PaymentPoint, Payroll, \
     BenefitConsumption, BenefitAttachment, \
-    CsvReconciliationUpload, ReconciliationUploadRow, PayrollBenefitConsumption, BenefitConsumptionStatus
+    CsvReconciliationUpload, ReconciliationUploadRow, PayrollBenefitConsumption, BenefitConsumptionStatus, \
+    ConsolidatedPayrollMember, PayrollStatus
 from payroll.payments_registry import PaymentMethodStorage
 from social_protection.models import BenefitPlan
 
@@ -242,9 +243,14 @@ class Query(graphene.ObjectType):
         }
         if benefit_plan_id:
             filters["payment_plan__benefit_plan_id"] = benefit_plan_id
-        payrolls = Payroll.objects.filter(**filters).exclude(
-            consolidated_memberships__is_deleted=False,
-        ).select_related("payment_plan__benefit_plan").distinct()
+        active_memberships = ConsolidatedPayrollMember.objects.filter(
+            source_payroll_id=OuterRef("pk"),
+            is_deleted=False,
+            consolidated_payroll__is_deleted=False,
+        ).exclude(consolidated_payroll__status=PayrollStatus.REJECTED)
+        payrolls = Payroll.objects.filter(**filters).filter(
+            ~Exists(active_memberships),
+        ).select_related("payment_plan").distinct()
         project_model = apps.get_model("project_social_protection", "Project")
         district_id = str(district_id)
         matches = []
@@ -287,13 +293,13 @@ class Query(graphene.ObjectType):
 
     def resolve_consolidation_candidates(self, info, district_id, benefit_plan_id):
         Query._check_permissions(info.context.user, PayrollConfig.gql_payroll_search_perms)
-        return self._consolidation_candidates(district_id, benefit_plan_id)
+        return Query._consolidation_candidates(district_id, benefit_plan_id)
 
     def resolve_consolidation_phases(self, info, district_id):
         Query._check_permissions(info.context.user, PayrollConfig.gql_payroll_search_perms)
         phase_ids = {
             payroll.payment_plan.benefit_plan_id
-            for payroll in self._consolidation_candidates(district_id)
+            for payroll in Query._consolidation_candidates(district_id)
             if payroll.payment_plan_id
         }
         return BenefitPlan.objects.filter(id__in=phase_ids, is_deleted=False).order_by("name")
