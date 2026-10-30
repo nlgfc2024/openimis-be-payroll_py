@@ -1,6 +1,7 @@
 import graphene
 import graphene_django_optimizer as gql_optimizer
 from gettext import gettext as _
+from django.apps import apps
 from django.contrib.auth.models import AnonymousUser
 from django.db.models import Q, Sum
 
@@ -24,6 +25,12 @@ from payroll.models import PaymentPoint, Payroll, \
     CsvReconciliationUpload, ReconciliationUploadRow, PayrollBenefitConsumption, BenefitConsumptionStatus
 from payroll.payments_registry import PaymentMethodStorage
 from social_protection.models import BenefitPlan
+
+
+class ConsolidationPhaseGQLType(graphene.ObjectType):
+    uuid = graphene.String()
+    code = graphene.String()
+    name = graphene.String()
 
 
 class Query(graphene.ObjectType):
@@ -123,6 +130,10 @@ class Query(graphene.ObjectType):
         district_id=graphene.UUID(required=True),
         benefit_plan_id=graphene.UUID(required=True),
     )
+    consolidation_phases = graphene.List(
+        ConsolidationPhaseGQLType,
+        district_id=graphene.UUID(required=True),
+    )
 
     def resolve_bill_by_payroll(self, info, **kwargs):
         Query._check_permissions(info.context.user, PayrollConfig.gql_payroll_search_perms)
@@ -216,19 +227,60 @@ class Query(graphene.ObjectType):
         query = Payroll.objects.filter(*filters)
         return gql_optimizer.query(query, info)
 
+    @staticmethod
+    def _consolidation_candidates(district_id, benefit_plan_id=None):
+        """Return available source payrolls belonging to a district.
+
+        New project payrolls retain project IDs in their criteria rather than a
+        district ID, so resolve their project location ancestry as well as the
+        legacy location filter.
+        """
+        filters = {
+            "status": 'APPROVE_FOR_PAYMENT',
+            "payroll_type": Payroll.PayrollType.STANDARD,
+            "is_deleted": False,
+        }
+        if benefit_plan_id:
+            filters["payment_plan__benefit_plan_id"] = benefit_plan_id
+        payrolls = Payroll.objects.filter(**filters).exclude(
+            consolidated_memberships__is_deleted=False,
+        ).select_related("payment_plan__benefit_plan").distinct()
+        project_model = apps.get_model("project_social_protection", "Project")
+        district_id = str(district_id)
+        matches = []
+        for payroll in payrolls:
+            criteria = (payroll.json_ext or {}).get("filter_criteria", {})
+            location_ids = {str(location_id) for location_id in criteria.get("location_ids", [])}
+            if district_id in location_ids:
+                matches.append(payroll)
+                continue
+            projects = project_model.objects.filter(
+                id__in=criteria.get("project_ids", []), is_deleted=False,
+            ).select_related("location__parent__parent__parent")
+            for project in projects:
+                location = project.location
+                while location:
+                    if str(location.uuid) == district_id:
+                        matches.append(payroll)
+                        break
+                    location = location.parent
+                else:
+                    continue
+                break
+        return matches
+
     def resolve_consolidation_candidates(self, info, district_id, benefit_plan_id):
         Query._check_permissions(info.context.user, PayrollConfig.gql_payroll_search_perms)
-        district_id = str(district_id)
-        candidates = Payroll.objects.filter(
-            payment_plan__benefit_plan_id=benefit_plan_id,
-            status='APPROVE_FOR_PAYMENT',
-            payroll_type='STANDARD',
-            is_deleted=False,
-        ).exclude(consolidated_memberships__is_deleted=False).distinct()
-        return [payroll for payroll in candidates if district_id in {
-            str(location_id) for location_id in (payroll.json_ext or {}).get(
-                'filter_criteria', {}).get('location_ids', [])
-        }]
+        return self._consolidation_candidates(district_id, benefit_plan_id)
+
+    def resolve_consolidation_phases(self, info, district_id):
+        Query._check_permissions(info.context.user, PayrollConfig.gql_payroll_search_perms)
+        phase_ids = {
+            payroll.payment_plan.benefit_plan_id
+            for payroll in self._consolidation_candidates(district_id)
+            if payroll.payment_plan_id
+        }
+        return BenefitPlan.objects.filter(id__in=phase_ids, is_deleted=False).order_by("name")
 
     def resolve_payroll_benefit_consumption(self, info, **kwargs):
         Query._check_permissions(info.context.user, PayrollConfig.gql_payroll_search_perms)
