@@ -756,6 +756,14 @@ class CsvReconciliationService:
         )
 
         benefits_by_code, contexts_by_benefit_id = self._load_upload_context(payroll, codes)
+        source_payroll_by_benefit = {}
+        if payroll.payroll_type == Payroll.PayrollType.CONSOLIDATED:
+            member_ids = ConsolidatedPayrollMember.objects.filter(
+                consolidated_payroll=payroll, is_deleted=False,
+            ).values_list("source_payroll_id", flat=True)
+            source_payroll_by_benefit = dict(PayrollBenefitConsumption.objects.filter(
+                payroll_id__in=member_ids, is_deleted=False,
+            ).values_list("benefit_id", "payroll_id"))
         errors = {}
         valid_indexes = []
         upload_rows = []
@@ -775,7 +783,11 @@ class CsvReconciliationService:
                 benefit=benefit,
                 code=code,
                 national_id=national_id,
-                submitted_data={str(key): self._json_value(value) for key, value in row.items()},
+                submitted_data={
+                    **{str(key): self._json_value(value) for key, value in row.items()},
+                    **({"_source_payroll_id": str(source_payroll_by_benefit[benefit.id])}
+                       if benefit and benefit.id in source_payroll_by_benefit else {}),
+                },
                 mismatch_reasons=reasons,
                 status=(ReconciliationUploadRow.Status.INVALID if self._has_blocking_reason(reasons)
                         else ReconciliationUploadRow.Status.VALID),
