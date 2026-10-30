@@ -9,7 +9,7 @@ from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError
 from django.db import transaction
 from simple_history.utils import bulk_create_with_history
-from django.db.models import Q
+from django.db.models import Q, Sum
 from django.utils.translation import gettext as _
 
 from core import datetime
@@ -18,6 +18,7 @@ from core.models import InteractiveUser
 from core.services import BaseService
 from core.signals import register_service_signal
 from invoice.models import Bill, BillItem, PaymentInvoice, DetailPaymentInvoice
+from location.models import Location
 from invoice.services import PaymentInvoiceService
 from payment_cycle.models import PaymentCycle
 from payroll.apps import PayrollConfig
@@ -28,6 +29,7 @@ from payroll.models import (
     BenefitConsumption,
     BenefitAttachment,
     BenefitConsumptionStatus,
+    ConsolidatedPayrollMember,
     PayrollStatus,
     CsvReconciliationUpload,
     ReconciliationUploadRow
@@ -194,6 +196,56 @@ class PayrollService(BaseService):
             'business_event': PayrollConfig.payroll_accept_event,
             'data': _get_std_task_data_payload(data)
         })
+
+    @transaction.atomic
+    def create_consolidated_payroll(self, district_id, payment_plan_id, source_payroll_ids):
+        """Create a parent payroll without cloning the source benefits."""
+        if not source_payroll_ids:
+            raise ValidationError("Select at least one approved payroll to consolidate.")
+        sources = list(Payroll.objects.select_for_update().filter(
+            id__in=source_payroll_ids,
+            payment_plan_id=payment_plan_id,
+            status=PayrollStatus.APPROVE_FOR_PAYMENT,
+            payroll_type=Payroll.PayrollType.STANDARD,
+            is_deleted=False,
+        ).select_related("payment_plan", "payment_cycle", "payment_point"))
+        if len(sources) != len(set(source_payroll_ids)):
+            raise ValidationError("Every selected payroll must still be approved and belong to the selected phase.")
+        if ConsolidatedPayrollMember.objects.filter(
+                source_payroll_id__in=[source.id for source in sources], is_deleted=False).exists():
+            raise ValidationError("A selected payroll already belongs to a consolidated payroll.")
+        first = sources[0]
+        if any((source.payment_method, source.payment_point_id, source.payment_cycle_id) !=
+               (first.payment_method, first.payment_point_id, first.payment_cycle_id) for source in sources):
+            raise ValidationError("Selected payrolls must use the same payment method, point, and cycle.")
+        district = Location.objects.get(id=district_id, is_deleted=False)
+        phase = first.payment_plan.name or first.payment_plan.code
+        name_base = f"{district.name}-{phase}-Consolidated Payroll"
+        sequence = Payroll.objects.filter(name__startswith=name_base, is_deleted=False).count() + 1
+        payroll = Payroll(
+            name=f"{name_base}-{sequence:03d}", payment_plan=first.payment_plan,
+            payment_cycle=first.payment_cycle, payment_point=first.payment_point,
+            payment_method=first.payment_method, status=PayrollStatus.PENDING_APPROVAL,
+            payroll_type=Payroll.PayrollType.CONSOLIDATED, district=district,
+            json_ext={"consolidated_source_payroll_ids": [str(source.id) for source in sources]},
+        )
+        payroll.save(username=self.user.login_name)
+        for source in sources:
+            benefits = PayrollBenefitConsumption.objects.filter(payroll=source, is_deleted=False)
+            benefit_ids = list(benefits.values_list("benefit_id", flat=True))
+            total = BenefitConsumption.objects.filter(id__in=benefit_ids).aggregate(total=Sum("amount"))["total"] or 0
+            ConsolidatedPayrollMember(
+                consolidated_payroll=payroll, source_payroll=source,
+                beneficiaries_count=len(benefit_ids), total_amount=total,
+            ).save(username=self.user.login_name)
+            for benefit_id in benefit_ids:
+                PayrollBenefitConsumption(payroll=payroll, benefit_id=benefit_id).save(username=self.user.login_name)
+        self.create_accept_payroll_task(payroll.id, {
+            "id": payroll.id, "district": district.name, "phase": phase,
+            "included_payrolls": [{"id": str(source.id), "name": source.name} for source in sources],
+            "consolidated": True,
+        })
+        return payroll
 
     @register_service_signal('payroll_service.close_payroll')
     def close_payroll(self, obj_data):

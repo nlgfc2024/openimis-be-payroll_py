@@ -13,7 +13,7 @@ from location.services import get_ancestor_location_filter
 from payroll.apps import PayrollConfig
 from payroll.gql_mutations import CreatePaymentPointMutation, UpdatePaymentPointMutation, DeletePaymentPointMutation, \
     CreatePayrollMutation, DeletePayrollMutation, ClosePayrollMutation, \
-    RejectPayrollMutation, MakePaymentForPayrollMutation, DeleteBenefitConsumptionMutation
+    RejectPayrollMutation, MakePaymentForPayrollMutation, DeleteBenefitConsumptionMutation, CreateConsolidatedPayrollMutation
 from payroll.gql_queries import BenefitConsumptionGQLType, PaymentPointGQLType, benefit_consumption_queryset, \
     PayrollGQLType, PaymentMethodGQLType, \
     PaymentMethodListGQLType, BenefitAttachmentListGQLType, \
@@ -118,6 +118,12 @@ class Query(graphene.ObjectType):
         paymentCycleUuid=graphene.String(),
     )
 
+    consolidation_candidates = graphene.List(
+        PayrollGQLType,
+        district_id=graphene.UUID(required=True),
+        payment_plan_id=graphene.UUID(required=True),
+    )
+
     def resolve_bill_by_payroll(self, info, **kwargs):
         Query._check_permissions(info.context.user, PayrollConfig.gql_payroll_search_perms)
         filters = [*append_validity_filter(**kwargs), Q(payrollbill__payroll_id=kwargs.get("payroll_uuid"),
@@ -209,6 +215,20 @@ class Query(graphene.ObjectType):
 
         query = Payroll.objects.filter(*filters)
         return gql_optimizer.query(query, info)
+
+    def resolve_consolidation_candidates(self, info, district_id, payment_plan_id):
+        Query._check_permissions(info.context.user, PayrollConfig.gql_payroll_search_perms)
+        district_id = str(district_id)
+        candidates = Payroll.objects.filter(
+            payment_plan_id=payment_plan_id,
+            status='APPROVE_FOR_PAYMENT',
+            payroll_type='STANDARD',
+            is_deleted=False,
+        ).exclude(consolidated_memberships__is_deleted=False).distinct()
+        return [payroll for payroll in candidates if district_id in {
+            str(location_id) for location_id in (payroll.json_ext or {}).get(
+                'filter_criteria', {}).get('location_ids', [])
+        }]
 
     def resolve_payroll_benefit_consumption(self, info, **kwargs):
         Query._check_permissions(info.context.user, PayrollConfig.gql_payroll_search_perms)
@@ -346,6 +366,7 @@ class Mutation(graphene.ObjectType):
     delete_payment_point = DeletePaymentPointMutation.Field()
 
     create_payroll = CreatePayrollMutation.Field()
+    create_consolidated_payroll = CreateConsolidatedPayrollMutation.Field()
     delete_payroll = DeletePayrollMutation.Field()
     close_payroll = ClosePayrollMutation.Field()
     reject_payroll = RejectPayrollMutation.Field()
