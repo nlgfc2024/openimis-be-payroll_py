@@ -186,9 +186,13 @@ class CreateConsolidatedPayrollMutation(BaseMutation):
 
     @classmethod
     def _mutate(cls, user, **data):
-        data.pop('client_mutation_id', None)
+        client_mutation_id = data.pop('client_mutation_id', None)
         data.pop('client_mutation_label', None)
-        PayrollService(user).create_consolidated_payroll(**data)
+        payroll = PayrollService(user).create_consolidated_payroll(**data)
+        if client_mutation_id:
+            PayrollMutation.object_mutated(
+                user, client_mutation_id=client_mutation_id, payroll=payroll,
+            )
 
     class Input(CreateConsolidatedPayrollInput):
         pass
