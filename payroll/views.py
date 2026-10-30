@@ -67,8 +67,10 @@ class CSVReconciliationAPIView(views.APIView):
             if get_blank_bool:
                 service = CsvReconciliationService(request.user)
                 in_memory_file = service.download_reconciliation(payroll_id)
-                response = Response(headers={'Content-Disposition': 'attachment; filename="reconciliation.csv"'},
-                                    content_type='text/csv')
+                response = Response(
+                    headers={'Content-Disposition': 'attachment; filename="reconciliation.xlsx"'},
+                    content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                )
                 response.content = in_memory_file.getvalue()
                 return response
             else:
@@ -88,8 +90,8 @@ class CSVReconciliationAPIView(views.APIView):
                         upload, file_handler.get_file_content(),
                     )
                     response = Response(
-                        headers={"Content-Disposition": f'attachment; filename="{file_name.rsplit(".", 1)[0]}_review.csv"'},
-                        content_type="text/csv",
+                        headers={"Content-Disposition": f'attachment; filename="{file_name.rsplit(".", 1)[0]}_review.xlsx"'},
+                        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     )
                     response.content = review_file.getvalue()
                     return response
@@ -111,7 +113,7 @@ class CSVReconciliationAPIView(views.APIView):
         try:
             file = request.FILES.get("file")
             if not file:
-                raise ValueError("No CSV file was provided")
+                raise ValueError("No Excel reconciliation file was provided")
             upload.save(username=request.user.login_name)
             target_file_path = PayrollConfig.get_payroll_payment_file_path(
                 payroll_id, f"{upload.id}_{file.name}",

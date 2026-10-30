@@ -3,6 +3,9 @@ import logging
 from decimal import Decimal, InvalidOperation
 import pandas as pd
 from io import BytesIO
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Protection
+from openpyxl.worksheet.datavalidation import DataValidation
 
 from django.apps import apps
 from django.contrib.contenttypes.models import ContentType
@@ -586,9 +589,73 @@ class CsvReconciliationService:
             export_columns.append(key)
         df = df.reindex(columns=export_columns)
 
-        in_memory_file = BytesIO()
-        df.to_csv(in_memory_file, index=False)
-        return in_memory_file
+        return self._protected_reconciliation_workbook(df)
+
+    @staticmethod
+    def _protected_reconciliation_workbook(df):
+        """Create the PSP reconciliation template with only payment inputs editable."""
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.title = "Reconciliation"
+        headers = list(df.columns)
+        header_fill = PatternFill("solid", fgColor="D9EAD3")
+        editable_columns = {
+            PayrollConfig.csv_reconciliation_paid_extra_field,
+            PayrollConfig.csv_reconciliation_field_mapping["receipt"],
+        }
+
+        for column_number, header in enumerate(headers, start=1):
+            cell = worksheet.cell(row=1, column=column_number, value=header)
+            cell.font = Font(bold=True)
+            cell.fill = header_fill
+            cell.protection = Protection(locked=True)
+
+        for row_number, row in enumerate(df.fillna("").itertuples(index=False, name=None), start=2):
+            for column_number, value in enumerate(row, start=1):
+                header = headers[column_number - 1]
+                cell = worksheet.cell(row=row_number, column=column_number, value=value)
+                cell.protection = Protection(locked=header not in editable_columns)
+                if header in {"Form Number", "Phone Number", "National ID", "Code", "Receipt"}:
+                    cell.number_format = "@"
+
+        paid_column = headers.index(PayrollConfig.csv_reconciliation_paid_extra_field) + 1
+        paid_letter = worksheet.cell(row=1, column=paid_column).column_letter
+        paid_validation = DataValidation(
+            type="list",
+            formula1=(
+                f'"{PayrollConfig.csv_reconciliation_paid_yes},'
+                f'{PayrollConfig.csv_reconciliation_paid_no}"'
+            ),
+            allow_blank=False,
+            showDropDown=False,
+            showErrorMessage=True,
+            errorStyle="stop",
+            errorTitle="Invalid payment status",
+            error="Select Yes or No.",
+        )
+        worksheet.add_data_validation(paid_validation)
+        paid_validation.add(f"{paid_letter}2:{paid_letter}{max(worksheet.max_row, 2)}")
+
+        worksheet.freeze_panes = "A2"
+        worksheet.auto_filter.ref = worksheet.dimensions
+        for column_cells in worksheet.columns:
+            column_letter = column_cells[0].column_letter
+            width = max(len(str(cell.value or "")) for cell in column_cells)
+            worksheet.column_dimensions[column_letter].width = min(max(width + 2, 12), 40)
+        worksheet.protection.sheet = True
+        worksheet.protection.enable()
+
+        output = BytesIO()
+        workbook.save(output)
+        output.seek(0)
+        return output
+
+    @staticmethod
+    def _read_reconciliation_workbook(contents):
+        try:
+            return pd.read_excel(BytesIO(contents), dtype=str, keep_default_na=False, engine="openpyxl")
+        except Exception as exc:
+            raise ValueError(_("Unable to read Excel reconciliation file: %(error)s") % {"error": str(exc)})
 
     @staticmethod
     def _get_payroll_micro_catchment(payroll):
@@ -664,10 +731,7 @@ class CsvReconciliationService:
             upload.save(username=self.user.login_name)
             return BytesIO(contents), upload.error, self._upload_summary(upload)
 
-        try:
-            df = pd.read_csv(BytesIO(contents), dtype=str, keep_default_na=False)
-        except Exception as exc:
-            raise ValueError(_("Unable to read CSV file: %(error)s") % {"error": str(exc)})
+        df = self._read_reconciliation_workbook(contents)
 
         self._validate_dataframe(df)
         df.rename(
@@ -890,10 +954,10 @@ class CsvReconciliationService:
             payroll.save(username=self.user.login_name)
 
     def download_upload_review(self, upload, contents):
-        """Return the original CSV annotated with its saved validation result."""
+        """Return the uploaded Excel workbook annotated with saved validation results."""
         try:
-            df = pd.read_csv(BytesIO(contents), dtype=str, keep_default_na=False)
-        except Exception:
+            df = self._read_reconciliation_workbook(contents)
+        except ValueError:
             return BytesIO(contents)
 
         row_results = {
@@ -926,10 +990,7 @@ class CsvReconciliationService:
         df["Paid Record"] = paid_records
         df["Unpaid Record"] = unpaid_records
         df["Unmatched Record"] = unmatched_records
-        review_file = BytesIO()
-        df.to_csv(review_file, index=False)
-        review_file.seek(0)
-        return review_file
+        return self._protected_reconciliation_workbook(df)
 
     def _validate_upload_row(self, payroll, row, code, national_id, duplicate_codes, duplicate_national_ids, benefits_by_code=None, contexts_by_benefit_id=None):
         reasons = []
@@ -957,11 +1018,16 @@ class CsvReconciliationService:
         context = (contexts_by_benefit_id or {}).get(benefit.id)
         if context is None:
             context = {"micro_catchment": self._get_micro_catchment(benefit)}
+        individual_extra = individual.json_ext or {}
         checks = (
             ("payroll_name_mismatch", "payrollbenefitconsumption__payroll__name", payroll.name, self._matches_text),
             ("payroll_status_mismatch", "payrollbenefitconsumption__payroll__status", payroll.status, self._matches_text),
+            ("district_name_mismatch", "individual__location__parent__parent__parent__name", self._district_name(individual.location), self._matches_text),
+            ("form_number_mismatch", "individual__json_ext__form_number", individual_extra.get("form_number"), self._matches_text),
+            ("phone_number_mismatch", "individual__json_ext__household_mobile_number", individual_extra.get("household_mobile_number"), self._matches_text),
             ("first_name_mismatch", "individual__first_name", individual.first_name, self._matches_text),
             ("last_name_mismatch", "individual__last_name", individual.last_name, self._matches_text),
+            ("national_id_mismatch", "individual__json_ext__national_id", individual_extra.get("national_id"), self._matches_text),
             ("date_of_birth_mismatch", "individual__dob", individual.dob, self._matches_date),
             ("status_mismatch", "status", benefit.status, self._matches_text),
             ("amount_mismatch", "amount", benefit.amount, self._amounts_match),
@@ -973,9 +1039,20 @@ class CsvReconciliationService:
             if not comparator(row.get(column), expected_value):
                 reasons.append(mismatch_reason)
 
-        if self.micro_catchment_column in row.index and not self._matches_text(
+        if not self._matches_text(
                 row.get(self.micro_catchment_column), context.get("micro_catchment")):
             reasons.append("micro_catchment_mismatch")
+
+        # Every extra column exported from benefit metadata is protected too.
+        # Paid and Receipt are deliberately excluded because they are the two
+        # operator inputs in the workbook.
+        mapped_headers = set(PayrollConfig.csv_reconciliation_field_mapping.values()) | {
+            self.micro_catchment_column,
+            PayrollConfig.csv_reconciliation_paid_extra_field,
+        }
+        for key, expected_value in (benefit.json_ext or {}).get("extra_info", {}).items():
+            if key not in mapped_headers and not self._matches_text(row.get(key), expected_value):
+                reasons.append(f"extra_info_mismatch:{key}")
 
         paid = self._clean_value(row.get(PayrollConfig.csv_reconciliation_paid_extra_field))
         if paid not in [PayrollConfig.csv_reconciliation_paid_yes, PayrollConfig.csv_reconciliation_paid_no]:
@@ -983,6 +1060,12 @@ class CsvReconciliationService:
         if not self._clean_value(row.get(PayrollConfig.csv_reconciliation_receipt_column)):
             reasons.append("missing_payment_reference")
         return benefit, reasons
+
+    @staticmethod
+    def _district_name(location):
+        for _ in range(3):
+            location = location.parent if location else None
+        return location.name if location else None
 
 
     @staticmethod
@@ -1070,7 +1153,7 @@ class CsvReconciliationService:
         if df.empty:
             raise ValueError(_("Import file is empty"))
         if PayrollConfig.csv_reconciliation_errors_column in df.columns:
-            raise ValueError(_("Column errors in csv."))
+            raise ValueError(_("The reconciliation workbook contains an errors column."))
         required_columns = set(PayrollConfig.csv_reconciliation_field_mapping.values()) | {
             PayrollConfig.csv_reconciliation_paid_extra_field
         }

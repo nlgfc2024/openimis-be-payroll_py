@@ -24,6 +24,7 @@ setup(
         'graphene-django',
         'django-db-signals',
         'djangorestframework',
+        'openpyxl',
         'openimis-be-core',
         'openimis-be-location',
         'openimis-be-invoice',
