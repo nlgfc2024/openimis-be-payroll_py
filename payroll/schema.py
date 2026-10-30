@@ -267,6 +267,22 @@ class Query(graphene.ObjectType):
                 else:
                     continue
                 break
+            else:
+                # Older payrolls can have neither a project nor a district in
+                # their saved criteria. Their paid beneficiaries still provide
+                # the authoritative district for consolidation eligibility.
+                beneficiary_in_district = BenefitConsumption.objects.filter(
+                    payrollbenefitconsumption__payroll=payroll,
+                    payrollbenefitconsumption__is_deleted=False,
+                    is_deleted=False,
+                ).filter(
+                    Q(individual__location__uuid=district_id)
+                    | Q(individual__location__parent__uuid=district_id)
+                    | Q(individual__location__parent__parent__uuid=district_id)
+                    | Q(individual__location__parent__parent__parent__uuid=district_id)
+                ).exists()
+                if beneficiary_in_district:
+                    matches.append(payroll)
         return matches
 
     def resolve_consolidation_candidates(self, info, district_id, benefit_plan_id):
