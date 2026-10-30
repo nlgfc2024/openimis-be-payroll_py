@@ -198,13 +198,13 @@ class PayrollService(BaseService):
         })
 
     @transaction.atomic
-    def create_consolidated_payroll(self, district_id, payment_plan_id, source_payroll_ids):
+    def create_consolidated_payroll(self, district_id, benefit_plan_id, source_payroll_ids):
         """Create a parent payroll without cloning the source benefits."""
         if not source_payroll_ids:
             raise ValidationError("Select at least one approved payroll to consolidate.")
         sources = list(Payroll.objects.select_for_update().filter(
             id__in=source_payroll_ids,
-            payment_plan_id=payment_plan_id,
+            payment_plan__benefit_plan_id=benefit_plan_id,
             status=PayrollStatus.APPROVE_FOR_PAYMENT,
             payroll_type=Payroll.PayrollType.STANDARD,
             is_deleted=False,
@@ -218,8 +218,8 @@ class PayrollService(BaseService):
         if any((source.payment_method, source.payment_point_id, source.payment_cycle_id) !=
                (first.payment_method, first.payment_point_id, first.payment_cycle_id) for source in sources):
             raise ValidationError("Selected payrolls must use the same payment method, point, and cycle.")
-        district = Location.objects.get(id=district_id, is_deleted=False)
-        phase = first.payment_plan.name or first.payment_plan.code
+        district = Location.objects.get(uuid=district_id, is_deleted=False)
+        phase = first.payment_plan.benefit_plan.name or first.payment_plan.benefit_plan.code
         name_base = f"{district.name}-{phase}-Consolidated Payroll"
         sequence = Payroll.objects.filter(name__startswith=name_base, is_deleted=False).count() + 1
         payroll = Payroll(

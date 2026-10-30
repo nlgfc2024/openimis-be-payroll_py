@@ -121,7 +121,7 @@ class Query(graphene.ObjectType):
     consolidation_candidates = graphene.List(
         PayrollGQLType,
         district_id=graphene.UUID(required=True),
-        payment_plan_id=graphene.UUID(required=True),
+        benefit_plan_id=graphene.UUID(required=True),
     )
 
     def resolve_bill_by_payroll(self, info, **kwargs):
@@ -216,11 +216,11 @@ class Query(graphene.ObjectType):
         query = Payroll.objects.filter(*filters)
         return gql_optimizer.query(query, info)
 
-    def resolve_consolidation_candidates(self, info, district_id, payment_plan_id):
+    def resolve_consolidation_candidates(self, info, district_id, benefit_plan_id):
         Query._check_permissions(info.context.user, PayrollConfig.gql_payroll_search_perms)
         district_id = str(district_id)
         candidates = Payroll.objects.filter(
-            payment_plan_id=payment_plan_id,
+            payment_plan__benefit_plan_id=benefit_plan_id,
             status='APPROVE_FOR_PAYMENT',
             payroll_type='STANDARD',
             is_deleted=False,

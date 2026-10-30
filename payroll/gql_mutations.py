@@ -56,7 +56,7 @@ class CreatePayrollInput(OpenIMISMutation.Input):
 
 class CreateConsolidatedPayrollInput(OpenIMISMutation.Input):
     district_id = graphene.UUID(required=True)
-    payment_plan_id = graphene.UUID(required=True)
+    benefit_plan_id = graphene.UUID(required=True)
     source_payroll_ids = graphene.List(graphene.UUID, required=True)
 
 
