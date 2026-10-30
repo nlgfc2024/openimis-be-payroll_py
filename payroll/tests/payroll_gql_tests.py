@@ -7,7 +7,7 @@ from graphene.test import Client
 from django.contrib.contenttypes.models import ContentType
 
 from contribution_plan.models import PaymentPlan
-from individual.models import Individual
+from individual.models import Group, GroupIndividual, Individual
 from individual.tests.data import service_add_individual_payload
 from invoice.models import Bill
 from payment_cycle.models import PaymentCycle
@@ -503,6 +503,13 @@ class PayrollGQLTestCase(openIMISGraphQLTestCase):
         individual = Individual(**object_data)
         individual.json_ext = {"able_bodied": able_bodied}
         individual.save(username=cls.user.username)
+        group = Group(code=str(uuid.uuid4()))
+        group.save(username=cls.user.username)
+        GroupIndividual(
+            group=group,
+            individual=individual,
+            recipient_type=GroupIndividual.RecipientType.PRIMARY,
+        ).save(username=cls.user.username)
         return individual
 
     @classmethod

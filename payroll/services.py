@@ -17,7 +17,7 @@ from core.custom_filters import CustomFilterWizardStorage
 from core.models import InteractiveUser
 from core.services import BaseService
 from core.signals import register_service_signal
-from invoice.models import Bill, PaymentInvoice, DetailPaymentInvoice
+from invoice.models import Bill, BillItem, PaymentInvoice, DetailPaymentInvoice
 from invoice.services import PaymentInvoiceService
 from payment_cycle.models import PaymentCycle
 from payroll.apps import PayrollConfig
@@ -28,6 +28,7 @@ from payroll.models import (
     BenefitConsumption,
     BenefitAttachment,
     BenefitConsumptionStatus,
+    PayrollStatus,
     CsvReconciliationUpload,
     ReconciliationUploadRow
 )
@@ -89,15 +90,57 @@ class PayrollService(BaseService):
                     obj_data, payment_plan, payment_cycle, project_names
                 )
                 if not bool(from_failed_invoices_payroll_id):
-                    beneficiaries_queryset = self._select_beneficiary_based_on_criteria(obj_data, payment_plan)
-                    self._generate_benefits(
-                        payment_plan,
-                        beneficiaries_queryset,
-                        date_valid_from,
-                        date_valid_to,
-                        payroll,
-                        payment_cycle
-                    )
+                    selected_projects = (obj_data.get("json_ext") or {}).get("filter_criteria", {}).get("project_ids", [])
+                    if self._is_group_payment_plan(payment_plan):
+                        enrollments_queryset = self._select_group_enrollments_based_on_criteria(
+                            obj_data, payment_plan
+                        )
+                        if selected_projects and not enrollments_queryset.exists():
+                            raise ValidationError(
+                                "No active household beneficiaries with a primary recipient are assigned "
+                                "to the selected completed project. Ensure the household assignments and "
+                                "their primary recipients were saved before creating the payroll."
+                            )
+                        # The timesheet GROUP strategy creates one benefit per group
+                        # enrollment. Passing the explicit enrollment queryset is
+                        # essential: it limits the run to the chosen project instead
+                        # of allowing the strategy to calculate every completed
+                        # project in the benefit plan.
+                        self._generate_benefits(
+                            payment_plan,
+                            date_valid_from,
+                            date_valid_to,
+                            payroll,
+                            payment_cycle,
+                            enrollments_queryset=enrollments_queryset,
+                        )
+                        self._assign_group_benefits_to_primary_recipients(
+                            payroll, enrollments_queryset
+                        )
+                    else:
+                        beneficiaries_queryset = self._select_beneficiary_based_on_criteria(
+                            obj_data, payment_plan
+                        )
+                        if selected_projects and not beneficiaries_queryset.exists():
+                            raise ValidationError(
+                                "No active primary beneficiaries are assigned to the selected project. "
+                                "Ensure its beneficiary assignments were saved and the assigned people are active "
+                                "programme beneficiaries before creating the payroll."
+                            )
+                        self._generate_benefits(
+                            payment_plan,
+                            date_valid_from,
+                            date_valid_to,
+                            payroll,
+                            payment_cycle,
+                            beneficiaries_queryset=beneficiaries_queryset,
+                        )
+                        # Some calculation rules generate a benefit for every eligible
+                        # beneficiary in the payment plan and do not apply the queryset
+                        # passed above.  The payroll must still honour its saved project
+                        # and location criteria, so retain only the generated benefits
+                        # belonging to the selected beneficiaries.
+                        self._enforce_beneficiary_scope(payroll, beneficiaries_queryset)
                 else:
                     self._move_benefit_consumptions(payroll, from_failed_invoices_payroll_id)
                 self.create_accept_payroll_task(payroll.id, obj_data)
@@ -231,6 +274,48 @@ class PayrollService(BaseService):
         date_valid_to = obj_data.get('date_valid_to', None)
         return date_valid_from, date_valid_to
 
+    @staticmethod
+    def _is_group_payment_plan(payment_plan):
+        return payment_plan.benefit_plan.type == "GROUP"
+
+    def _select_group_enrollments_based_on_criteria(self, obj_data, payment_plan):
+        """Return the eligible household enrollments for a GROUP payroll.
+
+        A household is paid once, through its primary recipient, so the unit of
+        selection must be ``GroupBeneficiaryProjectEnrollment`` rather than the
+        individual ``Beneficiary`` model used by individual benefit plans.
+        """
+        enrollment_model = apps.get_model(
+            "project_social_protection", "GroupBeneficiaryProjectEnrollment"
+        )
+        json_ext = obj_data.get("json_ext", {})
+        filter_criteria = json_ext.get("filter_criteria", {})
+        enrollments_queryset = enrollment_model.objects.filter(
+            group_beneficiary__benefit_plan_id=payment_plan.benefit_plan.id,
+            group_beneficiary__status=BeneficiaryStatus.ACTIVE,
+            group_beneficiary__is_deleted=False,
+            group_beneficiary__group__groupindividuals__recipient_type="PRIMARY",
+            group_beneficiary__group__groupindividuals__is_deleted=False,
+            project__status="COMPLETED",
+            project__is_deleted=False,
+            is_deleted=False,
+        )
+
+        project_ids = filter_criteria.get("project_ids", [])
+        if project_ids:
+            enrollments_queryset = enrollments_queryset.filter(project__id__in=project_ids)
+
+        location_ids = filter_criteria.get("location_ids", [])
+        if location_ids:
+            enrollments_queryset = enrollments_queryset.filter(
+                Q(group_beneficiary__group__location__uuid__in=location_ids)
+                | Q(group_beneficiary__group__location__parent__uuid__in=location_ids)
+                | Q(group_beneficiary__group__location__parent__parent__uuid__in=location_ids)
+                | Q(group_beneficiary__group__location__parent__parent__parent__uuid__in=location_ids)
+            )
+
+        return enrollments_queryset.distinct()
+
     def _select_beneficiary_based_on_criteria(self, obj_data, payment_plan):
         json_ext = obj_data.get("json_ext", {})
 
@@ -251,12 +336,13 @@ class PayrollService(BaseService):
 
         project_ids = filter_criteria.get("project_ids", [])
         if project_ids:
-            # Project-scoped payrolls use the intersection: the household's
-            # primary recipient must also be explicitly enrolled in one of
-            # the projects selected for the payroll.
+            # A project payroll must use the beneficiaries explicitly assigned
+            # to that project.  A micro-catchment describes where an activity
+            # takes place; it is not a payment entitlement and must never pull
+            # every eligible beneficiary from the whole catchment.
             beneficiaries_queryset = beneficiaries_queryset.filter(
                 project_enrollments__project__id__in=project_ids,
-                project_enrollments__is_deleted=False
+                project_enrollments__is_deleted=False,
             )
 
         location_ids = filter_criteria.get("location_ids", [])
@@ -282,16 +368,111 @@ class PayrollService(BaseService):
 
         return beneficiaries_queryset.distinct()
 
-    def _generate_benefits(self, payment_plan, beneficiaries_queryset, date_from, date_to, payroll, payment_cycle):
+    def _generate_benefits(
+        self,
+        payment_plan,
+        date_from,
+        date_to,
+        payroll,
+        payment_cycle,
+        beneficiaries_queryset=None,
+        enrollments_queryset=None,
+    ):
         calculation = get_calculation_object(payment_plan.calculation)
+        calculation_kwargs = {
+            "user_id": self.user.id,
+            "start_date": date_from,
+            "end_date": date_to,
+            "payroll": payroll,
+            "payment_cycle": payment_cycle,
+        }
+        if beneficiaries_queryset is not None:
+            calculation_kwargs["beneficiaries_queryset"] = beneficiaries_queryset
+        if enrollments_queryset is not None:
+            calculation_kwargs["enrollments_queryset"] = enrollments_queryset
         calculation.calculate_if_active_for_object(
             payment_plan,
-            user_id=self.user.id,
-            start_date=date_from, end_date=date_to,
-            beneficiaries_queryset=beneficiaries_queryset,
-            payroll=payroll,
-            payment_cycle=payment_cycle
+            **calculation_kwargs,
         )
+
+    def _assign_group_benefits_to_primary_recipients(self, payroll, enrollments_queryset):
+        """Make the primary recipient the payee for every household benefit.
+
+        Timesheet bills deliberately remain attributed to the household because
+        the work and entitlement belong to that household.  The benefit record,
+        however, is the payment instruction consumed by the PSP and must name
+        the household's selected primary recipient (which can differ from the
+        household head).
+        """
+        group_individual_model = apps.get_model("individual", "GroupIndividual")
+        group_ids_by_beneficiary = dict(
+            enrollments_queryset.values_list("group_beneficiary_id", "group_beneficiary__group_id")
+        )
+        primary_recipient_by_group = dict(
+            group_individual_model.objects.filter(
+                group_id__in=group_ids_by_beneficiary.values(),
+                recipient_type="PRIMARY",
+                is_deleted=False,
+            ).values_list("group_id", "individual_id")
+        )
+        primary_recipient_by_beneficiary = {
+            str(group_beneficiary_id): primary_recipient_by_group.get(group_id)
+            for group_beneficiary_id, group_id in group_ids_by_beneficiary.items()
+        }
+        if any(recipient_id is None for recipient_id in primary_recipient_by_beneficiary.values()):
+            raise ValidationError(
+                "Every household selected for payroll must have a primary recipient."
+            )
+
+        attachments = BenefitAttachment.objects.filter(
+            benefit__payrollbenefitconsumption__payroll=payroll,
+            benefit__payrollbenefitconsumption__is_deleted=False,
+            is_deleted=False,
+        ).select_related("benefit", "bill")
+        benefits_updated = set()
+        for attachment in attachments:
+            recipient_id = primary_recipient_by_beneficiary.get(str(attachment.bill.subject_id))
+            if recipient_id is None:
+                # Benefits unrelated to this group calculation must never be
+                # reassigned as a side effect of creating the payroll.
+                continue
+            attachment.benefit.individual_id = recipient_id
+            attachment.benefit.save(user=self.user)
+            benefits_updated.add(attachment.benefit_id)
+
+        expected_benefit_ids = set(
+            PayrollBenefitConsumption.objects.filter(
+                payroll=payroll,
+                is_deleted=False,
+            ).values_list("benefit_id", flat=True)
+        )
+        if expected_benefit_ids != benefits_updated:
+            raise ValidationError(
+                "Unable to assign every household benefit to its primary recipient."
+            )
+
+    @staticmethod
+    def _enforce_beneficiary_scope(payroll, beneficiaries_queryset):
+        allowed_individual_ids = beneficiaries_queryset.values("individual_id")
+        out_of_scope_links = PayrollBenefitConsumption.objects.filter(
+            payroll=payroll,
+            is_deleted=False,
+        ).exclude(
+            benefit__individual_id__in=allowed_individual_ids,
+        )
+        benefit_data = list(out_of_scope_links.values_list(
+            "benefit_id", "benefit__benefitattachment__bill_id",
+        ))
+        benefit_ids = {benefit_id for benefit_id, _ in benefit_data}
+        bill_ids = {bill_id for _, bill_id in benefit_data if bill_id}
+        if not benefit_ids:
+            return
+
+        BenefitAttachment.objects.filter(benefit_id__in=benefit_ids).delete()
+        BillItem.objects.filter(bill_id__in=bill_ids).delete()
+        Bill.objects.filter(id__in=bill_ids).delete()
+        out_of_scope_links.delete()
+        BenefitConsumption.objects.filter(id__in=benefit_ids, is_deleted=False).delete()
 
     @transaction.atomic
     def _move_benefit_consumptions(self, payroll, from_payroll_id):
@@ -373,9 +554,15 @@ class CsvReconciliationService:
         extra_info_keys = set()
         extra_info_dicts = []
         mapped_headers = set(field_mapping.values()) | {self.micro_catchment_column}
+        project_micro_catchment = self._get_payroll_micro_catchment(payroll)
         for record in records:
             benefit = benefits_by_code[record["code"]]
-            record["micro_catchment"] = self._get_micro_catchment(benefit)
+            # The payroll's project is the work location. A recipient may live
+            # in a different catchment, but that must not make a one-project
+            # payroll look as though it contains several project catchments.
+            record["micro_catchment"] = (
+                project_micro_catchment or self._get_micro_catchment(benefit)
+            )
             extra_info = benefit.json_ext.get("extra_info", {}) if benefit.json_ext else {}
             extra_info_keys.update(key for key in extra_info if key not in mapped_headers)
             extra_info_dicts.append(extra_info)
@@ -402,6 +589,22 @@ class CsvReconciliationService:
         in_memory_file = BytesIO()
         df.to_csv(in_memory_file, index=False)
         return in_memory_file
+
+    @staticmethod
+    def _get_payroll_micro_catchment(payroll):
+        """Return the selected project's catchment for a single-project payroll."""
+        project_ids = {
+            str(project_id)
+            for project_id in (payroll.json_ext or {}).get("filter_criteria", {}).get("project_ids", [])
+            if project_id
+        }
+        if len(project_ids) != 1:
+            return None
+        project_model = apps.get_model("project_social_protection", "Project")
+        project = project_model.objects.filter(
+            id=next(iter(project_ids)), is_deleted=False,
+        ).select_related("micro_catchment").first()
+        return project.micro_catchment.name if project and project.micro_catchment else None
 
     def _get_micro_catchment(self, benefit):
         location = benefit.individual.location
@@ -573,15 +776,19 @@ class CsvReconciliationService:
             "status": Task.Status.RECEIVED,
             "executor_action_event": TasksManagementConfig.default_executor_event,
             "business_event": PayrollConfig.payroll_reconciliation_event,
-            "data": _get_std_task_data_payload({"id": payroll.id, "upload_id": upload.id}),
+            "data": _get_std_task_data_payload({
+                "id": payroll.id,
+                "upload_id": upload.id,
+                "payroll_name": payroll.name,
+                "included_payrolls": [{"id": str(payroll.id), "name": payroll.name}],
+                "summary": self._upload_summary(upload),
+            }),
         })
         if not task.get("success", False):
             raise ValueError(task.get("error") or "Unable to create reconciliation review task")
         return BytesIO(contents), errors or None, self._upload_summary(upload)
 
     def _load_upload_context(self, payroll, codes):
-        from location.models import Location, MicroCatchmentGVH
-
         benefits = list(
             BenefitConsumption.objects.filter(
                 code__in=list(codes.dropna().unique()),
@@ -593,6 +800,17 @@ class CsvReconciliationService:
             ).select_related("individual", "individual__location").distinct()
         )
         benefits_by_code = {benefit.code: benefit for benefit in benefits}
+        project_micro_catchment = self._get_payroll_micro_catchment(payroll)
+        if project_micro_catchment:
+            return benefits_by_code, {
+                benefit.id: {"micro_catchment": project_micro_catchment}
+                for benefit in benefits
+            }
+
+        # A historical multi-project payroll has no single project catchment.
+        # Preserve its legacy recipient-location behavior rather than inventing
+        # a catchment that cannot be determined from the payroll criteria.
+        from location.models import Location, MicroCatchmentGVH
         locations = {
             benefit.individual.location_id: benefit.individual.location
             for benefit in benefits if benefit.individual.location_id
@@ -656,6 +874,20 @@ class CsvReconciliationService:
                 self._reconcile_bc(pd.Series(row.submitted_data), benefit)
         upload.status = CsvReconciliationUpload.Status.PARTIAL_SUCCESS if upload.unmatched_records else CsvReconciliationUpload.Status.SUCCESS
         upload.save(username=self.user.login_name)
+
+        # A payroll is fully reconciled only when this approved upload has no
+        # unmatched rows and every linked benefit has reached RECONCILED.
+        # In particular, an all-unpaid or partial upload must leave the payroll
+        # available for a later reconciliation upload.
+        payroll = upload.payroll
+        has_unreconciled_benefits = PayrollBenefitConsumption.objects.filter(
+            payroll=payroll,
+            is_deleted=False,
+        ).exclude(benefit__status=BenefitConsumptionStatus.RECONCILED).exists()
+        if paid_rows and not upload.unmatched_records and not has_unreconciled_benefits \
+                and payroll.status != PayrollStatus.RECONCILED:
+            payroll.status = PayrollStatus.RECONCILED
+            payroll.save(username=self.user.login_name)
 
     def download_upload_review(self, upload, contents):
         """Return the original CSV annotated with its saved validation result."""

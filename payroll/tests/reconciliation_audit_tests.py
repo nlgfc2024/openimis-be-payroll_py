@@ -1,10 +1,17 @@
 from types import SimpleNamespace
 
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, TestCase
 
 from payroll.apps import PayrollConfig
 from payroll import signals
+from payroll.models import (
+    CsvReconciliationUpload,
+    Payroll,
+    PayrollStatus,
+    ReconciliationUploadRow,
+)
 from payroll.services import CsvReconciliationService
+from core.test_helpers import LogInHelper
 
 
 class ReconciliationAuditPolicyTests(SimpleTestCase):
@@ -68,3 +75,35 @@ class ReconciliationAuditPolicyTests(SimpleTestCase):
         # The reconciliation completion signal uses this service to change a
         # checker task to FAILED when applying its upload raises an error.
         self.assertIsNotNone(signals.TaskService)
+
+
+class ReconciliationPayrollStatusTests(TestCase):
+    def setUp(self):
+        self.user = LogInHelper().get_or_create_user_api(username='recon-status-user')
+
+    def test_approved_upload_with_only_unpaid_rows_does_not_reconcile_payroll(self):
+        payroll = Payroll(name='Reconciliation status test', status=PayrollStatus.APPROVE_FOR_PAYMENT)
+        payroll.save(username=self.user.login_name)
+        upload = CsvReconciliationUpload(
+            payroll=payroll,
+            status=CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION,
+            total_records=1,
+            matched_records=1,
+            unpaid_records=1,
+        )
+        upload.save(username=self.user.login_name)
+        row = ReconciliationUploadRow(
+            upload=upload,
+            row_number=2,
+            code='unpaid-row',
+            submitted_data={'Paid': 'No'},
+            status=ReconciliationUploadRow.Status.VALID,
+        )
+        row.save(username=self.user.login_name)
+
+        CsvReconciliationService(self.user).apply_upload(upload)
+
+        payroll.refresh_from_db()
+        upload.refresh_from_db()
+        self.assertEqual(upload.status, CsvReconciliationUpload.Status.SUCCESS)
+        self.assertEqual(payroll.status, PayrollStatus.APPROVE_FOR_PAYMENT)
