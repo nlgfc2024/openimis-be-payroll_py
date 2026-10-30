@@ -17,7 +17,7 @@ from core.custom_filters import CustomFilterWizardStorage
 from core.models import InteractiveUser
 from core.services import BaseService
 from core.signals import register_service_signal
-from invoice.models import Bill, PaymentInvoice, DetailPaymentInvoice
+from invoice.models import Bill, BillItem, PaymentInvoice, DetailPaymentInvoice
 from invoice.services import PaymentInvoiceService
 from payment_cycle.models import PaymentCycle
 from payroll.apps import PayrollConfig
@@ -454,12 +454,25 @@ class PayrollService(BaseService):
     @staticmethod
     def _enforce_beneficiary_scope(payroll, beneficiaries_queryset):
         allowed_individual_ids = beneficiaries_queryset.values("individual_id")
-        PayrollBenefitConsumption.objects.filter(
+        out_of_scope_links = PayrollBenefitConsumption.objects.filter(
             payroll=payroll,
             is_deleted=False,
         ).exclude(
             benefit__individual_id__in=allowed_individual_ids,
-        ).delete()
+        )
+        benefit_data = list(out_of_scope_links.values_list(
+            "benefit_id", "benefit__benefitattachment__bill_id",
+        ))
+        benefit_ids = {benefit_id for benefit_id, _ in benefit_data}
+        bill_ids = {bill_id for _, bill_id in benefit_data if bill_id}
+        if not benefit_ids:
+            return
+
+        BenefitAttachment.objects.filter(benefit_id__in=benefit_ids).delete()
+        BillItem.objects.filter(bill_id__in=bill_ids).delete()
+        Bill.objects.filter(id__in=bill_ids).delete()
+        out_of_scope_links.delete()
+        BenefitConsumption.objects.filter(id__in=benefit_ids, is_deleted=False).delete()
 
     @transaction.atomic
     def _move_benefit_consumptions(self, payroll, from_payroll_id):
@@ -862,11 +875,17 @@ class CsvReconciliationService:
         upload.status = CsvReconciliationUpload.Status.PARTIAL_SUCCESS if upload.unmatched_records else CsvReconciliationUpload.Status.SUCCESS
         upload.save(username=self.user.login_name)
 
-        # An upload reaches this method only after its reconciliation-review
-        # task has been approved.  Keep the parent payroll in sync with the
-        # reconciled benefit records so it is visible in Reconciled Payrolls.
+        # A payroll is fully reconciled only when this approved upload has no
+        # unmatched rows and every linked benefit has reached RECONCILED.
+        # In particular, an all-unpaid or partial upload must leave the payroll
+        # available for a later reconciliation upload.
         payroll = upload.payroll
-        if payroll.status != PayrollStatus.RECONCILED:
+        has_unreconciled_benefits = PayrollBenefitConsumption.objects.filter(
+            payroll=payroll,
+            is_deleted=False,
+        ).exclude(benefit__status=BenefitConsumptionStatus.RECONCILED).exists()
+        if paid_rows and not upload.unmatched_records and not has_unreconciled_benefits \
+                and payroll.status != PayrollStatus.RECONCILED:
             payroll.status = PayrollStatus.RECONCILED
             payroll.save(username=self.user.login_name)
 

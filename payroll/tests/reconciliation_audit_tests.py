@@ -79,9 +79,9 @@ class ReconciliationAuditPolicyTests(SimpleTestCase):
 
 class ReconciliationPayrollStatusTests(TestCase):
     def setUp(self):
-        self.user = LogInHelper().get_or_create_user_api(username='reconciliation-status-user')
+        self.user = LogInHelper().get_or_create_user_api(username='recon-status-user')
 
-    def test_approved_upload_marks_parent_payroll_reconciled(self):
+    def test_approved_upload_with_only_unpaid_rows_does_not_reconcile_payroll(self):
         payroll = Payroll(name='Reconciliation status test', status=PayrollStatus.APPROVE_FOR_PAYMENT)
         payroll.save(username=self.user.login_name)
         upload = CsvReconciliationUpload(
@@ -106,4 +106,4 @@ class ReconciliationPayrollStatusTests(TestCase):
         payroll.refresh_from_db()
         upload.refresh_from_db()
         self.assertEqual(upload.status, CsvReconciliationUpload.Status.SUCCESS)
-        self.assertEqual(payroll.status, PayrollStatus.RECONCILED)
+        self.assertEqual(payroll.status, PayrollStatus.APPROVE_FOR_PAYMENT)
