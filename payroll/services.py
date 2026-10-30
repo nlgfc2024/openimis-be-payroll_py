@@ -607,6 +607,14 @@ class CsvReconciliationService:
         extra_info_dicts = []
         mapped_headers = set(field_mapping.values()) | {self.micro_catchment_column}
         project_micro_catchment = self._get_payroll_micro_catchment(payroll)
+        source_payroll_by_benefit = {}
+        if payroll.payroll_type == Payroll.PayrollType.CONSOLIDATED:
+            member_ids = ConsolidatedPayrollMember.objects.filter(
+                consolidated_payroll=payroll, is_deleted=False,
+            ).values_list("source_payroll_id", flat=True)
+            source_payroll_by_benefit = dict(PayrollBenefitConsumption.objects.filter(
+                payroll_id__in=member_ids, is_deleted=False,
+            ).select_related("payroll").values_list("benefit_id", "payroll__name"))
         for record in records:
             benefit = benefits_by_code[record["code"]]
             # The payroll's project is the work location. A recipient may live
@@ -618,6 +626,8 @@ class CsvReconciliationService:
             extra_info = benefit.json_ext.get("extra_info", {}) if benefit.json_ext else {}
             extra_info_keys.update(key for key in extra_info if key not in mapped_headers)
             extra_info_dicts.append(extra_info)
+            if source_payroll_by_benefit:
+                record["Source Payroll"] = source_payroll_by_benefit.get(benefit.id)
 
         df = pd.DataFrame.from_records(records)
         df[PayrollConfig.csv_reconciliation_paid_extra_field] = df.apply(
@@ -633,6 +643,8 @@ class CsvReconciliationService:
         except ValueError:
             export_columns.append(self.micro_catchment_column)
         export_columns.append(PayrollConfig.csv_reconciliation_paid_extra_field)
+        if source_payroll_by_benefit:
+            export_columns.append("Source Payroll")
         for key in extra_info_keys:
             df[key] = [extra_info.get(key) for extra_info in extra_info_dicts]
             export_columns.append(key)
@@ -969,6 +981,14 @@ class CsvReconciliationService:
                 and payroll.status != PayrollStatus.RECONCILED:
             payroll.status = PayrollStatus.RECONCILED
             payroll.save(username=self.user.login_name)
+            if payroll.payroll_type == Payroll.PayrollType.CONSOLIDATED:
+                for member in ConsolidatedPayrollMember.objects.filter(
+                        consolidated_payroll=payroll, is_deleted=False).select_related("source_payroll"):
+                    if not PayrollBenefitConsumption.objects.filter(
+                            payroll=member.source_payroll, is_deleted=False).exclude(
+                                benefit__status=BenefitConsumptionStatus.RECONCILED).exists():
+                        member.source_payroll.status = PayrollStatus.RECONCILED
+                        member.source_payroll.save(username=self.user.login_name)
 
     def download_upload_review(self, upload, contents):
         """Return the original CSV annotated with its saved validation result."""
