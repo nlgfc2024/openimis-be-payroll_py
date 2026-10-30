@@ -1,4 +1,8 @@
+from io import BytesIO
 from types import SimpleNamespace
+
+import pandas as pd
+from openpyxl import load_workbook
 
 from django.test import SimpleTestCase, TestCase
 
@@ -75,6 +79,101 @@ class ReconciliationAuditPolicyTests(SimpleTestCase):
         # The reconciliation completion signal uses this service to change a
         # checker task to FAILED when applying its upload raises an error.
         self.assertIsNotNone(signals.TaskService)
+
+    def test_reconciliation_template_locks_all_but_paid_and_receipt(self):
+        dataframe = pd.DataFrame([{
+            "Payroll Name": "PAYROLL-001",
+            "First Name": "Jane",
+            "Receipt": "",
+            "Paid": "",
+        }])
+
+        content = CsvReconciliationService._protected_reconciliation_workbook(dataframe).getvalue()
+        worksheet = load_workbook(BytesIO(content)).active
+
+        self.assertTrue(worksheet.protection.sheet)
+        self.assertTrue(worksheet["A2"].protection.locked)
+        self.assertFalse(worksheet["C2"].protection.locked)
+        self.assertFalse(worksheet["D2"].protection.locked)
+        self.assertTrue(worksheet["A1"].protection.locked)
+        validation = worksheet.data_validations.dataValidation[0]
+        self.assertEqual(validation.type, "list")
+        self.assertEqual(validation.formula1, '"Yes,No"')
+        self.assertEqual(str(validation.sqref), "D2")
+
+    def test_changed_locked_value_is_rejected(self):
+        individual = SimpleNamespace(
+            first_name="Jane",
+            last_name="Doe",
+            dob=None,
+            json_ext={},
+            location=None,
+        )
+        benefit = SimpleNamespace(
+            id="benefit-001",
+            individual=individual,
+            status="APPROVE_FOR_PAYMENT",
+            amount="100",
+            type="Cash Transfer",
+            json_ext={},
+        )
+        payroll = SimpleNamespace(name="PAYROLL-001", status="APPROVE_FOR_PAYMENT")
+        row = pd.Series({
+            "code": "benefit-001",
+            "individual__first_name": "Changed name",
+            "receipt": "PSP-001",
+            "Paid": "Yes",
+        })
+
+        _, reasons = CsvReconciliationService(None)._validate_upload_row(
+            payroll,
+            row,
+            "benefit-001",
+            None,
+            set(),
+            set(),
+            {"benefit-001": benefit},
+            {"benefit-001": {"micro_catchment": None}},
+        )
+
+        self.assertIn("first_name_mismatch", reasons)
+
+    def test_missing_protected_extra_info_column_is_rejected(self):
+        individual = SimpleNamespace(
+            first_name="Jane",
+            last_name="Doe",
+            dob=None,
+            json_ext={},
+            location=None,
+        )
+        benefit = SimpleNamespace(
+            id="benefit-001",
+            individual=individual,
+            status="APPROVE_FOR_PAYMENT",
+            amount="100",
+            type="Cash Transfer",
+            json_ext={"extra_info": {"Programme": "Cash Plus"}},
+        )
+        payroll = SimpleNamespace(name="PAYROLL-001", status="APPROVE_FOR_PAYMENT")
+        row = pd.Series({
+            "code": "benefit-001",
+            "receipt": "PSP-001",
+            "Paid": "Yes",
+            "Micro Catchment": None,
+        })
+
+        _, reasons = CsvReconciliationService(None)._validate_upload_row(
+            payroll,
+            row,
+            "benefit-001",
+            None,
+            set(),
+            set(),
+            {"benefit-001": benefit},
+            {"benefit-001": {"micro_catchment": None}},
+        )
+
+        self.assertIn("extra_info_mismatch:Programme", reasons)
 
 
 class ReconciliationPayrollStatusTests(TestCase):
