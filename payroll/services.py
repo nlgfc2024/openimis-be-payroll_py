@@ -771,6 +771,7 @@ class CsvReconciliationService:
         upload.status = CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION
         upload.json_ext = {"extra_info": self._upload_summary(upload)}
         upload.save(username=self.user.login_name)
+        task_context = self._reconciliation_task_context(payroll)
         task = TaskService(self.user).create({
             "source": "payroll_reconciliation", "entity": payroll,
             "status": Task.Status.RECEIVED,
@@ -781,12 +782,40 @@ class CsvReconciliationService:
                 "upload_id": upload.id,
                 "payroll_name": payroll.name,
                 "included_payrolls": [{"id": str(payroll.id), "name": payroll.name}],
+                "district": task_context["district"],
+                "phase": task_context["phase"],
                 "summary": self._upload_summary(upload),
             }),
         })
         if not task.get("success", False):
             raise ValueError(task.get("error") or "Unable to create reconciliation review task")
         return BytesIO(contents), errors or None, self._upload_summary(upload)
+
+    @staticmethod
+    def _reconciliation_task_context(payroll):
+        """Return the selected-project district and the payroll's benefit-plan phase."""
+        project_ids = (payroll.json_ext or {}).get("filter_criteria", {}).get("project_ids", [])
+        project_model = apps.get_model("project_social_protection", "Project")
+        projects = project_model.objects.filter(
+            id__in=project_ids,
+            is_deleted=False,
+        ).select_related("location__parent__parent__parent")
+
+        districts = set()
+        for project in projects:
+            location = project.location
+            while location:
+                if location.type == "R":
+                    districts.add(location.name)
+                    break
+                location = location.parent
+
+        payment_plan = payroll.payment_plan
+        benefit_plan = payment_plan.benefit_plan if payment_plan else None
+        return {
+            "district": ", ".join(sorted(districts)) or None,
+            "phase": benefit_plan.name if benefit_plan else None,
+        }
 
     def _load_upload_context(self, payroll, codes):
         benefits = list(
