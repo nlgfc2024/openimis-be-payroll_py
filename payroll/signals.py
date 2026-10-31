@@ -7,6 +7,10 @@ from openIMIS.openimisapps import openimis_apps
 from tasks_management.models import Task
 from tasks_management.services import TaskService
 from payroll.apps import PayrollConfig
+from payroll.consolidation import (
+    ensure_benefit_is_not_in_active_consolidation,
+    ensure_payroll_is_not_consolidated_source,
+)
 from payroll.models import Payroll, BenefitConsumption, BenefitConsumptionStatus, CsvReconciliationUpload
 from payroll.payments_registry import PaymentMethodStorage
 from payroll.services import PayrollService, CsvReconciliationService
@@ -119,9 +123,10 @@ def bind_service_signals():
 
     def on_task_delete_payroll(**kwargs):
         def delete_payroll(payroll, user):
+            ensure_payroll_is_not_consolidated_source(payroll, "delete")
             strategy = PaymentMethodStorage.get_chosen_payment_method(payroll.payment_method)
             if strategy:
-                strategy.remove_benefits_from_rejected_payroll(payroll=payroll)
+                strategy.remove_benefits_from_rejected_payroll(payroll=payroll, user=user)
                 PayrollService(user).delete_instance(payroll)
         try:
             result = kwargs.get('result', None)
@@ -139,6 +144,7 @@ def bind_service_signals():
 
     def on_task_delete_benefit(**kwargs):
         def delete_benefit(benefit, user):
+            ensure_benefit_is_not_in_active_consolidation(benefit, "delete")
             StrategyOfPaymentInterface.remove_benefit_from_payroll(benefit=benefit)
         try:
             result = kwargs.get('result', None)

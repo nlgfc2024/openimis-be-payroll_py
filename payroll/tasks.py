@@ -3,6 +3,7 @@ from celery import shared_task
 
 from core.models import User
 from payroll.models import Payroll, PayrollStatus, BenefitConsumptionStatus
+from payroll.consolidation import ensure_payroll_is_not_consolidated_source
 from payroll.strategies import StrategyOnlinePayment
 from payroll.payments_registry import PaymentMethodStorage
 
@@ -12,6 +13,7 @@ logger = logging.getLogger(__name__)
 @shared_task
 def send_requests_to_gateway_payment(payroll_id, user_id):
     payroll = Payroll.objects.get(id=payroll_id)
+    ensure_payroll_is_not_consolidated_source(payroll, "pay")
     strategy = PaymentMethodStorage.get_chosen_payment_method(payroll.payment_method)
     if strategy:
         user = User.objects.get(id=user_id)
@@ -22,6 +24,7 @@ def send_requests_to_gateway_payment(payroll_id, user_id):
 @shared_task
 def send_request_to_reconcile(payroll_id, user_id):
     payroll = Payroll.objects.get(id=payroll_id)
+    ensure_payroll_is_not_consolidated_source(payroll, "reconcile")
     user = User.objects.get(id=user_id)
     strategy = StrategyOnlinePayment
     strategy.initialize_payment_gateway(payroll.payment_point)

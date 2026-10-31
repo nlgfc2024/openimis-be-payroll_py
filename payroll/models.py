@@ -89,7 +89,7 @@ class BenefitAttachment(HistoryBusinessModel):
 
 
 class PayrollBenefitConsumption(HistoryModel):
-    # 1:n it is ensured by the service
+    # Standard payrolls own their benefits; consolidated payrolls share source links.
     payroll = models.ForeignKey(Payroll, on_delete=models.DO_NOTHING)
     benefit = models.ForeignKey(BenefitConsumption, on_delete=models.DO_NOTHING)
 

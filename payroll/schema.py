@@ -1,7 +1,6 @@
 import graphene
 import graphene_django_optimizer as gql_optimizer
 from gettext import gettext as _
-from django.apps import apps
 from django.contrib.auth.models import AnonymousUser
 from django.db.models import Exists, OuterRef, Q, Sum
 
@@ -12,6 +11,7 @@ from invoice.gql.gql_types.bill_types import BillGQLType
 from invoice.models import Bill
 from location.services import get_ancestor_location_filter
 from payroll.apps import PayrollConfig
+from payroll.consolidation import payrolls_in_district
 from payroll.gql_mutations import CreatePaymentPointMutation, UpdatePaymentPointMutation, DeletePaymentPointMutation, \
     CreatePayrollMutation, DeletePayrollMutation, ClosePayrollMutation, \
     RejectPayrollMutation, MakePaymentForPayrollMutation, DeleteBenefitConsumptionMutation, CreateConsolidatedPayrollMutation
@@ -234,7 +234,8 @@ class Query(graphene.ObjectType):
 
         New project payrolls retain project IDs in their criteria rather than a
         district ID, so resolve their project location ancestry as well as the
-        legacy location filter.
+        legacy location filter. The shared resolver also handles old payrolls
+        that have no saved project or location criteria.
         """
         filters = {
             "status": 'APPROVE_FOR_PAYMENT',
@@ -251,45 +252,7 @@ class Query(graphene.ObjectType):
         payrolls = Payroll.objects.filter(**filters).filter(
             ~Exists(active_memberships),
         ).select_related("payment_plan").distinct()
-        project_model = apps.get_model("project_social_protection", "Project")
-        district_id = str(district_id)
-        matches = []
-        for payroll in payrolls:
-            criteria = (payroll.json_ext or {}).get("filter_criteria", {})
-            location_ids = {str(location_id) for location_id in criteria.get("location_ids", [])}
-            if district_id in location_ids:
-                matches.append(payroll)
-                continue
-            projects = project_model.objects.filter(
-                id__in=criteria.get("project_ids", []), is_deleted=False,
-            ).select_related("location__parent__parent__parent")
-            for project in projects:
-                location = project.location
-                while location:
-                    if str(location.uuid) == district_id:
-                        matches.append(payroll)
-                        break
-                    location = location.parent
-                else:
-                    continue
-                break
-            else:
-                # Older payrolls can have neither a project nor a district in
-                # their saved criteria. Their paid beneficiaries still provide
-                # the authoritative district for consolidation eligibility.
-                beneficiary_in_district = BenefitConsumption.objects.filter(
-                    payrollbenefitconsumption__payroll=payroll,
-                    payrollbenefitconsumption__is_deleted=False,
-                    is_deleted=False,
-                ).filter(
-                    Q(individual__location__uuid=district_id)
-                    | Q(individual__location__parent__uuid=district_id)
-                    | Q(individual__location__parent__parent__uuid=district_id)
-                    | Q(individual__location__parent__parent__parent__uuid=district_id)
-                ).exists()
-                if beneficiary_in_district:
-                    matches.append(payroll)
-        return matches
+        return payrolls_in_district(payrolls, district_id)
 
     def resolve_consolidation_candidates(self, info, district_id, benefit_plan_id):
         Query._check_permissions(info.context.user, PayrollConfig.gql_payroll_search_perms)

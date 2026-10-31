@@ -7,17 +7,23 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 
 from django.test import SimpleTestCase, TestCase
+from django.core.exceptions import ValidationError
 
 from payroll.apps import PayrollConfig
 from payroll import signals
 from payroll.models import (
+    BenefitConsumption,
+    BenefitConsumptionStatus,
     CsvReconciliationUpload,
     Payroll,
+    PayrollBenefitConsumption,
     PayrollStatus,
     ReconciliationUploadRow,
 )
 from payroll.services import CsvReconciliationService
 from core.test_helpers import LogInHelper
+from individual.models import Individual
+from individual.tests.data import service_add_individual_payload
 
 
 class ReconciliationAuditPolicyTests(SimpleTestCase):
@@ -125,7 +131,8 @@ class ReconciliationAuditPolicyTests(SimpleTestCase):
         )
         with patch("payroll.services.CsvReconciliationUpload.objects.select_for_update") as lock_upload:
             lock_upload.return_value.get.return_value = upload
-            CsvReconciliationService(None).apply_upload(upload)
+            with self.assertRaises(ValidationError):
+                CsvReconciliationService(None).apply_upload(upload)
 
         self.assertEqual(upload.status, CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION)
 
@@ -150,6 +157,7 @@ class ReconciliationAuditPolicyTests(SimpleTestCase):
             patch("payroll.services.CsvReconciliationUpload.objects.filter") as find_uploads,
             patch("payroll.services.ReconciliationUploadRow") as upload_row_model,
             patch("payroll.services.bulk_create_with_history"),
+            patch("payroll.services.ensure_payroll_is_not_consolidated_source"),
             patch("payroll.services.TaskService") as task_service,
         ):
             find_payroll.return_value.first.return_value = payroll
@@ -276,3 +284,59 @@ class ReconciliationPayrollStatusTests(TestCase):
         upload.refresh_from_db()
         self.assertEqual(upload.status, CsvReconciliationUpload.Status.SUCCESS)
         self.assertEqual(payroll.status, PayrollStatus.APPROVE_FOR_PAYMENT)
+
+    def test_invalid_upload_batch_does_not_apply_its_valid_rows(self):
+        individual = Individual(**service_add_individual_payload)
+        individual.save(username=self.user.login_name)
+        payroll = Payroll(
+            name="All-or-nothing reconciliation test",
+            status=PayrollStatus.APPROVE_FOR_PAYMENT,
+        )
+        payroll.save(username=self.user.login_name)
+        benefit = BenefitConsumption(
+            individual=individual,
+            code="all-or-nothing-valid-code",
+            amount=Decimal("100"),
+            type="Cash Transfer",
+            status=BenefitConsumptionStatus.ACCEPTED,
+        )
+        benefit.save(username=self.user.login_name)
+        PayrollBenefitConsumption(payroll=payroll, benefit=benefit).save(
+            username=self.user.login_name,
+        )
+        upload = CsvReconciliationUpload(
+            payroll=payroll,
+            status=CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION,
+            total_records=2,
+            matched_records=1,
+            paid_records=1,
+            unmatched_records=1,
+        )
+        upload.save(username=self.user.login_name)
+        ReconciliationUploadRow(
+            upload=upload,
+            row_number=2,
+            benefit=benefit,
+            code=benefit.code,
+            submitted_data={"Paid": "Yes", "receipt": "valid-row-receipt"},
+            status=ReconciliationUploadRow.Status.VALID,
+        ).save(username=self.user.login_name)
+        ReconciliationUploadRow(
+            upload=upload,
+            row_number=3,
+            code="invalid-row-code",
+            mismatch_reasons=["national_id_mismatch"],
+            submitted_data={"Paid": "Yes", "receipt": "invalid-row-receipt"},
+            status=ReconciliationUploadRow.Status.INVALID,
+        ).save(username=self.user.login_name)
+
+        with self.assertRaises(ValidationError):
+            CsvReconciliationService(self.user).apply_upload(upload)
+
+        benefit.refresh_from_db()
+        payroll.refresh_from_db()
+        upload.refresh_from_db()
+        self.assertEqual(benefit.status, BenefitConsumptionStatus.ACCEPTED)
+        self.assertIsNone(benefit.receipt)
+        self.assertEqual(payroll.status, PayrollStatus.APPROVE_FOR_PAYMENT)
+        self.assertEqual(upload.status, CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION)
