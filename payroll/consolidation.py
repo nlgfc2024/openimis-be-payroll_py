@@ -51,15 +51,22 @@ def payrolls_in_district(payrolls, district_id):
         for criteria in criteria_by_payroll_id.values()
         for location_id in criteria.get("location_ids") or []
     }
-    relevant_location_ids = criteria_location_ids.union(
-        location_id
+    numeric_location_ids = {
+        int(location_id)
+        for location_id in criteria_location_ids
+        if location_id.isdigit()
+    }
+    relevant_location_ids = numeric_location_ids.union(
+        int(location_id)
         for locations in project_location_ids.values()
         for location_id in locations
     )
-    locations = {
-        str(location.id): location
-        for location in Location.objects.filter(id__in=relevant_location_ids)
-    }
+    locations = {}
+    for location in Location.objects.filter(
+        Q(id__in=relevant_location_ids) | Q(uuid__in=criteria_location_ids)
+    ):
+        locations[str(location.id)] = location
+        locations[str(location.uuid)] = location
     while True:
         parent_ids = {
             str(location.parent_id)

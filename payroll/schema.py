@@ -9,6 +9,7 @@ from core.services import wait_for_mutation
 from core.utils import append_validity_filter
 from invoice.gql.gql_types.bill_types import BillGQLType
 from invoice.models import Bill
+from location.models import Location
 from location.services import get_ancestor_location_filter
 from payroll.apps import PayrollConfig
 from payroll.consolidation import payrolls_in_district
@@ -235,8 +236,10 @@ class Query(graphene.ObjectType):
         New project payrolls retain project IDs in their criteria rather than a
         district ID, so resolve their project location ancestry as well as the
         legacy location filter. The shared resolver also handles old payrolls
-        that have no saved project or location criteria.
+        that have no saved project or location criteria. The API accepts a
+        location UUID, while the shared resolver compares internal location IDs.
         """
+        district_id = Location.objects.only("id").get(uuid=district_id).id
         filters = {
             "status": 'APPROVE_FOR_PAYMENT',
             "payroll_type": Payroll.PayrollType.STANDARD,

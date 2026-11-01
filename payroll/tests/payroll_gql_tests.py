@@ -644,13 +644,20 @@ class PayrollGQLTestCase(openIMISGraphQLTestCase):
             json_ext={"filter_criteria": {"location_ids": [str(self.other_location.id)]}},
         )
         self._attach_benefit(criteria_source)
+        uuid_criteria_source = self._create_consolidation_source(
+            "UUID criteria source",
+            json_ext={"filter_criteria": {"location_ids": [str(self.district.uuid)]}},
+        )
 
         matches = payrolls_in_district(
-            [legacy_source, criteria_source],
+            [legacy_source, criteria_source, uuid_criteria_source],
             self.district.id,
         )
 
-        self.assertEqual([payroll.id for payroll in matches], [legacy_source.id])
+        self.assertEqual(
+            [payroll.id for payroll in matches],
+            [legacy_source.id, uuid_criteria_source.id],
+        )
 
     def _create_consolidation_source(self, name, **overrides):
         fields = {
