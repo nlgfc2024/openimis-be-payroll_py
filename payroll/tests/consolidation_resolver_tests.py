@@ -32,6 +32,31 @@ class ConsolidationResolverTests(SimpleTestCase):
         locations.return_value.get.assert_called_once_with(uuid="district-uuid")
         in_district.assert_called_once_with(payroll_queryset, 102)
 
+    def test_candidates_empty_for_unknown_district(self):
+        from location.models import Location
+
+        with patch("payroll.schema.Location.objects.only") as locations, \
+                patch("payroll.schema.Payroll.objects.none", return_value=[]) as none, \
+                patch("payroll.schema.payrolls_in_district") as in_district:
+            locations.return_value.get.side_effect = Location.DoesNotExist
+
+            result = Query._consolidation_candidates("missing-uuid")
+
+        self.assertEqual(result, [])
+        none.assert_called_once_with()
+        in_district.assert_not_called()
+
+    def test_candidates_exclude_payrolls_in_active_consolidation(self):
+        with patch("payroll.schema.Location.objects.only") as locations, \
+                patch("payroll.schema.Payroll.objects.filter") as payroll_filter, \
+                patch("payroll.schema.payrolls_in_district", return_value=[]):
+            locations.return_value.get.return_value = SimpleNamespace(id=102)
+
+            Query._consolidation_candidates("district-uuid")
+
+        exclusion = payroll_filter.return_value.filter.call_args.args[0]
+        self.assertTrue(exclusion.negated)
+
     def test_payrolls_in_district_resolves_saved_location_uuids(self):
         district = SimpleNamespace(id=102, uuid="district-uuid", parent_id=None)
         child = SimpleNamespace(id=103, uuid="child-uuid", parent_id=102)

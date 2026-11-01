@@ -2,6 +2,7 @@ import graphene
 import graphene_django_optimizer as gql_optimizer
 from gettext import gettext as _
 from django.contrib.auth.models import AnonymousUser
+from django.core.exceptions import ValidationError
 from django.db.models import Exists, OuterRef, Q, Sum
 
 from core.schema import OrderedDjangoFilterConnectionField
@@ -239,7 +240,10 @@ class Query(graphene.ObjectType):
         that have no saved project or location criteria. The API accepts a
         location UUID, while the shared resolver compares internal location IDs.
         """
-        district_id = Location.objects.only("id").get(uuid=district_id).id
+        try:
+            district_id = Location.objects.only("id").get(uuid=district_id).id
+        except (Location.DoesNotExist, ValidationError, ValueError):
+            return Payroll.objects.none()
         filters = {
             "status": 'APPROVE_FOR_PAYMENT',
             "payroll_type": Payroll.PayrollType.STANDARD,
