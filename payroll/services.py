@@ -1130,6 +1130,7 @@ class CsvReconciliationService:
 
     @transaction.atomic
     def apply_upload(self, upload):
+        payroll = Payroll.objects.select_for_update().get(id=upload.payroll_id)
         upload = CsvReconciliationUpload.objects.select_for_update().get(id=upload.id)
         if upload.status != CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION:
             return
@@ -1137,12 +1138,31 @@ class CsvReconciliationService:
             raise ValidationError(
                 "A reconciliation upload with unmatched rows cannot be applied."
             )
-        ensure_payroll_is_not_consolidated_source(upload.payroll, "reconcile")
+        if payroll.payroll_type == Payroll.PayrollType.CONSOLIDATED:
+            if payroll.is_deleted or payroll.status == PayrollStatus.REJECTED:
+                raise ValidationError(
+                    "A reconciliation upload cannot be applied to an inactive consolidated payroll."
+                )
+        else:
+            ensure_payroll_is_not_consolidated_source(payroll, "reconcile")
         rows = list(ReconciliationUploadRow.objects.filter(
             upload=upload,
             status=ReconciliationUploadRow.Status.VALID,
             is_deleted=False,
         ))
+        if payroll.payroll_type == Payroll.PayrollType.CONSOLIDATED:
+            benefit_ids = {row.benefit_id for row in rows if row.benefit_id}
+            active_benefit_ids = set(
+                PayrollBenefitConsumption.objects.select_for_update().filter(
+                    payroll=payroll,
+                    benefit_id__in=benefit_ids,
+                    is_deleted=False,
+                ).values_list("benefit_id", flat=True)
+            )
+            if benefit_ids != active_benefit_ids:
+                raise ValidationError(
+                    "A reconciliation upload contains benefits no longer linked to its consolidated payroll."
+                )
         paid_rows = [
             row for row in rows
             if self._clean_value(row.submitted_data.get(PayrollConfig.csv_reconciliation_paid_extra_field))
@@ -1166,7 +1186,6 @@ class CsvReconciliationService:
         # unmatched rows and every linked benefit has reached RECONCILED.
         # In particular, an all-unpaid or partial upload must leave the payroll
         # available for a later reconciliation upload.
-        payroll = upload.payroll
         has_unreconciled_benefits = PayrollBenefitConsumption.objects.filter(
             payroll=payroll,
             is_deleted=False,

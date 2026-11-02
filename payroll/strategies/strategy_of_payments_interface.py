@@ -92,6 +92,7 @@ class StrategyOfPaymentInterface(object, metaclass=abc.ABCMeta):
         payroll.save(username=user.login_name)
 
     @classmethod
+    @transaction.atomic
     def remove_benefits_from_rejected_payroll(cls, payroll, user=None):
         from payroll.models import (
             BenefitAttachment,
@@ -112,6 +113,19 @@ class StrategyOfPaymentInterface(object, metaclass=abc.ABCMeta):
         )
 
         if payroll.payroll_type == Payroll.PayrollType.CONSOLIDATED:
+            payroll = Payroll.objects.select_for_update().get(id=payroll.id)
+            pending_uploads = CsvReconciliationUpload.objects.filter(
+                payroll=payroll,
+                status=CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION,
+                is_deleted=False,
+            )
+            for upload in pending_uploads:
+                upload.status = CsvReconciliationUpload.Status.FAIL
+                upload.error = {
+                    **(upload.error or {}),
+                    "consolidation_released": True,
+                }
+                upload.save(username=user.login_name if user else None)
             for link in PayrollBenefitConsumption.objects.filter(
                 payroll=payroll, is_deleted=False,
             ):
