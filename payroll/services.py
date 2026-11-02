@@ -558,6 +558,10 @@ class PayrollService(BaseService):
 
     @transaction.atomic
     def _move_benefit_consumptions(self, payroll, from_payroll_id):
+        source_payroll = Payroll.objects.select_for_update().get(id=from_payroll_id)
+        if source_payroll.payroll_type == Payroll.PayrollType.CONSOLIDATED:
+            raise ValidationError("Cannot move benefits from a consolidated payroll.")
+        ensure_payroll_is_not_consolidated_source(source_payroll, "move benefits from")
         payroll_benefits = PayrollBenefitConsumption.objects.filter(
             payroll_id=from_payroll_id,
             benefit__status__in=[BenefitConsumptionStatus.ACCEPTED, BenefitConsumptionStatus.APPROVE_FOR_PAYMENT]

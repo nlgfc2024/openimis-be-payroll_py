@@ -633,6 +633,38 @@ class PayrollGQLTestCase(openIMISGraphQLTestCase):
                 with self.assertRaises(ValidationError):
                     action()
 
+    def test_recovery_move_blocks_active_consolidated_source(self):
+        source, consolidated, benefit = self._create_shared_consolidation_benefit()
+        destination = self._create_consolidation_source("Recovery destination")
+        benefit.status = BenefitConsumptionStatus.APPROVE_FOR_PAYMENT
+        benefit.save(user=self.user)
+
+        with self.assertRaises(ValidationError):
+            PayrollService(self.user)._move_benefit_consumptions(destination, source.id)
+
+        self.assertTrue(PayrollBenefitConsumption.objects.filter(
+            payroll=source, benefit=benefit, is_deleted=False,
+        ).exists())
+        self.assertTrue(PayrollBenefitConsumption.objects.filter(
+            payroll=consolidated, benefit=benefit, is_deleted=False,
+        ).exists())
+        benefit.refresh_from_db()
+        self.assertEqual(benefit.status, BenefitConsumptionStatus.APPROVE_FOR_PAYMENT)
+
+    def test_recovery_move_blocks_consolidated_parent(self):
+        source, consolidated, benefit = self._create_shared_consolidation_benefit()
+        destination = self._create_consolidation_source("Recovery destination from parent")
+
+        with self.assertRaises(ValidationError):
+            PayrollService(self.user)._move_benefit_consumptions(destination, consolidated.id)
+
+        self.assertTrue(PayrollBenefitConsumption.objects.filter(
+            payroll=source, benefit=benefit, is_deleted=False,
+        ).exists())
+        self.assertTrue(PayrollBenefitConsumption.objects.filter(
+            payroll=consolidated, benefit=benefit, is_deleted=False,
+        ).exists())
+
     def test_district_fallback_only_applies_without_saved_criteria(self):
         legacy_source = self._create_consolidation_source(
             "Legacy district source",
