@@ -9,7 +9,7 @@ from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError
 from django.db import transaction
 from simple_history.utils import bulk_create_with_history
-from django.db.models import Q
+from django.db.models import Count, Q, Sum
 from django.utils.translation import gettext as _
 
 from core import datetime
@@ -18,9 +18,15 @@ from core.models import InteractiveUser
 from core.services import BaseService
 from core.signals import register_service_signal
 from invoice.models import Bill, BillItem, PaymentInvoice, DetailPaymentInvoice
+from location.models import Location
 from invoice.services import PaymentInvoiceService
 from payment_cycle.models import PaymentCycle
 from payroll.apps import PayrollConfig
+from payroll.consolidation import (
+    ensure_benefit_is_not_in_active_consolidation,
+    ensure_payroll_is_not_consolidated_source,
+    payrolls_in_district,
+)
 from payroll.models import (
     PaymentPoint,
     Payroll,
@@ -28,6 +34,7 @@ from payroll.models import (
     BenefitConsumption,
     BenefitAttachment,
     BenefitConsumptionStatus,
+    ConsolidatedPayrollMember,
     PayrollStatus,
     CsvReconciliationUpload,
     ReconciliationUploadRow
@@ -156,6 +163,7 @@ class PayrollService(BaseService):
     @register_service_signal('payroll_service.delete')
     def delete(self, obj_data):
         payroll_to_delete = Payroll.objects.get(id=obj_data['id'])
+        ensure_payroll_is_not_consolidated_source(payroll_to_delete, "delete")
         data = {'id': payroll_to_delete.id}
         TaskService(self.user).create({
             'source': 'payroll_delete',
@@ -169,6 +177,8 @@ class PayrollService(BaseService):
     @check_authentication
     @register_service_signal('payroll_service.attach_benefit_to_payroll')
     def attach_benefit_to_payroll(self, payroll_id, benefit_id):
+        payroll = Payroll.objects.get(id=payroll_id, is_deleted=False)
+        ensure_payroll_is_not_consolidated_source(payroll, "change")
         active_links = PayrollBenefitConsumption.objects.filter(
             benefit_id=benefit_id,
             is_deleted=False,
@@ -186,7 +196,7 @@ class PayrollService(BaseService):
     def create_accept_payroll_task(self, payroll_id, obj_data):
         payroll_to_accept = Payroll.objects.get(id=payroll_id)
         data = {**obj_data, 'id': payroll_id}
-        TaskService(self.user).create({
+        task = TaskService(self.user).create({
             'source': 'payroll',
             'entity': payroll_to_accept,
             'status': Task.Status.RECEIVED,
@@ -194,10 +204,99 @@ class PayrollService(BaseService):
             'business_event': PayrollConfig.payroll_accept_event,
             'data': _get_std_task_data_payload(data)
         })
+        if not task.get("success", False):
+            raise ValueError(task.get("error") or "Unable to create payroll approval task")
+        return task
+
+    @transaction.atomic
+    def create_consolidated_payroll(self, district_id, benefit_plan_id, source_payroll_ids):
+        """Create a parent payroll without cloning the source benefits."""
+        if not source_payroll_ids:
+            raise ValidationError("Select at least one approved payroll to consolidate.")
+        sources = list(Payroll.objects.select_for_update(of=("self",)).filter(
+            id__in=source_payroll_ids,
+            payment_plan__benefit_plan_id=benefit_plan_id,
+            status=PayrollStatus.APPROVE_FOR_PAYMENT,
+            payroll_type=Payroll.PayrollType.STANDARD,
+            is_deleted=False,
+        ).select_related("payment_plan", "payment_cycle", "payment_point"))
+        if len(sources) != len(source_payroll_ids):
+            raise ValidationError("Every selected payroll must still be approved and belong to the selected phase.")
+        duplicate_recipients = PayrollBenefitConsumption.objects.filter(
+            payroll_id__in=[source.id for source in sources],
+            is_deleted=False,
+            benefit__is_deleted=False,
+        ).values(
+            "benefit__individual_id",
+        ).annotate(
+            source_count=Count("payroll_id", distinct=True),
+        ).filter(
+            source_count__gt=1,
+        )
+        if duplicate_recipients.exists():
+            raise ValidationError(
+                "Selected payrolls contain benefits for the same recipient. "
+                "Remove overlapping source payrolls before consolidation."
+            )
+        if ConsolidatedPayrollMember.objects.filter(
+                source_payroll_id__in=[source.id for source in sources],
+                is_deleted=False,
+                consolidated_payroll__is_deleted=False,
+        ).exclude(consolidated_payroll__status=PayrollStatus.REJECTED).exists():
+            raise ValidationError("A selected payroll already belongs to a consolidated payroll.")
+        first = sources[0]
+        if any((source.payment_method, source.payment_point_id, source.payment_cycle_id) !=
+               (first.payment_method, first.payment_point_id, first.payment_cycle_id) for source in sources):
+            raise ValidationError("Selected payrolls must use the same payment method, point, and cycle.")
+        district = Location.objects.select_for_update().get(uuid=district_id, validity_to__isnull=True)
+        eligible_source_ids = {
+            source.id for source in payrolls_in_district(sources, district.id)
+        }
+        if eligible_source_ids != {source.id for source in sources}:
+            raise ValidationError(
+                "Every selected payroll must belong to the selected district."
+            )
+        phase = first.payment_plan.benefit_plan.name or first.payment_plan.benefit_plan.code
+        name_base = f"{district.name}-{phase}-Consolidated Payroll"
+        name_prefix = f"{name_base}-"
+        used_sequences = []
+        for existing_name in Payroll.objects.filter(
+            name__startswith=name_prefix, is_deleted=False,
+        ).values_list("name", flat=True):
+            suffix = existing_name[len(name_prefix):]
+            if suffix.isdigit():
+                used_sequences.append(int(suffix))
+        sequence = max(used_sequences, default=0) + 1
+        payroll = Payroll(
+            name=f"{name_base}-{sequence:03d}", payment_plan=first.payment_plan,
+            payment_cycle=first.payment_cycle, payment_point=first.payment_point,
+            payment_method=first.payment_method, status=PayrollStatus.PENDING_APPROVAL,
+            payroll_type=Payroll.PayrollType.CONSOLIDATED, district=district,
+            json_ext={"consolidated_source_payroll_ids": [str(source.id) for source in sources]},
+        )
+        payroll.save(username=self.user.login_name)
+        for source in sources:
+            benefits = PayrollBenefitConsumption.objects.filter(payroll=source, is_deleted=False)
+            benefit_ids = list(benefits.values_list("benefit_id", flat=True))
+            total = BenefitConsumption.objects.filter(id__in=benefit_ids).aggregate(total=Sum("amount"))["total"] or 0
+            ConsolidatedPayrollMember(
+                consolidated_payroll=payroll, source_payroll=source,
+                beneficiaries_count=len(benefit_ids), total_amount=total,
+            ).save(username=self.user.login_name)
+            # This is the intentional shared-link exception for consolidation.
+            for benefit_id in benefit_ids:
+                PayrollBenefitConsumption(payroll=payroll, benefit_id=benefit_id).save(username=self.user.login_name)
+        self.create_accept_payroll_task(payroll.id, {
+            "id": payroll.id, "district": district.name, "phase": phase,
+            "included_payrolls": [{"id": str(source.id), "name": source.name} for source in sources],
+            "consolidated": True,
+        })
+        return payroll
 
     @register_service_signal('payroll_service.close_payroll')
     def close_payroll(self, obj_data):
         payroll_to_close = Payroll.objects.get(id=obj_data['id'])
+        ensure_payroll_is_not_consolidated_source(payroll_to_close, "reconcile")
         data = {'id': payroll_to_close.id}
         TaskService(self.user).create({
             'source': 'payroll_reconciliation',
@@ -211,6 +310,7 @@ class PayrollService(BaseService):
     @register_service_signal('payroll_service.reject_approve_payroll')
     def reject_approved_payroll(self, obj_data):
         payroll_to_reject = Payroll.objects.get(id=obj_data['id'])
+        ensure_payroll_is_not_consolidated_source(payroll_to_reject, "reject")
         data = {'id': payroll_to_reject.id}
         TaskService(self.user).create({
             'source': 'payroll_reject',
@@ -222,8 +322,9 @@ class PayrollService(BaseService):
         })
 
     def make_payment_for_payroll(self, obj_data):
-        payroll_id = obj_data['id']
-        send_requests_to_gateway_payment.delay(payroll_id, self.user.id)
+        payroll = Payroll.objects.get(id=obj_data['id'], is_deleted=False)
+        ensure_payroll_is_not_consolidated_source(payroll, "pay")
+        send_requests_to_gateway_payment.delay(payroll.id, self.user.id)
 
     def _save_payroll(self, obj_data, payment_plan, payment_cycle, project_names):
         obj_ = self.OBJECT_TYPE(**obj_data)
@@ -476,6 +577,10 @@ class PayrollService(BaseService):
 
     @transaction.atomic
     def _move_benefit_consumptions(self, payroll, from_payroll_id):
+        source_payroll = Payroll.objects.select_for_update().get(id=from_payroll_id)
+        if source_payroll.payroll_type == Payroll.PayrollType.CONSOLIDATED:
+            raise ValidationError("Cannot move benefits from a consolidated payroll.")
+        ensure_payroll_is_not_consolidated_source(source_payroll, "move benefits from")
         payroll_benefits = PayrollBenefitConsumption.objects.filter(
             payroll_id=from_payroll_id,
             benefit__status__in=[BenefitConsumptionStatus.ACCEPTED, BenefitConsumptionStatus.APPROVE_FOR_PAYMENT]
@@ -498,12 +603,15 @@ class BenefitConsumptionService(BaseService):
 
     @register_service_signal('benefit_consumption_service.update')
     def update(self, obj_data):
+        benefit = BenefitConsumption.objects.get(id=obj_data["id"], is_deleted=False)
+        ensure_benefit_is_not_in_active_consolidation(benefit, "update")
         return super().update(obj_data)
 
     @check_authentication
     @register_service_signal('benefit_consumption_service.delete')
     def delete(self, obj_data):
         benefit_to_delete = BenefitConsumption.objects.get(id=obj_data['id'])
+        ensure_benefit_is_not_in_active_consolidation(benefit_to_delete, "delete")
         benefit_to_delete.status = BenefitConsumptionStatus.PENDING_DELETION
         benefit_to_delete.save(user=self.user)
         data = {'id': benefit_to_delete.id}
@@ -519,6 +627,8 @@ class BenefitConsumptionService(BaseService):
     @check_authentication
     @register_service_signal('benefit_consumption_service.create_or_update_benefit_attachment')
     def create_or_update_benefit_attachment(self, bills_queryset, benefit_id):
+        benefit = BenefitConsumption.objects.get(id=benefit_id, is_deleted=False)
+        ensure_benefit_is_not_in_active_consolidation(benefit, "change attachments for")
         # remove first old attachments and save the new one
         BenefitAttachment.objects.filter(benefit_id=benefit_id).delete()
         # save new bill attachments
@@ -554,18 +664,26 @@ class CsvReconciliationService:
         extra_info_keys = set()
         extra_info_dicts = []
         mapped_headers = set(field_mapping.values()) | {self.micro_catchment_column}
-        project_micro_catchment = self._get_payroll_micro_catchment(payroll)
+        source_payroll_by_benefit = self._get_source_payrolls_by_benefit(payroll)
+        project_micro_catchments = {}
         for record in records:
             benefit = benefits_by_code[record["code"]]
+            source_payroll = source_payroll_by_benefit.get(benefit.id, payroll)
+            if source_payroll.id not in project_micro_catchments:
+                project_micro_catchments[source_payroll.id] = self._get_payroll_micro_catchment(
+                    source_payroll
+                )
             # The payroll's project is the work location. A recipient may live
             # in a different catchment, but that must not make a one-project
             # payroll look as though it contains several project catchments.
             record["micro_catchment"] = (
-                project_micro_catchment or self._get_micro_catchment(benefit)
+                project_micro_catchments[source_payroll.id] or self._get_micro_catchment(benefit)
             )
             extra_info = benefit.json_ext.get("extra_info", {}) if benefit.json_ext else {}
             extra_info_keys.update(key for key in extra_info if key not in mapped_headers)
             extra_info_dicts.append(extra_info)
+            if source_payroll_by_benefit:
+                record["Source Payroll"] = source_payroll.name
 
         df = pd.DataFrame.from_records(records)
         df[PayrollConfig.csv_reconciliation_paid_extra_field] = df.apply(
@@ -581,6 +699,32 @@ class CsvReconciliationService:
         except ValueError:
             export_columns.append(self.micro_catchment_column)
         export_columns.append(PayrollConfig.csv_reconciliation_paid_extra_field)
+        if source_payroll_by_benefit:
+            export_columns.insert(0, "Source Payroll")
+            preferred_columns = [
+                "Source Payroll",
+                "Payroll Name",
+                "Payroll Status",
+                "District Name",
+                self.micro_catchment_column,
+                "Form Number",
+                "Phone Number",
+                "First Name",
+                "Last Name",
+                "National ID",
+                "Date of Birth",
+                "Code",
+                "Status",
+                "Amount",
+                "Type",
+                "Receipt",
+                PayrollConfig.csv_reconciliation_paid_extra_field,
+            ]
+            export_columns = [
+                column for column in preferred_columns if column in export_columns
+            ] + [
+                column for column in export_columns if column not in preferred_columns
+            ]
         for key in extra_info_keys:
             df[key] = [extra_info.get(key) for extra_info in extra_info_dicts]
             export_columns.append(key)
@@ -605,6 +749,22 @@ class CsvReconciliationService:
             id=next(iter(project_ids)), is_deleted=False,
         ).select_related("micro_catchment").first()
         return project.micro_catchment.name if project and project.micro_catchment else None
+
+    @staticmethod
+    def _get_source_payrolls_by_benefit(payroll):
+        if payroll.payroll_type != Payroll.PayrollType.CONSOLIDATED:
+            return {}
+        members = list(ConsolidatedPayrollMember.objects.filter(
+            consolidated_payroll=payroll, is_deleted=False,
+        ).select_related("source_payroll"))
+        source_payrolls = {member.source_payroll_id: member.source_payroll for member in members}
+        return {
+            benefit_id: source_payrolls[source_payroll_id]
+            for benefit_id, source_payroll_id in PayrollBenefitConsumption.objects.filter(
+                payroll_id__in=source_payrolls, is_deleted=False,
+            ).values_list("benefit_id", "payroll_id")
+            if source_payroll_id in source_payrolls
+        }
 
     def _get_micro_catchment(self, benefit):
         location = benefit.individual.location
@@ -633,6 +793,7 @@ class CsvReconciliationService:
         # Serialise uploads for a payroll.  This makes superseding a pending
         # review deterministic even when corrected files arrive concurrently.
         payroll = Payroll.objects.select_for_update().get(id=payroll.id)
+        ensure_payroll_is_not_consolidated_source(payroll, "upload reconciliation for")
         if not file:
             raise ValueError(_("csv_reconciliation.validation.file_required"))
 
@@ -692,6 +853,14 @@ class CsvReconciliationService:
         )
 
         benefits_by_code, contexts_by_benefit_id = self._load_upload_context(payroll, codes)
+        source_payroll_by_benefit = {}
+        if payroll.payroll_type == Payroll.PayrollType.CONSOLIDATED:
+            member_ids = ConsolidatedPayrollMember.objects.filter(
+                consolidated_payroll=payroll, is_deleted=False,
+            ).values_list("source_payroll_id", flat=True)
+            source_payroll_by_benefit = dict(PayrollBenefitConsumption.objects.filter(
+                payroll_id__in=member_ids, is_deleted=False,
+            ).values_list("benefit_id", "payroll_id"))
         errors = {}
         valid_indexes = []
         upload_rows = []
@@ -711,7 +880,11 @@ class CsvReconciliationService:
                 benefit=benefit,
                 code=code,
                 national_id=national_id,
-                submitted_data={str(key): self._json_value(value) for key, value in row.items()},
+                submitted_data={
+                    **{str(key): self._json_value(value) for key, value in row.items()},
+                    **({"_source_payroll_id": str(source_payroll_by_benefit[benefit.id])}
+                       if benefit and benefit.id in source_payroll_by_benefit else {}),
+                },
                 mismatch_reasons=reasons,
                 status=(ReconciliationUploadRow.Status.INVALID if self._has_blocking_reason(reasons)
                         else ReconciliationUploadRow.Status.VALID),
@@ -739,6 +912,13 @@ class CsvReconciliationService:
              == PayrollConfig.csv_reconciliation_paid_no).sum()
         )
         bulk_create_with_history(upload_rows, ReconciliationUploadRow, default_user=self.user, batch_size=1000)
+
+        if errors and payroll.payroll_type == Payroll.PayrollType.CONSOLIDATED:
+            upload.error = errors
+            upload.status = CsvReconciliationUpload.Status.FAIL
+            upload.json_ext = {"extra_info": self._upload_summary(upload)}
+            upload.save(username=self.user.login_name)
+            return BytesIO(contents), errors, self._upload_summary(upload)
 
         # A corrected file replaces, rather than competes with, an outstanding
         # review. Fail its still-open checker task as well, so it cannot later
@@ -771,6 +951,7 @@ class CsvReconciliationService:
         upload.status = CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION
         upload.json_ext = {"extra_info": self._upload_summary(upload)}
         upload.save(username=self.user.login_name)
+        task_context = self._reconciliation_task_context(payroll)
         task = TaskService(self.user).create({
             "source": "payroll_reconciliation", "entity": payroll,
             "status": Task.Status.RECEIVED,
@@ -780,13 +961,119 @@ class CsvReconciliationService:
                 "id": payroll.id,
                 "upload_id": upload.id,
                 "payroll_name": payroll.name,
-                "included_payrolls": [{"id": str(payroll.id), "name": payroll.name}],
+                "included_payrolls": task_context["included_payrolls"],
+                "consolidated": task_context["consolidated"],
+                "district": task_context["district"],
+                "phase": task_context["phase"],
                 "summary": self._upload_summary(upload),
             }),
         })
         if not task.get("success", False):
             raise ValueError(task.get("error") or "Unable to create reconciliation review task")
         return BytesIO(contents), errors or None, self._upload_summary(upload)
+
+    @staticmethod
+    def _reconciliation_task_context(payroll):
+        """Return the payroll's phase, district, and source-payroll review context."""
+        consolidated = payroll.payroll_type == Payroll.PayrollType.CONSOLIDATED
+        if consolidated:
+            members = list(ConsolidatedPayrollMember.objects.filter(
+                consolidated_payroll=payroll,
+                is_deleted=False,
+                source_payroll__is_deleted=False,
+            ).select_related("source_payroll").order_by("source_payroll__name"))
+            source_payrolls = [member.source_payroll for member in members]
+        else:
+            members = []
+            source_payrolls = [payroll]
+
+        project_ids_by_payroll = {}
+        for source_payroll in source_payrolls:
+            extension = source_payroll.json_ext or {}
+            filter_criteria = extension.get("filter_criteria", {}) if isinstance(extension, dict) else {}
+            project_ids = filter_criteria.get("project_ids", []) if isinstance(filter_criteria, dict) else []
+            if isinstance(project_ids, (list, tuple)):
+                project_ids_by_payroll[str(source_payroll.id)] = set(project_ids)
+            else:
+                project_ids_by_payroll[str(source_payroll.id)] = set()
+
+        all_project_ids = set().union(*project_ids_by_payroll.values()) if project_ids_by_payroll else set()
+        project_model = apps.get_model("project_social_protection", "Project")
+        projects = project_model.objects.filter(
+            id__in=all_project_ids,
+            is_deleted=False,
+        ).select_related("location__parent__parent__parent") if all_project_ids else []
+
+        districts_by_payroll = {payroll_id: set() for payroll_id in project_ids_by_payroll}
+        project_ids_to_payrolls = {}
+        for payroll_id, project_ids in project_ids_by_payroll.items():
+            for project_id in project_ids:
+                project_ids_to_payrolls.setdefault(str(project_id), set()).add(payroll_id)
+        for project in projects:
+            district = CsvReconciliationService._district_name_for_location(project.location)
+            if district:
+                for payroll_id in project_ids_to_payrolls.get(str(project.id), set()):
+                    districts_by_payroll[payroll_id].add(district)
+
+        # Older payrolls may not have retained their project criteria. In that
+        # case derive the district from the beneficiaries actually linked to
+        # each source payroll instead of leaving the task district blank.
+        fallback_payroll_ids = {
+            str(source_payroll.id)
+            for source_payroll in source_payrolls
+            if not project_ids_by_payroll.get(str(source_payroll.id))
+            or not districts_by_payroll.get(str(source_payroll.id))
+        }
+        source_payroll_id_by_value = {
+            str(source_payroll.id): source_payroll.id for source_payroll in source_payrolls
+        }
+        if fallback_payroll_ids:
+            fallback_memberships = PayrollBenefitConsumption.objects.filter(
+                payroll_id__in=[
+                    source_payroll_id_by_value[payroll_id] for payroll_id in fallback_payroll_ids
+                ],
+                is_deleted=False,
+                benefit__is_deleted=False,
+                benefit__individual__groupindividuals__recipient_type="PRIMARY",
+                benefit__individual__groupindividuals__is_deleted=False,
+            ).select_related(
+                "benefit__individual__location__parent__parent__parent",
+            )
+            for membership in fallback_memberships:
+                payroll_id = str(membership.payroll_id)
+                district = CsvReconciliationService._district_name_for_location(
+                    membership.benefit.individual.location,
+                )
+                if district:
+                    districts_by_payroll.setdefault(payroll_id, set()).add(district)
+
+        districts = set().union(*districts_by_payroll.values()) if districts_by_payroll else set()
+
+        payment_plan = payroll.payment_plan
+        benefit_plan = payment_plan.benefit_plan if payment_plan else None
+        if consolidated:
+            included_payrolls = [
+                {"id": str(member.source_payroll_id), "name": member.source_payroll.name}
+                for member in members
+            ]
+        else:
+            included_payrolls = [{"id": str(payroll.id), "name": payroll.name}]
+        return {
+            "district": ", ".join(sorted(districts)) or None,
+            "phase": benefit_plan.name if benefit_plan else None,
+            "consolidated": consolidated,
+            "included_payrolls": included_payrolls,
+        }
+
+    @staticmethod
+    def _district_name_for_location(location):
+        visited = set()
+        while location and location.id not in visited:
+            visited.add(location.id)
+            if location.type == "R":
+                return location.name
+            location = location.parent
+        return None
 
     def _load_upload_context(self, payroll, codes):
         benefits = list(
@@ -800,12 +1087,23 @@ class CsvReconciliationService:
             ).select_related("individual", "individual__location").distinct()
         )
         benefits_by_code = {benefit.code: benefit for benefit in benefits}
-        project_micro_catchment = self._get_payroll_micro_catchment(payroll)
-        if project_micro_catchment:
-            return benefits_by_code, {
-                benefit.id: {"micro_catchment": project_micro_catchment}
-                for benefit in benefits
-            }
+        source_payroll_by_benefit = self._get_source_payrolls_by_benefit(payroll)
+        project_micro_catchments = {}
+        contexts = {}
+        for benefit in benefits:
+            source_payroll = source_payroll_by_benefit.get(benefit.id, payroll)
+            if source_payroll.id not in project_micro_catchments:
+                project_micro_catchments[source_payroll.id] = self._get_payroll_micro_catchment(
+                    source_payroll
+                )
+            project_micro_catchment = project_micro_catchments[source_payroll.id]
+            if project_micro_catchment:
+                contexts[benefit.id] = {"micro_catchment": project_micro_catchment}
+        fallback_benefits = [
+            benefit for benefit in benefits if benefit.id not in contexts
+        ]
+        if not fallback_benefits:
+            return benefits_by_code, contexts
 
         # A historical multi-project payroll has no single project catchment.
         # Preserve its legacy recipient-location behavior rather than inventing
@@ -813,7 +1111,7 @@ class CsvReconciliationService:
         from location.models import Location, MicroCatchmentGVH
         locations = {
             benefit.individual.location_id: benefit.individual.location
-            for benefit in benefits if benefit.individual.location_id
+            for benefit in fallback_benefits if benefit.individual.location_id
         }
         while True:
             parent_ids = {
@@ -828,7 +1126,7 @@ class CsvReconciliationService:
             locations.update(parents)
 
         gvh_by_benefit = {}
-        for benefit in benefits:
+        for benefit in fallback_benefits:
             location = locations.get(benefit.individual.location_id)
             while location and location.type != "W":
                 location = locations.get(location.parent_id)
@@ -840,22 +1138,47 @@ class CsvReconciliationService:
             validity_to__isnull=True,
         ).select_related("micro_catchment").order_by("micro_catchment__name"):
             micro_catchments.setdefault(item.location_id, item.micro_catchment.name)
-        contexts = {
+        contexts.update({
             benefit.id: {"micro_catchment": micro_catchments.get(gvh_by_benefit[benefit.id])}
-            for benefit in benefits
-        }
+            for benefit in fallback_benefits
+        })
         return benefits_by_code, contexts
 
     @transaction.atomic
     def apply_upload(self, upload):
+        payroll = Payroll.objects.select_for_update().get(id=upload.payroll_id)
         upload = CsvReconciliationUpload.objects.select_for_update().get(id=upload.id)
         if upload.status != CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION:
             return
+        if upload.unmatched_records and payroll.payroll_type == Payroll.PayrollType.CONSOLIDATED:
+            raise ValidationError(
+                "A reconciliation upload with unmatched rows cannot be applied."
+            )
+        if payroll.payroll_type == Payroll.PayrollType.CONSOLIDATED:
+            if payroll.is_deleted or payroll.status == PayrollStatus.REJECTED:
+                raise ValidationError(
+                    "A reconciliation upload cannot be applied to an inactive consolidated payroll."
+                )
+        else:
+            ensure_payroll_is_not_consolidated_source(payroll, "reconcile")
         rows = list(ReconciliationUploadRow.objects.filter(
             upload=upload,
             status=ReconciliationUploadRow.Status.VALID,
             is_deleted=False,
         ))
+        if payroll.payroll_type == Payroll.PayrollType.CONSOLIDATED:
+            benefit_ids = {row.benefit_id for row in rows if row.benefit_id}
+            active_benefit_ids = set(
+                PayrollBenefitConsumption.objects.select_for_update().filter(
+                    payroll=payroll,
+                    benefit_id__in=benefit_ids,
+                    is_deleted=False,
+                ).values_list("benefit_id", flat=True)
+            )
+            if benefit_ids != active_benefit_ids:
+                raise ValidationError(
+                    "A reconciliation upload contains benefits no longer linked to its consolidated payroll."
+                )
         paid_rows = [
             row for row in rows
             if self._clean_value(row.submitted_data.get(PayrollConfig.csv_reconciliation_paid_extra_field))
@@ -872,14 +1195,17 @@ class CsvReconciliationService:
             benefit = locked_benefits.get(row.benefit_id)
             if benefit and benefit.status == BenefitConsumptionStatus.ACCEPTED:
                 self._reconcile_bc(pd.Series(row.submitted_data), benefit)
-        upload.status = CsvReconciliationUpload.Status.PARTIAL_SUCCESS if upload.unmatched_records else CsvReconciliationUpload.Status.SUCCESS
+        upload.status = (
+            CsvReconciliationUpload.Status.PARTIAL_SUCCESS
+            if upload.unmatched_records
+            else CsvReconciliationUpload.Status.SUCCESS
+        )
         upload.save(username=self.user.login_name)
 
         # A payroll is fully reconciled only when this approved upload has no
         # unmatched rows and every linked benefit has reached RECONCILED.
         # In particular, an all-unpaid or partial upload must leave the payroll
         # available for a later reconciliation upload.
-        payroll = upload.payroll
         has_unreconciled_benefits = PayrollBenefitConsumption.objects.filter(
             payroll=payroll,
             is_deleted=False,
@@ -888,6 +1214,11 @@ class CsvReconciliationService:
                 and payroll.status != PayrollStatus.RECONCILED:
             payroll.status = PayrollStatus.RECONCILED
             payroll.save(username=self.user.login_name)
+        reconcile_consolidated_sources(
+            payroll,
+            self.user,
+            only_completed_sources=True,
+        )
 
     def download_upload_review(self, upload, contents):
         """Return the original CSV annotated with its saved validation result."""
@@ -962,6 +1293,8 @@ class CsvReconciliationService:
             ("payroll_status_mismatch", "payrollbenefitconsumption__payroll__status", payroll.status, self._matches_text),
             ("first_name_mismatch", "individual__first_name", individual.first_name, self._matches_text),
             ("last_name_mismatch", "individual__last_name", individual.last_name, self._matches_text),
+            ("national_id_mismatch", "individual__json_ext__national_id",
+             (individual.json_ext or {}).get("national_id"), self._matches_text),
             ("date_of_birth_mismatch", "individual__dob", individual.dob, self._matches_date),
             ("status_mismatch", "status", benefit.status, self._matches_text),
             ("amount_mismatch", "amount", benefit.amount, self._amounts_match),

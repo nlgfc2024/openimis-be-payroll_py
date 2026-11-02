@@ -2,18 +2,21 @@ import graphene
 import graphene_django_optimizer as gql_optimizer
 from gettext import gettext as _
 from django.contrib.auth.models import AnonymousUser
-from django.db.models import Q, Sum
+from django.core.exceptions import ValidationError
+from django.db.models import Exists, OuterRef, Q, Sum
 
 from core.schema import OrderedDjangoFilterConnectionField
 from core.services import wait_for_mutation
 from core.utils import append_validity_filter
 from invoice.gql.gql_types.bill_types import BillGQLType
 from invoice.models import Bill
+from location.models import Location
 from location.services import get_ancestor_location_filter
 from payroll.apps import PayrollConfig
+from payroll.consolidation import payrolls_in_district
 from payroll.gql_mutations import CreatePaymentPointMutation, UpdatePaymentPointMutation, DeletePaymentPointMutation, \
     CreatePayrollMutation, DeletePayrollMutation, ClosePayrollMutation, \
-    RejectPayrollMutation, MakePaymentForPayrollMutation, DeleteBenefitConsumptionMutation
+    RejectPayrollMutation, MakePaymentForPayrollMutation, DeleteBenefitConsumptionMutation, CreateConsolidatedPayrollMutation
 from payroll.gql_queries import BenefitConsumptionGQLType, PaymentPointGQLType, benefit_consumption_queryset, \
     PayrollGQLType, PaymentMethodGQLType, \
     PaymentMethodListGQLType, BenefitAttachmentListGQLType, \
@@ -21,9 +24,16 @@ from payroll.gql_queries import BenefitConsumptionGQLType, PaymentPointGQLType, 
     PaymentGatewayConfigGQLType, BenefitsSummaryGQLType
 from payroll.models import PaymentPoint, Payroll, \
     BenefitConsumption, BenefitAttachment, \
-    CsvReconciliationUpload, ReconciliationUploadRow, PayrollBenefitConsumption, BenefitConsumptionStatus
+    CsvReconciliationUpload, ReconciliationUploadRow, PayrollBenefitConsumption, BenefitConsumptionStatus, \
+    ConsolidatedPayrollMember, PayrollStatus
 from payroll.payments_registry import PaymentMethodStorage
 from social_protection.models import BenefitPlan
+
+
+class ConsolidationPhaseGQLType(graphene.ObjectType):
+    uuid = graphene.String()
+    code = graphene.String()
+    name = graphene.String()
 
 
 class Query(graphene.ObjectType):
@@ -118,6 +128,16 @@ class Query(graphene.ObjectType):
         paymentCycleUuid=graphene.String(),
     )
 
+    consolidation_candidates = graphene.List(
+        PayrollGQLType,
+        district_id=graphene.UUID(required=True),
+        benefit_plan_id=graphene.UUID(required=True),
+    )
+    consolidation_phases = graphene.List(
+        ConsolidationPhaseGQLType,
+        district_id=graphene.UUID(required=True),
+    )
+
     def resolve_bill_by_payroll(self, info, **kwargs):
         Query._check_permissions(info.context.user, PayrollConfig.gql_payroll_search_perms)
         filters = [*append_validity_filter(**kwargs), Q(payrollbill__payroll_id=kwargs.get("payroll_uuid"),
@@ -209,6 +229,50 @@ class Query(graphene.ObjectType):
 
         query = Payroll.objects.filter(*filters)
         return gql_optimizer.query(query, info)
+
+    @staticmethod
+    def _consolidation_candidates(district_id, benefit_plan_id=None):
+        """Return available source payrolls belonging to a district.
+
+        New project payrolls retain project IDs in their criteria rather than a
+        district ID, so resolve their project location ancestry as well as the
+        legacy location filter. The shared resolver also handles old payrolls
+        that have no saved project or location criteria. The API accepts a
+        location UUID, while the shared resolver compares internal location IDs.
+        """
+        try:
+            district_id = Location.objects.only("id").get(uuid=district_id).id
+        except (Location.DoesNotExist, ValidationError, ValueError):
+            return Payroll.objects.none()
+        filters = {
+            "status": 'APPROVE_FOR_PAYMENT',
+            "payroll_type": Payroll.PayrollType.STANDARD,
+            "is_deleted": False,
+        }
+        if benefit_plan_id:
+            filters["payment_plan__benefit_plan_id"] = benefit_plan_id
+        active_memberships = ConsolidatedPayrollMember.objects.filter(
+            source_payroll_id=OuterRef("pk"),
+            is_deleted=False,
+            consolidated_payroll__is_deleted=False,
+        ).exclude(consolidated_payroll__status=PayrollStatus.REJECTED)
+        payrolls = Payroll.objects.filter(**filters).filter(
+            ~Exists(active_memberships),
+        ).select_related("payment_plan").distinct()
+        return payrolls_in_district(payrolls, district_id)
+
+    def resolve_consolidation_candidates(self, info, district_id, benefit_plan_id):
+        Query._check_permissions(info.context.user, PayrollConfig.gql_payroll_search_perms)
+        return Query._consolidation_candidates(district_id, benefit_plan_id)
+
+    def resolve_consolidation_phases(self, info, district_id):
+        Query._check_permissions(info.context.user, PayrollConfig.gql_payroll_search_perms)
+        phase_ids = {
+            payroll.payment_plan.benefit_plan_id
+            for payroll in Query._consolidation_candidates(district_id)
+            if payroll.payment_plan_id
+        }
+        return BenefitPlan.objects.filter(id__in=phase_ids, is_deleted=False).order_by("name")
 
     def resolve_payroll_benefit_consumption(self, info, **kwargs):
         Query._check_permissions(info.context.user, PayrollConfig.gql_payroll_search_perms)
@@ -346,6 +410,7 @@ class Mutation(graphene.ObjectType):
     delete_payment_point = DeletePaymentPointMutation.Field()
 
     create_payroll = CreatePayrollMutation.Field()
+    create_consolidated_payroll = CreateConsolidatedPayrollMutation.Field()
     delete_payroll = DeletePayrollMutation.Field()
     close_payroll = ClosePayrollMutation.Field()
     reject_payroll = RejectPayrollMutation.Field()

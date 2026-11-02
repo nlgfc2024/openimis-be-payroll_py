@@ -1,17 +1,32 @@
 import json
 import uuid
 from datetime import datetime, timedelta
+from decimal import Decimal
+from unittest.mock import patch
 
 from graphene import Schema
 from graphene.test import Client
 from django.contrib.contenttypes.models import ContentType
+from django.core.exceptions import ValidationError
 
 from contribution_plan.models import PaymentPlan
 from individual.models import Group, GroupIndividual, Individual
 from individual.tests.data import service_add_individual_payload
 from invoice.models import Bill
 from payment_cycle.models import PaymentCycle
-from payroll.models import Payroll, PayrollBill, PayrollStatus, PayrollBenefitConsumption
+from payroll.models import (
+    BenefitAttachment,
+    BenefitConsumption,
+    BenefitConsumptionStatus,
+    ConsolidatedPayrollMember,
+    Payroll,
+    PayrollBenefitConsumption,
+    PayrollBill,
+    PayrollStatus,
+)
+from payroll.consolidation import payrolls_in_district
+from payroll.services import PayrollService
+from payroll.strategies.strategy_of_payments_interface import StrategyOfPaymentInterface
 from payroll.tests.data import gql_payroll_create, gql_payroll_query, gql_payroll_delete, \
     gql_payroll_create_no_json_ext
 from payroll.tests.helpers import PaymentPointHelper
@@ -448,6 +463,324 @@ class PayrollGQLTestCase(openIMISGraphQLTestCase):
         # self.assertEqual(PayrollBill.objects.filter(payroll=payroll, bill=self.bill).count(), 1)
         # payroll_bill.delete(username=self.user.username)
         # self.assertTrue(PayrollBill.objects.filter(payroll=payroll, bill=self.bill, is_deleted=True))
+
+    def test_consolidated_creation_validates_selected_sources(self):
+        service = PayrollService(self.user)
+        source = self._create_consolidation_source("Consolidation validation source")
+        invalid_cases = [
+            (self.district.id, self.benefit_plan.id, []),
+            (self.district.id, uuid.uuid4(), [source.id]),
+            (self.district.id, self.benefit_plan.id, [uuid.uuid4()]),
+            (self.district.id, self.benefit_plan.id, [source.id, source.id]),
+        ]
+        for district_id, phase_id, source_ids in invalid_cases:
+            with self.subTest(source_ids=source_ids):
+                with self.assertRaises(ValidationError):
+                    service.create_consolidated_payroll(district_id, phase_id, source_ids)
+
+        pending_source = self._create_consolidation_source(
+            "Pending consolidation source",
+            status=PayrollStatus.PENDING_APPROVAL,
+        )
+        with self.assertRaises(ValidationError):
+            service.create_consolidated_payroll(
+                self.district.id, self.benefit_plan.id, [pending_source.id],
+            )
+
+        wrong_district_source = self._create_consolidation_source(
+            "Wrong district source",
+            json_ext={"filter_criteria": {"location_ids": [str(self.other_location.id)]}},
+        )
+        with self.assertRaises(ValidationError):
+            service.create_consolidated_payroll(
+                self.district.id, self.benefit_plan.id, [wrong_district_source.id],
+            )
+
+        incompatible_source = self._create_consolidation_source(
+            "Incompatible payment source",
+            payment_method="another-payment-method",
+        )
+        with self.assertRaises(ValidationError):
+            service.create_consolidated_payroll(
+                self.district.id,
+                self.benefit_plan.id,
+                [source.id, incompatible_source.id],
+            )
+
+        for field in ("payment_point", "payment_cycle"):
+            incompatible_source = self._create_consolidation_source(
+                f"Incompatible {field} source",
+                **{field: None},
+            )
+            with self.subTest(incompatible_field=field):
+                with self.assertRaises(ValidationError):
+                    service.create_consolidated_payroll(
+                        self.district.id,
+                        self.benefit_plan.id,
+                        [source.id, incompatible_source.id],
+                    )
+
+    def test_consolidated_creation_blocks_duplicate_membership_and_creates_valid_payroll(self):
+        source = self._create_consolidation_source("Consolidation source")
+        service = PayrollService(self.user)
+
+        with patch("payroll.services.TaskService") as task_service:
+            task_service.return_value.create.return_value = {"success": True}
+            consolidated = service.create_consolidated_payroll(
+                self.district.id, self.benefit_plan.id, [source.id],
+            )
+        self.assertEqual(consolidated.payroll_type, Payroll.PayrollType.CONSOLIDATED)
+        self.assertTrue(ConsolidatedPayrollMember.objects.filter(
+            consolidated_payroll=consolidated,
+            source_payroll=source,
+            is_deleted=False,
+        ).exists())
+        task_service.return_value.create.assert_called_once()
+
+        second_source = self._create_consolidation_source("Duplicate membership source")
+        ConsolidatedPayrollMember(
+            consolidated_payroll=consolidated,
+            source_payroll=second_source,
+        ).save(user=self.user)
+        with self.assertRaises(ValidationError):
+            service.create_consolidated_payroll(
+                self.district.id, self.benefit_plan.id, [second_source.id],
+            )
+
+    def test_consolidated_creation_rejects_duplicate_recipients(self):
+        source_a = self._create_consolidation_source("Duplicate recipient source A")
+        source_b = self._create_consolidation_source("Duplicate recipient source B")
+        self._attach_benefit(source_a)
+        self._attach_benefit(source_b)
+
+        with self.assertRaisesRegex(ValidationError, "same recipient"):
+            PayrollService(self.user).create_consolidated_payroll(
+                self.district.id,
+                self.benefit_plan.id,
+                [source_a.id, source_b.id],
+            )
+
+    def test_consolidated_creation_rolls_back_when_task_creation_fails(self):
+        source = self._create_consolidation_source("Task failure consolidation source")
+        service = PayrollService(self.user)
+        consolidated_count = Payroll.objects.filter(
+            payroll_type=Payroll.PayrollType.CONSOLIDATED,
+        ).count()
+
+        with patch("payroll.services.TaskService") as task_service:
+            task_service.return_value.create.return_value = {
+                "success": False,
+                "error": "Task creation failed",
+            }
+            with self.assertRaisesRegex(ValueError, "Task creation failed"):
+                service.create_consolidated_payroll(
+                    self.district.id, self.benefit_plan.id, [source.id],
+                )
+
+        self.assertFalse(ConsolidatedPayrollMember.objects.filter(
+            source_payroll=source,
+            is_deleted=False,
+        ).exists())
+        self.assertEqual(
+            Payroll.objects.filter(payroll_type=Payroll.PayrollType.CONSOLIDATED).count(),
+            consolidated_count,
+        )
+
+    def test_rejecting_consolidated_payroll_preserves_shared_benefits_and_bills(self):
+        source, consolidated, benefit = self._create_shared_consolidation_benefit()
+
+        StrategyOfPaymentInterface.reject_payroll(consolidated, self.user)
+
+        self.assertTrue(BenefitConsumption.objects.filter(id=benefit.id, is_deleted=False).exists())
+        self.assertTrue(BenefitAttachment.objects.filter(
+            benefit=benefit, bill=self.bill, is_deleted=False,
+        ).exists())
+        self.assertTrue(Bill.objects.filter(id=self.bill.id, is_deleted=False).exists())
+        self.assertTrue(PayrollBenefitConsumption.objects.filter(
+            payroll=source, benefit=benefit, is_deleted=False,
+        ).exists())
+        self.assertFalse(PayrollBenefitConsumption.objects.filter(
+            payroll=consolidated, benefit=benefit, is_deleted=False,
+        ).exists())
+        self.assertFalse(ConsolidatedPayrollMember.objects.filter(
+            consolidated_payroll=consolidated, is_deleted=False,
+        ).exists())
+
+    def test_deleting_consolidated_payroll_preserves_shared_benefits_and_bills(self):
+        source, consolidated, benefit = self._create_shared_consolidation_benefit()
+
+        StrategyOfPaymentInterface.remove_benefits_from_rejected_payroll(
+            consolidated, user=self.user,
+        )
+        consolidated.delete(user=self.user)
+
+        self.assertTrue(BenefitConsumption.objects.filter(id=benefit.id, is_deleted=False).exists())
+        self.assertTrue(BenefitAttachment.objects.filter(
+            benefit=benefit, bill=self.bill, is_deleted=False,
+        ).exists())
+        self.assertTrue(Bill.objects.filter(id=self.bill.id, is_deleted=False).exists())
+        self.assertTrue(PayrollBenefitConsumption.objects.filter(
+            payroll=source, benefit=benefit, is_deleted=False,
+        ).exists())
+
+    def test_rejecting_approved_consolidated_payroll_preserves_payment_state(self):
+        source, consolidated, benefit = self._create_shared_consolidation_benefit()
+        benefit.status = BenefitConsumptionStatus.RECONCILED
+        benefit.receipt = "source-payment-receipt"
+        benefit.save(user=self.user)
+
+        with patch("payroll.services.PayrollService.create_accept_payroll_task"):
+            StrategyOfPaymentInterface.reject_approved_payroll(consolidated, self.user)
+
+        benefit.refresh_from_db()
+        consolidated.refresh_from_db()
+        self.assertEqual(benefit.status, BenefitConsumptionStatus.RECONCILED)
+        self.assertEqual(benefit.receipt, "source-payment-receipt")
+        self.assertEqual(consolidated.status, PayrollStatus.PENDING_APPROVAL)
+        self.assertTrue(PayrollBenefitConsumption.objects.filter(
+            payroll=source, benefit=benefit, is_deleted=False,
+        ).exists())
+        self.assertTrue(BenefitAttachment.objects.filter(
+            benefit=benefit, bill=self.bill, is_deleted=False,
+        ).exists())
+
+    def test_active_consolidation_blocks_source_payroll_actions(self):
+        source = self._create_consolidation_source("Reserved source")
+        consolidated = Payroll(
+            name="Reserved consolidated payroll",
+            payment_plan=self.payment_plan,
+            payment_cycle=self.payment_cycle,
+            payment_point=self.payment_point,
+            payment_method=self.payment_method,
+            status=PayrollStatus.PENDING_APPROVAL,
+            payroll_type=Payroll.PayrollType.CONSOLIDATED,
+            district=self.district,
+        )
+        consolidated.save(user=self.user)
+        ConsolidatedPayrollMember(
+            consolidated_payroll=consolidated,
+            source_payroll=source,
+        ).save(user=self.user)
+        service = PayrollService(self.user)
+        actions = (
+            lambda: service.delete({"id": source.id}),
+            lambda: service.close_payroll({"id": source.id}),
+            lambda: service.reject_approved_payroll({"id": source.id}),
+            lambda: service.make_payment_for_payroll({"id": source.id}),
+        )
+        for action in actions:
+            with self.subTest(action=action):
+                with self.assertRaises(ValidationError):
+                    action()
+
+    def test_recovery_move_blocks_active_consolidated_source(self):
+        source, consolidated, benefit = self._create_shared_consolidation_benefit()
+        destination = self._create_consolidation_source("Recovery destination")
+        benefit.status = BenefitConsumptionStatus.APPROVE_FOR_PAYMENT
+        benefit.save(user=self.user)
+
+        with self.assertRaises(ValidationError):
+            PayrollService(self.user)._move_benefit_consumptions(destination, source.id)
+
+        self.assertTrue(PayrollBenefitConsumption.objects.filter(
+            payroll=source, benefit=benefit, is_deleted=False,
+        ).exists())
+        self.assertTrue(PayrollBenefitConsumption.objects.filter(
+            payroll=consolidated, benefit=benefit, is_deleted=False,
+        ).exists())
+        benefit.refresh_from_db()
+        self.assertEqual(benefit.status, BenefitConsumptionStatus.APPROVE_FOR_PAYMENT)
+
+    def test_recovery_move_blocks_consolidated_parent(self):
+        source, consolidated, benefit = self._create_shared_consolidation_benefit()
+        destination = self._create_consolidation_source("Recovery destination from parent")
+
+        with self.assertRaises(ValidationError):
+            PayrollService(self.user)._move_benefit_consumptions(destination, consolidated.id)
+
+        self.assertTrue(PayrollBenefitConsumption.objects.filter(
+            payroll=source, benefit=benefit, is_deleted=False,
+        ).exists())
+        self.assertTrue(PayrollBenefitConsumption.objects.filter(
+            payroll=consolidated, benefit=benefit, is_deleted=False,
+        ).exists())
+
+    def test_district_fallback_only_applies_without_saved_criteria(self):
+        legacy_source = self._create_consolidation_source(
+            "Legacy district source",
+            json_ext={},
+        )
+        self._attach_benefit(legacy_source)
+        criteria_source = self._create_consolidation_source(
+            "Saved criteria source",
+            json_ext={"filter_criteria": {"location_ids": [str(self.other_location.id)]}},
+        )
+        self._attach_benefit(criteria_source)
+        uuid_criteria_source = self._create_consolidation_source(
+            "UUID criteria source",
+            json_ext={"filter_criteria": {"location_ids": [str(self.district.uuid)]}},
+        )
+
+        matches = payrolls_in_district(
+            [legacy_source, criteria_source, uuid_criteria_source],
+            self.district.id,
+        )
+
+        self.assertEqual(
+            [payroll.id for payroll in matches],
+            [legacy_source.id, uuid_criteria_source.id],
+        )
+
+    def _create_consolidation_source(self, name, **overrides):
+        fields = {
+            "name": name,
+            "payment_plan": self.payment_plan,
+            "payment_cycle": self.payment_cycle,
+            "payment_point": self.payment_point,
+            "payment_method": self.payment_method,
+            "status": PayrollStatus.APPROVE_FOR_PAYMENT,
+            "json_ext": {
+                "filter_criteria": {"location_ids": [str(self.district.id)]},
+            },
+        }
+        fields.update(overrides)
+        source = Payroll(**fields)
+        source.save(user=self.user)
+        return source
+
+    def _attach_benefit(self, payroll):
+        benefit = BenefitConsumption(
+            individual=self.individual_2,
+            code=str(uuid.uuid4()),
+            amount=Decimal("100"),
+            type="Cash Transfer",
+            status=BenefitConsumptionStatus.ACCEPTED,
+        )
+        benefit.save(user=self.user)
+        PayrollBenefitConsumption(payroll=payroll, benefit=benefit).save(user=self.user)
+        return benefit
+
+    def _create_shared_consolidation_benefit(self):
+        source = self._create_consolidation_source("Shared benefit source")
+        consolidated = Payroll(
+            name="Shared benefit consolidated payroll",
+            payment_plan=self.payment_plan,
+            payment_cycle=self.payment_cycle,
+            payment_point=self.payment_point,
+            payment_method=self.payment_method,
+            status=PayrollStatus.APPROVE_FOR_PAYMENT,
+            payroll_type=Payroll.PayrollType.CONSOLIDATED,
+            district=self.district,
+        )
+        consolidated.save(user=self.user)
+        ConsolidatedPayrollMember(
+            consolidated_payroll=consolidated,
+            source_payroll=source,
+        ).save(user=self.user)
+        benefit = self._attach_benefit(source)
+        PayrollBenefitConsumption(payroll=consolidated, benefit=benefit).save(user=self.user)
+        BenefitAttachment(benefit=benefit, bill=self.bill).save(user=self.user)
+        return source, consolidated, benefit
 
     @classmethod
     def __create_benefit_plan(cls):
