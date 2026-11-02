@@ -124,6 +124,72 @@ class ReconciliationAuditPolicyTests(SimpleTestCase):
     def test_uploaded_national_id_matching_ignores_surrounding_whitespace(self):
         self.assertTrue(CsvReconciliationService._matches_text(" ID-123 ", "ID-123"))
 
+    def test_consolidated_export_uses_source_payroll_micro_catchment(self):
+        source_payroll = SimpleNamespace(id="source-id", name="Source payroll")
+        consolidated_payroll = SimpleNamespace(
+            id="consolidated-id",
+            payroll_type=Payroll.PayrollType.CONSOLIDATED,
+        )
+        benefit = SimpleNamespace(id="benefit-id", code="CODE-1", json_ext={})
+        record = {
+            key: "value" for key in PayrollConfig.csv_reconciliation_field_mapping
+        }
+        record["code"] = benefit.code
+        benefits = MagicMock()
+        benefits.values.return_value = [record]
+        benefits.select_related.return_value = [benefit]
+        service = CsvReconciliationService(None)
+
+        with (
+            patch.object(service, "_resolve_payroll", return_value=consolidated_payroll),
+            patch.object(service, "_get_benefit_consumption_qs", return_value=benefits),
+            patch.object(
+                service, "_get_source_payrolls_by_benefit",
+                return_value={benefit.id: source_payroll},
+            ),
+            patch.object(
+                service, "_get_payroll_micro_catchment", return_value="Source catchment",
+            ),
+            patch.object(service, "_get_micro_catchment", return_value="Recipient catchment"),
+        ):
+            exported = pd.read_csv(BytesIO(
+                service.download_reconciliation("consolidated-id").getvalue()
+            ))
+
+        self.assertEqual(exported.loc[0, "Micro Catchment"], "Source catchment")
+
+    def test_consolidated_upload_context_uses_source_payroll_micro_catchment(self):
+        source_payroll = SimpleNamespace(id="source-id")
+        consolidated_payroll = SimpleNamespace(
+            id="consolidated-id",
+            payroll_type=Payroll.PayrollType.CONSOLIDATED,
+        )
+        benefit = SimpleNamespace(
+            id="benefit-id",
+            code="CODE-1",
+            individual=SimpleNamespace(location_id="location-id", location=None),
+        )
+        benefit_query = MagicMock()
+        benefit_query.select_related.return_value.distinct.return_value = [benefit]
+        service = CsvReconciliationService(None)
+
+        with (
+            patch("payroll.services.BenefitConsumption.objects.filter", return_value=benefit_query),
+            patch.object(
+                service, "_get_source_payrolls_by_benefit",
+                return_value={benefit.id: source_payroll},
+            ),
+            patch.object(
+                service, "_get_payroll_micro_catchment", return_value="Source catchment",
+            ),
+        ):
+            benefits_by_code, contexts = service._load_upload_context(
+                consolidated_payroll, pd.Series(["CODE-1"])
+            )
+
+        self.assertIs(benefits_by_code["CODE-1"], benefit)
+        self.assertEqual(contexts[benefit.id]["micro_catchment"], "Source catchment")
+
     def test_upload_with_unmatched_rows_cannot_be_applied(self):
         upload = SimpleNamespace(
             id="upload-id",

@@ -648,28 +648,26 @@ class CsvReconciliationService:
         extra_info_keys = set()
         extra_info_dicts = []
         mapped_headers = set(field_mapping.values()) | {self.micro_catchment_column}
-        project_micro_catchment = self._get_payroll_micro_catchment(payroll)
-        source_payroll_by_benefit = {}
-        if payroll.payroll_type == Payroll.PayrollType.CONSOLIDATED:
-            member_ids = ConsolidatedPayrollMember.objects.filter(
-                consolidated_payroll=payroll, is_deleted=False,
-            ).values_list("source_payroll_id", flat=True)
-            source_payroll_by_benefit = dict(PayrollBenefitConsumption.objects.filter(
-                payroll_id__in=member_ids, is_deleted=False,
-            ).select_related("payroll").values_list("benefit_id", "payroll__name"))
+        source_payroll_by_benefit = self._get_source_payrolls_by_benefit(payroll)
+        project_micro_catchments = {}
         for record in records:
             benefit = benefits_by_code[record["code"]]
+            source_payroll = source_payroll_by_benefit.get(benefit.id, payroll)
+            if source_payroll.id not in project_micro_catchments:
+                project_micro_catchments[source_payroll.id] = self._get_payroll_micro_catchment(
+                    source_payroll
+                )
             # The payroll's project is the work location. A recipient may live
             # in a different catchment, but that must not make a one-project
             # payroll look as though it contains several project catchments.
             record["micro_catchment"] = (
-                project_micro_catchment or self._get_micro_catchment(benefit)
+                project_micro_catchments[source_payroll.id] or self._get_micro_catchment(benefit)
             )
             extra_info = benefit.json_ext.get("extra_info", {}) if benefit.json_ext else {}
             extra_info_keys.update(key for key in extra_info if key not in mapped_headers)
             extra_info_dicts.append(extra_info)
             if source_payroll_by_benefit:
-                record["Source Payroll"] = source_payroll_by_benefit.get(benefit.id)
+                record["Source Payroll"] = source_payroll.name
 
         df = pd.DataFrame.from_records(records)
         df[PayrollConfig.csv_reconciliation_paid_extra_field] = df.apply(
@@ -735,6 +733,22 @@ class CsvReconciliationService:
             id=next(iter(project_ids)), is_deleted=False,
         ).select_related("micro_catchment").first()
         return project.micro_catchment.name if project and project.micro_catchment else None
+
+    @staticmethod
+    def _get_source_payrolls_by_benefit(payroll):
+        if payroll.payroll_type != Payroll.PayrollType.CONSOLIDATED:
+            return {}
+        members = list(ConsolidatedPayrollMember.objects.filter(
+            consolidated_payroll=payroll, is_deleted=False,
+        ).select_related("source_payroll"))
+        source_payrolls = {member.source_payroll_id: member.source_payroll for member in members}
+        return {
+            benefit_id: source_payrolls[source_payroll_id]
+            for benefit_id, source_payroll_id in PayrollBenefitConsumption.objects.filter(
+                payroll_id__in=source_payrolls, is_deleted=False,
+            ).values_list("benefit_id", "payroll_id")
+            if source_payroll_id in source_payrolls
+        }
 
     def _get_micro_catchment(self, benefit):
         location = benefit.individual.location
@@ -1057,12 +1071,23 @@ class CsvReconciliationService:
             ).select_related("individual", "individual__location").distinct()
         )
         benefits_by_code = {benefit.code: benefit for benefit in benefits}
-        project_micro_catchment = self._get_payroll_micro_catchment(payroll)
-        if project_micro_catchment:
-            return benefits_by_code, {
-                benefit.id: {"micro_catchment": project_micro_catchment}
-                for benefit in benefits
-            }
+        source_payroll_by_benefit = self._get_source_payrolls_by_benefit(payroll)
+        project_micro_catchments = {}
+        contexts = {}
+        for benefit in benefits:
+            source_payroll = source_payroll_by_benefit.get(benefit.id, payroll)
+            if source_payroll.id not in project_micro_catchments:
+                project_micro_catchments[source_payroll.id] = self._get_payroll_micro_catchment(
+                    source_payroll
+                )
+            project_micro_catchment = project_micro_catchments[source_payroll.id]
+            if project_micro_catchment:
+                contexts[benefit.id] = {"micro_catchment": project_micro_catchment}
+        fallback_benefits = [
+            benefit for benefit in benefits if benefit.id not in contexts
+        ]
+        if not fallback_benefits:
+            return benefits_by_code, contexts
 
         # A historical multi-project payroll has no single project catchment.
         # Preserve its legacy recipient-location behavior rather than inventing
@@ -1070,7 +1095,7 @@ class CsvReconciliationService:
         from location.models import Location, MicroCatchmentGVH
         locations = {
             benefit.individual.location_id: benefit.individual.location
-            for benefit in benefits if benefit.individual.location_id
+            for benefit in fallback_benefits if benefit.individual.location_id
         }
         while True:
             parent_ids = {
@@ -1085,7 +1110,7 @@ class CsvReconciliationService:
             locations.update(parents)
 
         gvh_by_benefit = {}
-        for benefit in benefits:
+        for benefit in fallback_benefits:
             location = locations.get(benefit.individual.location_id)
             while location and location.type != "W":
                 location = locations.get(location.parent_id)
@@ -1097,10 +1122,10 @@ class CsvReconciliationService:
             validity_to__isnull=True,
         ).select_related("micro_catchment").order_by("micro_catchment__name"):
             micro_catchments.setdefault(item.location_id, item.micro_catchment.name)
-        contexts = {
+        contexts.update({
             benefit.id: {"micro_catchment": micro_catchments.get(gvh_by_benefit[benefit.id])}
-            for benefit in benefits
-        }
+            for benefit in fallback_benefits
+        })
         return benefits_by_code, contexts
 
     @transaction.atomic
