@@ -525,6 +525,7 @@ class PayrollGQLTestCase(openIMISGraphQLTestCase):
         service = PayrollService(self.user)
 
         with patch("payroll.services.TaskService") as task_service:
+            task_service.return_value.create.return_value = {"success": True}
             consolidated = service.create_consolidated_payroll(
                 self.district.id, self.benefit_plan.id, [source.id],
             )
@@ -545,6 +546,32 @@ class PayrollGQLTestCase(openIMISGraphQLTestCase):
             service.create_consolidated_payroll(
                 self.district.id, self.benefit_plan.id, [second_source.id],
             )
+
+    def test_consolidated_creation_rolls_back_when_task_creation_fails(self):
+        source = self._create_consolidation_source("Task failure consolidation source")
+        service = PayrollService(self.user)
+        consolidated_count = Payroll.objects.filter(
+            payroll_type=Payroll.PayrollType.CONSOLIDATED,
+        ).count()
+
+        with patch("payroll.services.TaskService") as task_service:
+            task_service.return_value.create.return_value = {
+                "success": False,
+                "error": "Task creation failed",
+            }
+            with self.assertRaisesRegex(ValueError, "Task creation failed"):
+                service.create_consolidated_payroll(
+                    self.district.id, self.benefit_plan.id, [source.id],
+                )
+
+        self.assertFalse(ConsolidatedPayrollMember.objects.filter(
+            source_payroll=source,
+            is_deleted=False,
+        ).exists())
+        self.assertEqual(
+            Payroll.objects.filter(payroll_type=Payroll.PayrollType.CONSOLIDATED).count(),
+            consolidated_count,
+        )
 
     def test_rejecting_consolidated_payroll_preserves_shared_benefits_and_bills(self):
         source, consolidated, benefit = self._create_shared_consolidation_benefit()

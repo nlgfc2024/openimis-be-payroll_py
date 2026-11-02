@@ -196,7 +196,7 @@ class PayrollService(BaseService):
     def create_accept_payroll_task(self, payroll_id, obj_data):
         payroll_to_accept = Payroll.objects.get(id=payroll_id)
         data = {**obj_data, 'id': payroll_id}
-        TaskService(self.user).create({
+        task = TaskService(self.user).create({
             'source': 'payroll',
             'entity': payroll_to_accept,
             'status': Task.Status.RECEIVED,
@@ -204,6 +204,9 @@ class PayrollService(BaseService):
             'business_event': PayrollConfig.payroll_accept_event,
             'data': _get_std_task_data_payload(data)
         })
+        if not task.get("success", False):
+            raise ValueError(task.get("error") or "Unable to create payroll approval task")
+        return task
 
     @transaction.atomic
     def create_consolidated_payroll(self, district_id, benefit_plan_id, source_payroll_ids):
