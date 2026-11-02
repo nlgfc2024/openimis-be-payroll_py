@@ -9,7 +9,7 @@ from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError
 from django.db import transaction
 from simple_history.utils import bulk_create_with_history
-from django.db.models import Q, Sum
+from django.db.models import Count, Q, Sum
 from django.utils.translation import gettext as _
 
 from core import datetime
@@ -222,6 +222,22 @@ class PayrollService(BaseService):
         ).select_related("payment_plan", "payment_cycle", "payment_point"))
         if len(sources) != len(source_payroll_ids):
             raise ValidationError("Every selected payroll must still be approved and belong to the selected phase.")
+        duplicate_recipients = PayrollBenefitConsumption.objects.filter(
+            payroll_id__in=[source.id for source in sources],
+            is_deleted=False,
+            benefit__is_deleted=False,
+        ).values(
+            "benefit__individual_id",
+        ).annotate(
+            source_count=Count("payroll_id", distinct=True),
+        ).filter(
+            source_count__gt=1,
+        )
+        if duplicate_recipients.exists():
+            raise ValidationError(
+                "Selected payrolls contain benefits for the same recipient. "
+                "Remove overlapping source payrolls before consolidation."
+            )
         if ConsolidatedPayrollMember.objects.filter(
                 source_payroll_id__in=[source.id for source in sources],
                 is_deleted=False,
@@ -897,7 +913,7 @@ class CsvReconciliationService:
         )
         bulk_create_with_history(upload_rows, ReconciliationUploadRow, default_user=self.user, batch_size=1000)
 
-        if errors:
+        if errors and payroll.payroll_type == Payroll.PayrollType.CONSOLIDATED:
             upload.error = errors
             upload.status = CsvReconciliationUpload.Status.FAIL
             upload.json_ext = {"extra_info": self._upload_summary(upload)}
@@ -1134,7 +1150,7 @@ class CsvReconciliationService:
         upload = CsvReconciliationUpload.objects.select_for_update().get(id=upload.id)
         if upload.status != CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION:
             return
-        if upload.unmatched_records:
+        if upload.unmatched_records and payroll.payroll_type == Payroll.PayrollType.CONSOLIDATED:
             raise ValidationError(
                 "A reconciliation upload with unmatched rows cannot be applied."
             )
@@ -1179,7 +1195,11 @@ class CsvReconciliationService:
             benefit = locked_benefits.get(row.benefit_id)
             if benefit and benefit.status == BenefitConsumptionStatus.ACCEPTED:
                 self._reconcile_bc(pd.Series(row.submitted_data), benefit)
-        upload.status = CsvReconciliationUpload.Status.SUCCESS
+        upload.status = (
+            CsvReconciliationUpload.Status.PARTIAL_SUCCESS
+            if upload.unmatched_records
+            else CsvReconciliationUpload.Status.SUCCESS
+        )
         upload.save(username=self.user.login_name)
 
         # A payroll is fully reconciled only when this approved upload has no
@@ -1194,14 +1214,11 @@ class CsvReconciliationService:
                 and payroll.status != PayrollStatus.RECONCILED:
             payroll.status = PayrollStatus.RECONCILED
             payroll.save(username=self.user.login_name)
-        if payroll.payroll_type == Payroll.PayrollType.CONSOLIDATED:
-            for member in ConsolidatedPayrollMember.objects.filter(
-                    consolidated_payroll=payroll, is_deleted=False).select_related("source_payroll"):
-                if not PayrollBenefitConsumption.objects.filter(
-                        payroll=member.source_payroll, is_deleted=False).exclude(
-                            benefit__status=BenefitConsumptionStatus.RECONCILED).exists():
-                    member.source_payroll.status = PayrollStatus.RECONCILED
-                    member.source_payroll.save(username=self.user.login_name)
+        reconcile_consolidated_sources(
+            payroll,
+            self.user,
+            only_completed_sources=True,
+        )
 
     def download_upload_review(self, upload, contents):
         """Return the original CSV annotated with its saved validation result."""

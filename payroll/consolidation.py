@@ -1,8 +1,10 @@
 from django.apps import apps
+from django.db import transaction
 from django.db.models import Q
 
 from location.models import Location
 from payroll.models import (
+    BenefitConsumptionStatus,
     ConsolidatedPayrollMember,
     Payroll,
     PayrollBenefitConsumption,
@@ -158,3 +160,24 @@ def ensure_benefit_is_not_in_active_consolidation(benefit, action):
     ).distinct()
     for payroll in source_payrolls:
         ensure_payroll_is_not_consolidated_source(payroll, action)
+
+
+@transaction.atomic
+def reconcile_consolidated_sources(payroll, user, only_completed_sources=False):
+    """Mark consolidated source payrolls reconciled after their parent is reconciled."""
+    if payroll.payroll_type != Payroll.PayrollType.CONSOLIDATED:
+        return
+
+    for member in ConsolidatedPayrollMember.objects.filter(
+        consolidated_payroll=payroll,
+        is_deleted=False,
+        source_payroll__is_deleted=False,
+    ).select_related("source_payroll"):
+        source_payroll = member.source_payroll
+        if only_completed_sources and PayrollBenefitConsumption.objects.filter(
+            payroll=source_payroll,
+            is_deleted=False,
+        ).exclude(benefit__status=BenefitConsumptionStatus.RECONCILED).exists():
+            continue
+        source_payroll.status = PayrollStatus.RECONCILED
+        source_payroll.save(username=user.login_name)

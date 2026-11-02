@@ -52,6 +52,7 @@ def benefit_consumption_queryset(queryset):
             queryset=PayrollBenefitConsumption.objects.filter(
                 is_deleted=False,
                 payroll__is_deleted=False,
+                payroll__payroll_type=Payroll.PayrollType.STANDARD,
             ).select_related("payroll").order_by("-date_created"),
             to_attr="active_payroll_links",
         ),
@@ -172,6 +173,7 @@ class BenefitConsumptionGQLType(DjangoObjectType):
         payroll_links = getattr(self, "active_payroll_links", None)
         payroll_link = payroll_links[0] if payroll_links else self.payrollbenefitconsumption_set.filter(
             is_deleted=False, payroll__is_deleted=False,
+            payroll__payroll_type=Payroll.PayrollType.STANDARD,
         ).select_related("payroll").order_by("-date_created").first()
         project_ids = (
             (payroll_link.payroll.json_ext or {}).get("filter_criteria", {}).get("project_ids", [])

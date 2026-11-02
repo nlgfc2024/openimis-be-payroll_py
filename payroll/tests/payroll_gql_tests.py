@@ -547,6 +547,19 @@ class PayrollGQLTestCase(openIMISGraphQLTestCase):
                 self.district.id, self.benefit_plan.id, [second_source.id],
             )
 
+    def test_consolidated_creation_rejects_duplicate_recipients(self):
+        source_a = self._create_consolidation_source("Duplicate recipient source A")
+        source_b = self._create_consolidation_source("Duplicate recipient source B")
+        self._attach_benefit(source_a)
+        self._attach_benefit(source_b)
+
+        with self.assertRaisesRegex(ValidationError, "same recipient"):
+            PayrollService(self.user).create_consolidated_payroll(
+                self.district.id,
+                self.benefit_plan.id,
+                [source_a.id, source_b.id],
+            )
+
     def test_consolidated_creation_rolls_back_when_task_creation_fails(self):
         source = self._create_consolidation_source("Task failure consolidation source")
         service = PayrollService(self.user)

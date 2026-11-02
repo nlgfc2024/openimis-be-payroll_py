@@ -87,9 +87,15 @@ class StrategyOfPaymentInterface(object, metaclass=abc.ABCMeta):
         pass
 
     @classmethod
+    @transaction.atomic
     def change_status_of_payroll(cls, payroll, status, user):
         payroll.status = status
         payroll.save(username=user.login_name)
+        from payroll.models import PayrollStatus
+        from payroll.consolidation import reconcile_consolidated_sources
+
+        if status == PayrollStatus.RECONCILED:
+            reconcile_consolidated_sources(payroll, user)
 
     @classmethod
     @transaction.atomic
@@ -98,6 +104,7 @@ class StrategyOfPaymentInterface(object, metaclass=abc.ABCMeta):
             BenefitAttachment,
             BenefitConsumption,
             ConsolidatedPayrollMember,
+            CsvReconciliationUpload,
             Payroll,
             PayrollBenefitConsumption,
         )

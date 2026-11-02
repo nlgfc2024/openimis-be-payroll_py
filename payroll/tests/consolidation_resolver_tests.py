@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from django.test import SimpleTestCase
+from django.db.models.expressions import NegatedExpression
 
 from payroll.consolidation import payrolls_in_district
 from payroll.schema import Query
@@ -55,7 +56,7 @@ class ConsolidationResolverTests(SimpleTestCase):
             Query._consolidation_candidates("district-uuid")
 
         exclusion = payroll_filter.return_value.filter.call_args.args[0]
-        self.assertTrue(exclusion.negated)
+        self.assertIsInstance(exclusion, NegatedExpression)
 
     def test_payrolls_in_district_resolves_saved_location_uuids(self):
         district = SimpleNamespace(id=102, uuid="district-uuid", parent_id=None)
