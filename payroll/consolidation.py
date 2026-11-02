@@ -109,10 +109,10 @@ def payrolls_in_district(payrolls, district_id):
 
     if legacy_payroll_ids:
         beneficiary_district = (
-            Q(individual__location__id=district_id)
-            | Q(individual__location__parent__id=district_id)
-            | Q(individual__location__parent__parent__id=district_id)
-            | Q(individual__location__parent__parent__parent__id=district_id)
+            Q(benefit__individual__location__id=district_id)
+            | Q(benefit__individual__location__parent__id=district_id)
+            | Q(benefit__individual__location__parent__parent__id=district_id)
+            | Q(benefit__individual__location__parent__parent__parent__id=district_id)
         )
         matching_payroll_ids.update(
             PayrollBenefitConsumption.objects.filter(
