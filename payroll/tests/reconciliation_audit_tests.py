@@ -9,6 +9,7 @@ import pandas as pd
 from django.test import SimpleTestCase, TestCase
 from django.core.exceptions import ValidationError
 
+from tasks_management.models import Task
 from payroll.apps import PayrollConfig
 from payroll import signals
 from payroll.models import (
@@ -252,6 +253,42 @@ class ReconciliationAuditPolicyTests(SimpleTestCase):
         # The reconciliation completion signal uses this service to change a
         # checker task to FAILED when applying its upload raises an error.
         self.assertIsNotNone(signals.TaskService)
+
+    def test_completed_offline_reconciliation_rechecks_source_membership(self):
+        user = SimpleNamespace(id="user-id")
+        payroll = SimpleNamespace(payment_method="offline")
+        with patch("payroll.signals.bind_service_signal") as bind_service_signal:
+            signals.bind_service_signals()
+        handler = next(
+            call.args[1]
+            for call in bind_service_signal.call_args_list
+            if call.args[1].__name__ == "on_task_complete_payroll_reconcilation"
+        )
+
+        with (
+            patch("payroll.signals.User.objects.get", return_value=user),
+            patch("payroll.signals.Payroll.objects.get", return_value=payroll),
+            patch(
+                "payroll.signals.ensure_payroll_is_not_consolidated_source",
+                side_effect=ValidationError("Payroll belongs to an active consolidation"),
+            ) as ensure_not_consolidated,
+            patch("payroll.signals.PaymentMethodStorage.get_chosen_payment_method") as get_strategy,
+        ):
+            handler(result={
+                "success": True,
+                "data": {
+                    "user": {"id": user.id},
+                    "task": {
+                        "business_event": PayrollConfig.payroll_reconciliation_event,
+                        "status": Task.Status.COMPLETED,
+                        "entity_id": "payroll-id",
+                        "data": {},
+                    },
+                },
+            })
+
+        ensure_not_consolidated.assert_called_once_with(payroll, "reconcile")
+        get_strategy.assert_not_called()
 
 
 class ReconciliationPayrollStatusTests(TestCase):

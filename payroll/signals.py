@@ -50,6 +50,7 @@ def bind_service_signals():
 
     def on_task_complete_payroll_reconcilation(**kwargs):
         def reconcile_payroll(payroll, user):
+            ensure_payroll_is_not_consolidated_source(payroll, "reconcile")
             strategy = PaymentMethodStorage.get_chosen_payment_method(payroll.payment_method)
             if strategy:
                 strategy.reconcile_payroll(payroll, user)
