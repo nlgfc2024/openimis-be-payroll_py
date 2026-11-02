@@ -15,6 +15,7 @@ from payroll import signals
 from payroll.models import (
     BenefitConsumption,
     BenefitConsumptionStatus,
+    ConsolidatedPayrollMember,
     CsvReconciliationUpload,
     Payroll,
     PayrollBenefitConsumption,
@@ -387,6 +388,78 @@ class ReconciliationPayrollStatusTests(TestCase):
         upload.refresh_from_db()
         self.assertEqual(upload.status, CsvReconciliationUpload.Status.SUCCESS)
         self.assertEqual(payroll.status, PayrollStatus.APPROVE_FOR_PAYMENT)
+
+    def test_completed_source_reconciles_before_consolidated_payroll(self):
+        individual = Individual(**service_add_individual_payload)
+        individual.save(username=self.user.login_name)
+        source_a = Payroll(name="Completed source", status=PayrollStatus.APPROVE_FOR_PAYMENT)
+        source_a.save(username=self.user.login_name)
+        source_b = Payroll(name="Pending source", status=PayrollStatus.APPROVE_FOR_PAYMENT)
+        source_b.save(username=self.user.login_name)
+        consolidated_payroll = Payroll(
+            name="Consolidated reconciliation test",
+            status=PayrollStatus.APPROVE_FOR_PAYMENT,
+            payroll_type=Payroll.PayrollType.CONSOLIDATED,
+        )
+        consolidated_payroll.save(username=self.user.login_name)
+        ConsolidatedPayrollMember(
+            consolidated_payroll=consolidated_payroll,
+            source_payroll=source_a,
+        ).save(username=self.user.login_name)
+        ConsolidatedPayrollMember(
+            consolidated_payroll=consolidated_payroll,
+            source_payroll=source_b,
+        ).save(username=self.user.login_name)
+        benefit_a = BenefitConsumption(
+            individual=individual,
+            code="completed-source-code",
+            amount=Decimal("100"),
+            type="Cash Transfer",
+            status=BenefitConsumptionStatus.ACCEPTED,
+        )
+        benefit_a.save(username=self.user.login_name)
+        benefit_b = BenefitConsumption(
+            individual=individual,
+            code="pending-source-code",
+            amount=Decimal("100"),
+            type="Cash Transfer",
+            status=BenefitConsumptionStatus.ACCEPTED,
+        )
+        benefit_b.save(username=self.user.login_name)
+        for payroll, benefit in (
+            (source_a, benefit_a),
+            (source_b, benefit_b),
+            (consolidated_payroll, benefit_a),
+            (consolidated_payroll, benefit_b),
+        ):
+            PayrollBenefitConsumption(payroll=payroll, benefit=benefit).save(
+                username=self.user.login_name,
+            )
+        upload = CsvReconciliationUpload(
+            payroll=consolidated_payroll,
+            status=CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION,
+            total_records=1,
+            matched_records=1,
+            paid_records=1,
+        )
+        upload.save(username=self.user.login_name)
+        ReconciliationUploadRow(
+            upload=upload,
+            row_number=2,
+            benefit=benefit_a,
+            code=benefit_a.code,
+            submitted_data={"Paid": "Yes", "receipt": "source-a-receipt"},
+            status=ReconciliationUploadRow.Status.VALID,
+        ).save(username=self.user.login_name)
+
+        CsvReconciliationService(self.user).apply_upload(upload)
+
+        source_a.refresh_from_db()
+        source_b.refresh_from_db()
+        consolidated_payroll.refresh_from_db()
+        self.assertEqual(source_a.status, PayrollStatus.RECONCILED)
+        self.assertEqual(source_b.status, PayrollStatus.APPROVE_FOR_PAYMENT)
+        self.assertEqual(consolidated_payroll.status, PayrollStatus.APPROVE_FOR_PAYMENT)
 
     def test_invalid_upload_batch_does_not_apply_its_valid_rows(self):
         individual = Individual(**service_add_individual_payload)

@@ -1175,14 +1175,14 @@ class CsvReconciliationService:
                 and payroll.status != PayrollStatus.RECONCILED:
             payroll.status = PayrollStatus.RECONCILED
             payroll.save(username=self.user.login_name)
-            if payroll.payroll_type == Payroll.PayrollType.CONSOLIDATED:
-                for member in ConsolidatedPayrollMember.objects.filter(
-                        consolidated_payroll=payroll, is_deleted=False).select_related("source_payroll"):
-                    if not PayrollBenefitConsumption.objects.filter(
-                            payroll=member.source_payroll, is_deleted=False).exclude(
-                                benefit__status=BenefitConsumptionStatus.RECONCILED).exists():
-                        member.source_payroll.status = PayrollStatus.RECONCILED
-                        member.source_payroll.save(username=self.user.login_name)
+        if payroll.payroll_type == Payroll.PayrollType.CONSOLIDATED:
+            for member in ConsolidatedPayrollMember.objects.filter(
+                    consolidated_payroll=payroll, is_deleted=False).select_related("source_payroll"):
+                if not PayrollBenefitConsumption.objects.filter(
+                        payroll=member.source_payroll, is_deleted=False).exclude(
+                            benefit__status=BenefitConsumptionStatus.RECONCILED).exists():
+                    member.source_payroll.status = PayrollStatus.RECONCILED
+                    member.source_payroll.save(username=self.user.login_name)
 
     def download_upload_review(self, upload, contents):
         """Return the original CSV annotated with its saved validation result."""
