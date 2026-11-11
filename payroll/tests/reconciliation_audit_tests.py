@@ -196,6 +196,30 @@ class ReconciliationAuditPolicyTests(SimpleTestCase):
 
         self.assertEqual(exported.loc[0, "Micro Catchment"], "Source catchment")
 
+    def test_source_cannot_download_reconciliation_file_during_consolidation(self):
+        service = CsvReconciliationService(None)
+        source_payroll = SimpleNamespace(
+            id="source-id",
+            payroll_type=Payroll.PayrollType.STANDARD,
+        )
+
+        with (
+            patch.object(service, "_resolve_payroll", return_value=source_payroll),
+            patch(
+                "payroll.services.ensure_payroll_is_not_consolidated_source",
+                side_effect=ValidationError("active consolidation"),
+            ) as guard,
+            patch.object(service, "_get_benefit_consumption_qs") as benefits,
+        ):
+            with self.assertRaisesRegex(ValidationError, "active consolidation"):
+                service.download_reconciliation("source-id")
+
+        guard.assert_called_once_with(
+            source_payroll,
+            "download a reconciliation file for",
+        )
+        benefits.assert_not_called()
+
     def test_consolidated_upload_context_uses_source_payroll_micro_catchment(self):
         source_payroll = SimpleNamespace(id="source-id")
         consolidated_payroll = SimpleNamespace(
@@ -246,116 +270,6 @@ class ReconciliationAuditPolicyTests(SimpleTestCase):
                 CsvReconciliationService(None).apply_upload(upload)
 
         self.assertEqual(upload.status, CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION)
-
-    def test_standard_upload_applies_valid_rows_as_partial_success(self):
-        individual = Individual(**service_add_individual_payload)
-        individual.save(username=self.user.login_name)
-        payroll = Payroll(
-            name="Partial standard reconciliation test",
-            status=PayrollStatus.APPROVE_FOR_PAYMENT,
-        )
-        payroll.save(username=self.user.login_name)
-        benefit = BenefitConsumption(
-            individual=individual,
-            code="partial-standard-valid-code",
-            amount=Decimal("100"),
-            type="Cash Transfer",
-            status=BenefitConsumptionStatus.ACCEPTED,
-        )
-        benefit.save(username=self.user.login_name)
-        PayrollBenefitConsumption(payroll=payroll, benefit=benefit).save(
-            username=self.user.login_name,
-        )
-        upload = CsvReconciliationUpload(
-            payroll=payroll,
-            status=CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION,
-            total_records=2,
-            matched_records=1,
-            paid_records=1,
-            unmatched_records=1,
-        )
-        upload.save(username=self.user.login_name)
-        ReconciliationUploadRow(
-            upload=upload,
-            row_number=2,
-            benefit=benefit,
-            code=benefit.code,
-            submitted_data={"Paid": "Yes", "receipt": "valid-row-receipt"},
-            status=ReconciliationUploadRow.Status.VALID,
-        ).save(username=self.user.login_name)
-        ReconciliationUploadRow(
-            upload=upload,
-            row_number=3,
-            code="invalid-row-code",
-            mismatch_reasons=["national_id_mismatch"],
-            submitted_data={"Paid": "Yes", "receipt": "invalid-row-receipt"},
-            status=ReconciliationUploadRow.Status.INVALID,
-        ).save(username=self.user.login_name)
-        service = CsvReconciliationService(self.user)
-
-        with patch.object(service, "_reconcile_bc") as reconcile_benefit:
-            service.apply_upload(upload)
-
-        reconcile_benefit.assert_called_once()
-        upload.refresh_from_db()
-        payroll.refresh_from_db()
-        self.assertEqual(upload.status, CsvReconciliationUpload.Status.PARTIAL_SUCCESS)
-        self.assertEqual(payroll.status, PayrollStatus.APPROVE_FOR_PAYMENT)
-
-    def test_offline_consolidated_reconciliation_updates_source_status(self):
-        source = Payroll(
-            name="Offline reconciliation source",
-            status=PayrollStatus.APPROVE_FOR_PAYMENT,
-        )
-        source.save(username=self.user.login_name)
-        consolidated = Payroll(
-            name="Offline reconciliation parent",
-            status=PayrollStatus.APPROVE_FOR_PAYMENT,
-            payroll_type=Payroll.PayrollType.CONSOLIDATED,
-        )
-        consolidated.save(username=self.user.login_name)
-        ConsolidatedPayrollMember(
-            consolidated_payroll=consolidated,
-            source_payroll=source,
-        ).save(username=self.user.login_name)
-
-        from payroll.strategies.strategy_offline_payments import StrategyOfflinePayment
-
-        StrategyOfflinePayment.reconcile_payroll(consolidated, self.user)
-
-        source.refresh_from_db()
-        self.assertEqual(source.status, PayrollStatus.RECONCILED)
-
-    def test_gateway_consolidated_reconciliation_updates_source_status(self):
-        source = Payroll(
-            name="Gateway reconciliation source",
-            status=PayrollStatus.APPROVE_FOR_PAYMENT,
-        )
-        source.save(username=self.user.login_name)
-        consolidated = Payroll(
-            name="Gateway reconciliation parent",
-            status=PayrollStatus.APPROVE_FOR_PAYMENT,
-            payroll_type=Payroll.PayrollType.CONSOLIDATED,
-        )
-        consolidated.save(username=self.user.login_name)
-        ConsolidatedPayrollMember(
-            consolidated_payroll=consolidated,
-            source_payroll=source,
-        ).save(username=self.user.login_name)
-
-        from payroll.tasks import send_request_to_reconcile
-
-        with (
-            patch("payroll.tasks.StrategyOnlinePayment.initialize_payment_gateway"),
-            patch(
-                "payroll.tasks.StrategyOnlinePayment.get_benefits_attached_to_payroll",
-                return_value=[],
-            ),
-        ):
-            send_request_to_reconcile.run(str(consolidated.id), str(self.user.id))
-
-        source.refresh_from_db()
-        self.assertEqual(source.status, PayrollStatus.RECONCILED)
 
     def test_standard_upload_with_mismatches_creates_partial_review_task(self):
         payroll = SimpleNamespace(
@@ -531,6 +445,180 @@ class ReconciliationPayrollStatusTests(TestCase):
     def setUp(self):
         self.user = LogInHelper().get_or_create_user_api(username='recon-status-user')
 
+    def test_standard_upload_applies_valid_rows_as_partial_success(self):
+        individual = Individual(**service_add_individual_payload)
+        individual.save(username=self.user.login_name)
+        payroll = Payroll(
+            name="Partial standard reconciliation test",
+            status=PayrollStatus.APPROVE_FOR_PAYMENT,
+        )
+        payroll.save(username=self.user.login_name)
+        benefit = BenefitConsumption(
+            individual=individual,
+            code="partial-standard-valid-code",
+            amount=Decimal("100"),
+            type="Cash Transfer",
+            status=BenefitConsumptionStatus.ACCEPTED,
+        )
+        benefit.save(username=self.user.login_name)
+        PayrollBenefitConsumption(payroll=payroll, benefit=benefit).save(
+            username=self.user.login_name,
+        )
+        upload = CsvReconciliationUpload(
+            payroll=payroll,
+            status=CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION,
+            total_records=2,
+            matched_records=1,
+            paid_records=1,
+            unmatched_records=1,
+        )
+        upload.save(username=self.user.login_name)
+        ReconciliationUploadRow(
+            upload=upload,
+            row_number=2,
+            benefit=benefit,
+            code=benefit.code,
+            submitted_data={"Paid": "Yes", "receipt": "valid-row-receipt"},
+            status=ReconciliationUploadRow.Status.VALID,
+        ).save(username=self.user.login_name)
+        ReconciliationUploadRow(
+            upload=upload,
+            row_number=3,
+            code="invalid-row-code",
+            mismatch_reasons=["national_id_mismatch"],
+            submitted_data={"Paid": "Yes", "receipt": "invalid-row-receipt"},
+            status=ReconciliationUploadRow.Status.INVALID,
+        ).save(username=self.user.login_name)
+        service = CsvReconciliationService(self.user)
+
+        with patch.object(service, "_reconcile_bc") as reconcile_benefit:
+            service.apply_upload(upload)
+
+        reconcile_benefit.assert_called_once()
+        upload.refresh_from_db()
+        payroll.refresh_from_db()
+        self.assertEqual(upload.status, CsvReconciliationUpload.Status.PARTIAL_SUCCESS)
+        self.assertEqual(payroll.status, PayrollStatus.APPROVE_FOR_PAYMENT)
+
+    def test_offline_reconciliation_does_not_mark_sources_without_completed_benefits(self):
+        individual = Individual(**service_add_individual_payload)
+        individual.save(username=self.user.login_name)
+        source = Payroll(
+            name="Offline reconciliation source",
+            status=PayrollStatus.APPROVE_FOR_PAYMENT,
+        )
+        source.save(username=self.user.login_name)
+        consolidated = Payroll(
+            name="Offline reconciliation parent",
+            status=PayrollStatus.APPROVE_FOR_PAYMENT,
+            payroll_type=Payroll.PayrollType.CONSOLIDATED,
+        )
+        consolidated.save(username=self.user.login_name)
+        ConsolidatedPayrollMember(
+            consolidated_payroll=consolidated,
+            source_payroll=source,
+        ).save(username=self.user.login_name)
+        benefit = BenefitConsumption(
+            individual=individual,
+            code="offline-unreconciled-benefit",
+            amount=Decimal("100"),
+            type="Cash Transfer",
+            status=BenefitConsumptionStatus.APPROVE_FOR_PAYMENT,
+        )
+        benefit.save(username=self.user.login_name)
+        for payroll in (source, consolidated):
+            PayrollBenefitConsumption(payroll=payroll, benefit=benefit).save(
+                username=self.user.login_name,
+            )
+
+        from payroll.strategies.strategy_offline_payments import StrategyOfflinePayment
+
+        StrategyOfflinePayment.reconcile_payroll(consolidated, self.user)
+
+        source.refresh_from_db()
+        self.assertEqual(source.status, PayrollStatus.APPROVE_FOR_PAYMENT)
+
+    def test_gateway_reconciliation_marks_only_sources_with_completed_benefits(self):
+        individual = Individual(**service_add_individual_payload)
+        individual.save(username=self.user.login_name)
+        completed_source = Payroll(
+            name="Gateway completed source",
+            status=PayrollStatus.APPROVE_FOR_PAYMENT,
+        )
+        completed_source.save(username=self.user.login_name)
+        pending_source = Payroll(
+            name="Gateway pending source",
+            status=PayrollStatus.APPROVE_FOR_PAYMENT,
+        )
+        pending_source.save(username=self.user.login_name)
+        consolidated = Payroll(
+            name="Gateway reconciliation parent",
+            status=PayrollStatus.APPROVE_FOR_PAYMENT,
+            payroll_type=Payroll.PayrollType.CONSOLIDATED,
+        )
+        consolidated.save(username=self.user.login_name)
+        for source in (completed_source, pending_source):
+            ConsolidatedPayrollMember(
+                consolidated_payroll=consolidated,
+                source_payroll=source,
+            ).save(username=self.user.login_name)
+        completed_benefit = BenefitConsumption(
+            individual=individual,
+            code="gateway-completed-benefit",
+            amount=Decimal("100"),
+            type="Cash Transfer",
+            status=BenefitConsumptionStatus.APPROVE_FOR_PAYMENT,
+        )
+        completed_benefit.save(username=self.user.login_name)
+        pending_benefit = BenefitConsumption(
+            individual=individual,
+            code="gateway-pending-benefit",
+            amount=Decimal("100"),
+            type="Cash Transfer",
+            status=BenefitConsumptionStatus.APPROVE_FOR_PAYMENT,
+        )
+        pending_benefit.save(username=self.user.login_name)
+        for source, benefit in (
+            (completed_source, completed_benefit),
+            (pending_source, pending_benefit),
+            (consolidated, completed_benefit),
+            (consolidated, pending_benefit),
+        ):
+            PayrollBenefitConsumption(payroll=source, benefit=benefit).save(
+                username=self.user.login_name,
+            )
+
+        from payroll.tasks import send_request_to_reconcile
+
+        def mark_reconciled(benefits, user):
+            for benefit in benefits:
+                benefit.status = BenefitConsumptionStatus.RECONCILED
+                benefit.save(username=user.login_name)
+
+        with (
+            patch("payroll.tasks.StrategyOnlinePayment.initialize_payment_gateway"),
+            patch(
+                "payroll.tasks.StrategyOnlinePayment.get_benefits_attached_to_payroll",
+                return_value=[completed_benefit, pending_benefit],
+            ) as get_benefits,
+            patch("payroll.tasks.StrategyOnlinePayment.PAYMENT_GATEWAY") as gateway,
+            patch(
+                "payroll.tasks.StrategyOnlinePayment.reconcile_benefit_consumption",
+                side_effect=mark_reconciled,
+            ),
+        ):
+            gateway.reconcile.side_effect = [True, False]
+            send_request_to_reconcile.run(str(consolidated.id), str(self.user.id))
+
+        get_benefits.assert_called_once_with(
+            consolidated,
+            BenefitConsumptionStatus.APPROVE_FOR_PAYMENT,
+        )
+        completed_source.refresh_from_db()
+        pending_source.refresh_from_db()
+        self.assertEqual(completed_source.status, PayrollStatus.RECONCILED)
+        self.assertEqual(pending_source.status, PayrollStatus.APPROVE_FOR_PAYMENT)
+
     def test_approved_upload_with_only_unpaid_rows_does_not_reconcile_payroll(self):
         payroll = Payroll(name='Reconciliation status test', status=PayrollStatus.APPROVE_FOR_PAYMENT)
         payroll.save(username=self.user.login_name)
@@ -629,6 +717,17 @@ class ReconciliationPayrollStatusTests(TestCase):
         self.assertEqual(source_a.status, PayrollStatus.RECONCILED)
         self.assertEqual(source_b.status, PayrollStatus.APPROVE_FOR_PAYMENT)
         self.assertEqual(consolidated_payroll.status, PayrollStatus.APPROVE_FOR_PAYMENT)
+
+        StrategyOfPaymentInterface.change_status_of_payroll(
+            consolidated_payroll,
+            PayrollStatus.RECONCILED,
+            self.user,
+        )
+
+        source_a.refresh_from_db()
+        source_b.refresh_from_db()
+        self.assertEqual(source_a.status, PayrollStatus.RECONCILED)
+        self.assertEqual(source_b.status, PayrollStatus.APPROVE_FOR_PAYMENT)
 
     def test_invalid_upload_batch_does_not_apply_its_valid_rows(self):
         individual = Individual(**service_add_individual_payload)

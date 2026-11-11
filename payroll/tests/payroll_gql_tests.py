@@ -27,6 +27,7 @@ from payroll.models import (
 from payroll.consolidation import payrolls_in_district
 from payroll.services import PayrollService
 from payroll.strategies.strategy_of_payments_interface import StrategyOfPaymentInterface
+from tasks_management.models import Task
 from payroll.tests.data import gql_payroll_create, gql_payroll_query, gql_payroll_delete, \
     gql_payroll_create_no_json_ext
 from payroll.tests.helpers import PaymentPointHelper
@@ -468,10 +469,10 @@ class PayrollGQLTestCase(openIMISGraphQLTestCase):
         service = PayrollService(self.user)
         source = self._create_consolidation_source("Consolidation validation source")
         invalid_cases = [
-            (self.district.id, self.benefit_plan.id, []),
-            (self.district.id, uuid.uuid4(), [source.id]),
-            (self.district.id, self.benefit_plan.id, [uuid.uuid4()]),
-            (self.district.id, self.benefit_plan.id, [source.id, source.id]),
+            (self.district.uuid, self.benefit_plan.id, []),
+            (self.district.uuid, uuid.uuid4(), [source.id]),
+            (self.district.uuid, self.benefit_plan.id, [uuid.uuid4()]),
+            (self.district.uuid, self.benefit_plan.id, [source.id, source.id]),
         ]
         for district_id, phase_id, source_ids in invalid_cases:
             with self.subTest(source_ids=source_ids):
@@ -484,7 +485,7 @@ class PayrollGQLTestCase(openIMISGraphQLTestCase):
         )
         with self.assertRaises(ValidationError):
             service.create_consolidated_payroll(
-                self.district.id, self.benefit_plan.id, [pending_source.id],
+                self.district.uuid, self.benefit_plan.id, [pending_source.id],
             )
 
         wrong_district_source = self._create_consolidation_source(
@@ -493,7 +494,7 @@ class PayrollGQLTestCase(openIMISGraphQLTestCase):
         )
         with self.assertRaises(ValidationError):
             service.create_consolidated_payroll(
-                self.district.id, self.benefit_plan.id, [wrong_district_source.id],
+                self.district.uuid, self.benefit_plan.id, [wrong_district_source.id],
             )
 
         incompatible_source = self._create_consolidation_source(
@@ -502,7 +503,7 @@ class PayrollGQLTestCase(openIMISGraphQLTestCase):
         )
         with self.assertRaises(ValidationError):
             service.create_consolidated_payroll(
-                self.district.id,
+                self.district.uuid,
                 self.benefit_plan.id,
                 [source.id, incompatible_source.id],
             )
@@ -515,19 +516,20 @@ class PayrollGQLTestCase(openIMISGraphQLTestCase):
             with self.subTest(incompatible_field=field):
                 with self.assertRaises(ValidationError):
                     service.create_consolidated_payroll(
-                        self.district.id,
+                        self.district.uuid,
                         self.benefit_plan.id,
                         [source.id, incompatible_source.id],
                     )
 
     def test_consolidated_creation_blocks_duplicate_membership_and_creates_valid_payroll(self):
         source = self._create_consolidation_source("Consolidation source")
+        self._attach_benefit(source)
         service = PayrollService(self.user)
 
         with patch("payroll.services.TaskService") as task_service:
             task_service.return_value.create.return_value = {"success": True}
             consolidated = service.create_consolidated_payroll(
-                self.district.id, self.benefit_plan.id, [source.id],
+                self.district.uuid, self.benefit_plan.id, [source.id],
             )
         self.assertEqual(consolidated.payroll_type, Payroll.PayrollType.CONSOLIDATED)
         self.assertTrue(ConsolidatedPayrollMember.objects.filter(
@@ -538,13 +540,16 @@ class PayrollGQLTestCase(openIMISGraphQLTestCase):
         task_service.return_value.create.assert_called_once()
 
         second_source = self._create_consolidation_source("Duplicate membership source")
+        second_benefit = self._attach_benefit(second_source)
+        second_benefit.individual = self.individual_3
+        second_benefit.save(user=self.user)
         ConsolidatedPayrollMember(
             consolidated_payroll=consolidated,
             source_payroll=second_source,
         ).save(user=self.user)
         with self.assertRaises(ValidationError):
             service.create_consolidated_payroll(
-                self.district.id, self.benefit_plan.id, [second_source.id],
+                self.district.uuid, self.benefit_plan.id, [second_source.id],
             )
 
     def test_consolidated_creation_rejects_duplicate_recipients(self):
@@ -555,13 +560,106 @@ class PayrollGQLTestCase(openIMISGraphQLTestCase):
 
         with self.assertRaisesRegex(ValidationError, "same recipient"):
             PayrollService(self.user).create_consolidated_payroll(
-                self.district.id,
+                self.district.uuid,
                 self.benefit_plan.id,
                 [source_a.id, source_b.id],
             )
 
+    def test_consolidated_creation_rejects_recipients_in_prior_consolidations(self):
+        source_a = self._create_consolidation_source("Prior consolidation source")
+        source_b = self._create_consolidation_source("Second consolidation source")
+        self._attach_benefit(source_a)
+        self._attach_benefit(source_b)
+        service = PayrollService(self.user)
+
+        with patch("payroll.services.TaskService") as task_service:
+            task_service.return_value.create.return_value = {"success": True}
+            service.create_consolidated_payroll(
+                self.district.uuid,
+                self.benefit_plan.id,
+                [source_a.id],
+            )
+
+        with self.assertRaisesRegex(ValidationError, "already included"):
+            service.create_consolidated_payroll(
+                self.district.uuid,
+                self.benefit_plan.id,
+                [source_b.id],
+            )
+
+    def test_consolidated_creation_rejects_pending_source_tasks(self):
+        source = self._create_consolidation_source("Pending task consolidation source")
+        self._attach_benefit(source)
+        Task(
+            source="payroll_delete",
+            entity_type=ContentType.objects.get_for_model(Payroll),
+            entity_id=str(source.id),
+            status=Task.Status.RECEIVED,
+        ).save(user=self.user)
+
+        with self.assertRaisesRegex(ValidationError, "pending task"):
+            PayrollService(self.user).create_consolidated_payroll(
+                self.district.uuid,
+                self.benefit_plan.id,
+                [source.id],
+            )
+
+        with self.subTest(pending_task="benefit"):
+            source = self._create_consolidation_source("Pending benefit task source")
+            benefit = self._attach_benefit(source)
+            Task(
+                source="benefit_delete",
+                entity_type=ContentType.objects.get_for_model(BenefitConsumption),
+                entity_id=str(benefit.id),
+                status=Task.Status.RECEIVED,
+            ).save(user=self.user)
+            with self.assertRaisesRegex(ValidationError, "benefit with pending work"):
+                PayrollService(self.user).create_consolidated_payroll(
+                    self.district.uuid,
+                    self.benefit_plan.id,
+                    [source.id],
+                )
+
+    def test_consolidated_creation_rejects_pending_deletion_or_reconciled_benefits(self):
+        for status in (
+            BenefitConsumptionStatus.PENDING_DELETION,
+            BenefitConsumptionStatus.RECONCILED,
+        ):
+            with self.subTest(status=status):
+                source = self._create_consolidation_source(
+                    f"Ineligible benefit source {status}",
+                )
+                benefit = self._attach_benefit(source)
+                benefit.status = status
+                benefit.save(user=self.user)
+
+                with self.assertRaisesRegex(ValidationError, "pending deletion"):
+                    PayrollService(self.user).create_consolidated_payroll(
+                        self.district.uuid,
+                        self.benefit_plan.id,
+                        [source.id],
+                    )
+
+    def test_consolidated_creation_enforces_district_access(self):
+        source = self._create_consolidation_source("Unauthorized district source")
+        self._attach_benefit(source)
+
+        with patch("payroll.services.LocationManager") as location_manager:
+            location_manager.return_value.is_allowed.return_value = False
+            with self.assertRaisesRegex(ValidationError, "not allowed"):
+                PayrollService(self.user).create_consolidated_payroll(
+                    self.district.uuid,
+                    self.benefit_plan.id,
+                    [source.id],
+                )
+        location_manager.return_value.is_allowed.assert_called_once_with(
+            self.user,
+            [self.district.id],
+        )
+
     def test_consolidated_creation_rolls_back_when_task_creation_fails(self):
         source = self._create_consolidation_source("Task failure consolidation source")
+        self._attach_benefit(source)
         service = PayrollService(self.user)
         consolidated_count = Payroll.objects.filter(
             payroll_type=Payroll.PayrollType.CONSOLIDATED,
@@ -574,7 +672,7 @@ class PayrollGQLTestCase(openIMISGraphQLTestCase):
             }
             with self.assertRaisesRegex(ValueError, "Task creation failed"):
                 service.create_consolidated_payroll(
-                    self.district.id, self.benefit_plan.id, [source.id],
+                    self.district.uuid, self.benefit_plan.id, [source.id],
                 )
 
         self.assertFalse(ConsolidatedPayrollMember.objects.filter(

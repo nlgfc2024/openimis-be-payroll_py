@@ -21,242 +21,42 @@ class Migration(migrations.Migration):
         migrations.AddField(
             model_name='historicalpayroll',
             name='district',
-            field=models.ForeignKey(blank=True, db_constraint=False, null=True, on_delete=django.db.models.deletion.DO_NOTHING, related_name='+', to='location.location'),
+            field=models.ForeignKey(
+                blank=True,
+                db_constraint=False,
+                null=True,
+                on_delete=django.db.models.deletion.DO_NOTHING,
+                related_name='+',
+                to='location.location',
+            ),
         ),
         migrations.AddField(
             model_name='historicalpayroll',
             name='payroll_type',
-            field=models.CharField(choices=[('STANDARD', 'STANDARD'), ('CONSOLIDATED', 'CONSOLIDATED')], default='STANDARD', max_length=32),
+            field=models.CharField(
+                choices=[('STANDARD', 'STANDARD'), ('CONSOLIDATED', 'CONSOLIDATED')],
+                default='STANDARD',
+                max_length=32,
+            ),
         ),
         migrations.AddField(
             model_name='payroll',
             name='district',
-            field=models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.DO_NOTHING, to='location.location'),
+            field=models.ForeignKey(
+                blank=True,
+                null=True,
+                on_delete=django.db.models.deletion.DO_NOTHING,
+                to='location.location',
+            ),
         ),
         migrations.AddField(
             model_name='payroll',
             name='payroll_type',
-            field=models.CharField(choices=[('STANDARD', 'STANDARD'), ('CONSOLIDATED', 'CONSOLIDATED')], default='STANDARD', max_length=32),
-        ),
-        migrations.AlterField(
-            model_name='benefitattachment',
-            name='date_created',
-            field=models.DateTimeField(db_column='DateCreated', default=datetime.datetime.now, null=True),
-        ),
-        migrations.AlterField(
-            model_name='benefitattachment',
-            name='date_updated',
-            field=models.DateTimeField(db_column='DateUpdated', default=datetime.datetime.now, null=True),
-        ),
-        migrations.AlterField(
-            model_name='benefitattachment',
-            name='date_valid_from',
-            field=models.DateTimeField(db_column='DateValidFrom', default=datetime.datetime.now),
-        ),
-        migrations.AlterField(
-            model_name='benefitattachment',
-            name='date_valid_to',
-            field=models.DateTimeField(blank=True, db_column='DateValidTo', null=True),
-        ),
-        migrations.AlterField(
-            model_name='benefitconsumption',
-            name='date_created',
-            field=models.DateTimeField(db_column='DateCreated', default=datetime.datetime.now, null=True),
-        ),
-        migrations.AlterField(
-            model_name='benefitconsumption',
-            name='date_updated',
-            field=models.DateTimeField(db_column='DateUpdated', default=datetime.datetime.now, null=True),
-        ),
-        migrations.AlterField(
-            model_name='benefitconsumption',
-            name='date_valid_from',
-            field=models.DateTimeField(db_column='DateValidFrom', default=datetime.datetime.now),
-        ),
-        migrations.AlterField(
-            model_name='benefitconsumption',
-            name='date_valid_to',
-            field=models.DateTimeField(blank=True, db_column='DateValidTo', null=True),
-        ),
-        migrations.AlterField(
-            model_name='csvreconciliationupload',
-            name='date_created',
-            field=models.DateTimeField(db_column='DateCreated', default=datetime.datetime.now, null=True),
-        ),
-        migrations.AlterField(
-            model_name='csvreconciliationupload',
-            name='date_updated',
-            field=models.DateTimeField(db_column='DateUpdated', default=datetime.datetime.now, null=True),
-        ),
-        migrations.AlterField(
-            model_name='historicalbenefitattachment',
-            name='date_created',
-            field=models.DateTimeField(db_column='DateCreated', default=datetime.datetime.now, null=True),
-        ),
-        migrations.AlterField(
-            model_name='historicalbenefitattachment',
-            name='date_updated',
-            field=models.DateTimeField(db_column='DateUpdated', default=datetime.datetime.now, null=True),
-        ),
-        migrations.AlterField(
-            model_name='historicalbenefitattachment',
-            name='date_valid_from',
-            field=models.DateTimeField(db_column='DateValidFrom', default=datetime.datetime.now),
-        ),
-        migrations.AlterField(
-            model_name='historicalbenefitattachment',
-            name='date_valid_to',
-            field=models.DateTimeField(blank=True, db_column='DateValidTo', null=True),
-        ),
-        migrations.AlterField(
-            model_name='historicalbenefitconsumption',
-            name='date_created',
-            field=models.DateTimeField(db_column='DateCreated', default=datetime.datetime.now, null=True),
-        ),
-        migrations.AlterField(
-            model_name='historicalbenefitconsumption',
-            name='date_updated',
-            field=models.DateTimeField(db_column='DateUpdated', default=datetime.datetime.now, null=True),
-        ),
-        migrations.AlterField(
-            model_name='historicalbenefitconsumption',
-            name='date_valid_from',
-            field=models.DateTimeField(db_column='DateValidFrom', default=datetime.datetime.now),
-        ),
-        migrations.AlterField(
-            model_name='historicalbenefitconsumption',
-            name='date_valid_to',
-            field=models.DateTimeField(blank=True, db_column='DateValidTo', null=True),
-        ),
-        migrations.AlterField(
-            model_name='historicalcsvreconciliationupload',
-            name='date_created',
-            field=models.DateTimeField(db_column='DateCreated', default=datetime.datetime.now, null=True),
-        ),
-        migrations.AlterField(
-            model_name='historicalcsvreconciliationupload',
-            name='date_updated',
-            field=models.DateTimeField(db_column='DateUpdated', default=datetime.datetime.now, null=True),
-        ),
-        migrations.AlterField(
-            model_name='historicalpaymentadaptorhistory',
-            name='date_created',
-            field=models.DateTimeField(db_column='DateCreated', default=datetime.datetime.now, null=True),
-        ),
-        migrations.AlterField(
-            model_name='historicalpaymentadaptorhistory',
-            name='date_updated',
-            field=models.DateTimeField(db_column='DateUpdated', default=datetime.datetime.now, null=True),
-        ),
-        migrations.AlterField(
-            model_name='historicalpaymentpoint',
-            name='date_created',
-            field=models.DateTimeField(db_column='DateCreated', default=datetime.datetime.now, null=True),
-        ),
-        migrations.AlterField(
-            model_name='historicalpaymentpoint',
-            name='date_updated',
-            field=models.DateTimeField(db_column='DateUpdated', default=datetime.datetime.now, null=True),
-        ),
-        migrations.AlterField(
-            model_name='historicalpayroll',
-            name='date_created',
-            field=models.DateTimeField(db_column='DateCreated', default=datetime.datetime.now, null=True),
-        ),
-        migrations.AlterField(
-            model_name='historicalpayroll',
-            name='date_updated',
-            field=models.DateTimeField(db_column='DateUpdated', default=datetime.datetime.now, null=True),
-        ),
-        migrations.AlterField(
-            model_name='historicalpayroll',
-            name='date_valid_from',
-            field=models.DateTimeField(db_column='DateValidFrom', default=datetime.datetime.now),
-        ),
-        migrations.AlterField(
-            model_name='historicalpayroll',
-            name='date_valid_to',
-            field=models.DateTimeField(blank=True, db_column='DateValidTo', null=True),
-        ),
-        migrations.AlterField(
-            model_name='historicalpayrollbenefitconsumption',
-            name='date_created',
-            field=models.DateTimeField(db_column='DateCreated', default=datetime.datetime.now, null=True),
-        ),
-        migrations.AlterField(
-            model_name='historicalpayrollbenefitconsumption',
-            name='date_updated',
-            field=models.DateTimeField(db_column='DateUpdated', default=datetime.datetime.now, null=True),
-        ),
-        migrations.AlterField(
-            model_name='historicalpayrollbill',
-            name='date_created',
-            field=models.DateTimeField(db_column='DateCreated', default=datetime.datetime.now, null=True),
-        ),
-        migrations.AlterField(
-            model_name='historicalpayrollbill',
-            name='date_updated',
-            field=models.DateTimeField(db_column='DateUpdated', default=datetime.datetime.now, null=True),
-        ),
-        migrations.AlterField(
-            model_name='paymentadaptorhistory',
-            name='date_created',
-            field=models.DateTimeField(db_column='DateCreated', default=datetime.datetime.now, null=True),
-        ),
-        migrations.AlterField(
-            model_name='paymentadaptorhistory',
-            name='date_updated',
-            field=models.DateTimeField(db_column='DateUpdated', default=datetime.datetime.now, null=True),
-        ),
-        migrations.AlterField(
-            model_name='paymentpoint',
-            name='date_created',
-            field=models.DateTimeField(db_column='DateCreated', default=datetime.datetime.now, null=True),
-        ),
-        migrations.AlterField(
-            model_name='paymentpoint',
-            name='date_updated',
-            field=models.DateTimeField(db_column='DateUpdated', default=datetime.datetime.now, null=True),
-        ),
-        migrations.AlterField(
-            model_name='payroll',
-            name='date_created',
-            field=models.DateTimeField(db_column='DateCreated', default=datetime.datetime.now, null=True),
-        ),
-        migrations.AlterField(
-            model_name='payroll',
-            name='date_updated',
-            field=models.DateTimeField(db_column='DateUpdated', default=datetime.datetime.now, null=True),
-        ),
-        migrations.AlterField(
-            model_name='payroll',
-            name='date_valid_from',
-            field=models.DateTimeField(db_column='DateValidFrom', default=datetime.datetime.now),
-        ),
-        migrations.AlterField(
-            model_name='payroll',
-            name='date_valid_to',
-            field=models.DateTimeField(blank=True, db_column='DateValidTo', null=True),
-        ),
-        migrations.AlterField(
-            model_name='payrollbenefitconsumption',
-            name='date_created',
-            field=models.DateTimeField(db_column='DateCreated', default=datetime.datetime.now, null=True),
-        ),
-        migrations.AlterField(
-            model_name='payrollbenefitconsumption',
-            name='date_updated',
-            field=models.DateTimeField(db_column='DateUpdated', default=datetime.datetime.now, null=True),
-        ),
-        migrations.AlterField(
-            model_name='payrollbill',
-            name='date_created',
-            field=models.DateTimeField(db_column='DateCreated', default=datetime.datetime.now, null=True),
-        ),
-        migrations.AlterField(
-            model_name='payrollbill',
-            name='date_updated',
-            field=models.DateTimeField(db_column='DateUpdated', default=datetime.datetime.now, null=True),
+            field=models.CharField(
+                choices=[('STANDARD', 'STANDARD'), ('CONSOLIDATED', 'CONSOLIDATED')],
+                default='STANDARD',
+                max_length=32,
+            ),
         ),
         migrations.CreateModel(
             name='HistoricalConsolidatedPayrollMember',

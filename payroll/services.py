@@ -18,7 +18,7 @@ from core.models import InteractiveUser
 from core.services import BaseService
 from core.signals import register_service_signal
 from invoice.models import Bill, BillItem, PaymentInvoice, DetailPaymentInvoice
-from location.models import Location
+from location.models import Location, LocationManager
 from invoice.services import PaymentInvoiceService
 from payment_cycle.models import PaymentCycle
 from payroll.apps import PayrollConfig
@@ -26,6 +26,7 @@ from payroll.consolidation import (
     ensure_benefit_is_not_in_active_consolidation,
     ensure_payroll_is_not_consolidated_source,
     payrolls_in_district,
+    reconcile_consolidated_sources,
 )
 from payroll.models import (
     PaymentPoint,
@@ -213,7 +214,15 @@ class PayrollService(BaseService):
         """Create a parent payroll without cloning the source benefits."""
         if not source_payroll_ids:
             raise ValidationError("Select at least one approved payroll to consolidate.")
-        sources = list(Payroll.objects.select_for_update(of=("self",)).filter(
+        district = Location.objects.select_for_update().get(
+            uuid=district_id,
+            validity_to__isnull=True,
+        )
+        if not LocationManager().is_allowed(self.user, [district.id]):
+            raise ValidationError(
+                "You are not allowed to consolidate payrolls in this district."
+            )
+        sources = list(Payroll.objects.select_for_update().filter(
             id__in=source_payroll_ids,
             payment_plan__benefit_plan_id=benefit_plan_id,
             status=PayrollStatus.APPROVE_FOR_PAYMENT,
@@ -222,8 +231,69 @@ class PayrollService(BaseService):
         ).select_related("payment_plan", "payment_cycle", "payment_point"))
         if len(sources) != len(source_payroll_ids):
             raise ValidationError("Every selected payroll must still be approved and belong to the selected phase.")
+        eligible_source_ids = {
+            source.id for source in payrolls_in_district(sources, district.id)
+        }
+        if eligible_source_ids != {source.id for source in sources}:
+            raise ValidationError(
+                "Every selected payroll must belong to the selected district."
+            )
+        source_ids = [source.id for source in sources]
+        pending_source_tasks = Task.objects.filter(
+            entity_type=ContentType.objects.get_for_model(Payroll),
+            entity_id__in=[str(source_id) for source_id in source_ids],
+            status__in=[Task.Status.RECEIVED, Task.Status.ACCEPTED],
+            is_deleted=False,
+        )
+        if pending_source_tasks.exists():
+            raise ValidationError(
+                "A selected payroll has a pending task. Resolve its pending work before consolidation."
+            )
+        source_links = list(
+            PayrollBenefitConsumption.objects.filter(
+                payroll_id__in=source_ids,
+                is_deleted=False,
+            ).values_list("payroll_id", "benefit_id")
+        )
+        source_benefit_ids = {benefit_id for _, benefit_id in source_links}
+        pending_benefit_tasks = Task.objects.filter(
+            entity_type=ContentType.objects.get_for_model(BenefitConsumption),
+            entity_id__in=[str(benefit_id) for benefit_id in source_benefit_ids],
+            status__in=[Task.Status.RECEIVED, Task.Status.ACCEPTED],
+            is_deleted=False,
+        )
+        if pending_benefit_tasks.exists():
+            raise ValidationError(
+                "A selected payroll has a benefit with pending work. Resolve it before consolidation."
+            )
+        source_benefits = list(
+            BenefitConsumption.objects.select_for_update().filter(
+                id__in=source_benefit_ids,
+                is_deleted=False,
+            )
+        )
+        if (
+            len(source_benefits) != len(source_benefit_ids)
+            or any(
+                not any(linked_payroll_id == source.id for linked_payroll_id, _ in source_links)
+                for source in sources
+            )
+        ):
+            raise ValidationError(
+                "Every selected payroll must have active, non-deleted benefits."
+            )
+        if any(
+            benefit.status in (
+                BenefitConsumptionStatus.PENDING_DELETION,
+                BenefitConsumptionStatus.RECONCILED,
+            )
+            for benefit in source_benefits
+        ):
+            raise ValidationError(
+                "Selected payrolls cannot contain benefits pending deletion or already reconciled."
+            )
         duplicate_recipients = PayrollBenefitConsumption.objects.filter(
-            payroll_id__in=[source.id for source in sources],
+            payroll_id__in=source_ids,
             is_deleted=False,
             benefit__is_deleted=False,
         ).values(
@@ -238,8 +308,22 @@ class PayrollService(BaseService):
                 "Selected payrolls contain benefits for the same recipient. "
                 "Remove overlapping source payrolls before consolidation."
             )
+        if PayrollBenefitConsumption.objects.filter(
+            payroll__payroll_type=Payroll.PayrollType.CONSOLIDATED,
+            payroll__is_deleted=False,
+            is_deleted=False,
+            benefit__is_deleted=False,
+            benefit__individual_id__in={
+                benefit.individual_id for benefit in source_benefits
+            },
+            payroll__consolidation_members__source_payroll__is_deleted=False,
+            payroll__consolidation_members__is_deleted=False,
+        ).exclude(payroll__status=PayrollStatus.REJECTED).exists():
+            raise ValidationError(
+                "A selected recipient was already included in a consolidated payroll."
+            )
         if ConsolidatedPayrollMember.objects.filter(
-                source_payroll_id__in=[source.id for source in sources],
+                source_payroll_id__in=source_ids,
                 is_deleted=False,
                 consolidated_payroll__is_deleted=False,
         ).exclude(consolidated_payroll__status=PayrollStatus.REJECTED).exists():
@@ -248,14 +332,6 @@ class PayrollService(BaseService):
         if any((source.payment_method, source.payment_point_id, source.payment_cycle_id) !=
                (first.payment_method, first.payment_point_id, first.payment_cycle_id) for source in sources):
             raise ValidationError("Selected payrolls must use the same payment method, point, and cycle.")
-        district = Location.objects.select_for_update().get(uuid=district_id, validity_to__isnull=True)
-        eligible_source_ids = {
-            source.id for source in payrolls_in_district(sources, district.id)
-        }
-        if eligible_source_ids != {source.id for source in sources}:
-            raise ValidationError(
-                "Every selected payroll must belong to the selected district."
-            )
         phase = first.payment_plan.benefit_plan.name or first.payment_plan.benefit_plan.code
         name_base = f"{district.name}-{phase}-Consolidated Payroll"
         name_prefix = f"{name_base}-"
@@ -651,6 +727,7 @@ class CsvReconciliationService:
 
     def download_reconciliation(self, payroll_id) -> BytesIO:
         payroll = self._resolve_payroll(payroll_id)
+        ensure_payroll_is_not_consolidated_source(payroll, "download a reconciliation file for")
         bc_qs = self._get_benefit_consumption_qs(payroll)
         field_mapping = PayrollConfig.csv_reconciliation_field_mapping
         records = list(bc_qs.values(*field_mapping.keys()))
@@ -1214,11 +1291,7 @@ class CsvReconciliationService:
                 and payroll.status != PayrollStatus.RECONCILED:
             payroll.status = PayrollStatus.RECONCILED
             payroll.save(username=self.user.login_name)
-        reconcile_consolidated_sources(
-            payroll,
-            self.user,
-            only_completed_sources=True,
-        )
+        reconcile_consolidated_sources(payroll, self.user)
 
     def download_upload_review(self, upload, contents):
         """Return the original CSV annotated with its saved validation result."""
