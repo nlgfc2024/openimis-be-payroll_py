@@ -166,6 +166,19 @@ def ensure_payroll_is_not_consolidated_source(payroll, action):
             f"Cannot {action} a payroll while it belongs to an active "
             "consolidated payroll."
         )
+    reconciled_memberships = ConsolidatedPayrollMember.objects.filter(
+        source_payroll=payroll,
+        is_deleted=True,
+        consolidated_payroll__is_deleted=False,
+        consolidated_payroll__status=PayrollStatus.RECONCILED,
+    )
+    if action != "move benefits from" and reconciled_memberships.exists():
+        from django.core.exceptions import ValidationError
+
+        raise ValidationError(
+            f"Cannot {action} a payroll after its consolidated payroll "
+            "has been reconciled."
+        )
 
 
 def ensure_benefit_is_not_in_active_consolidation(benefit, action):
@@ -180,13 +193,7 @@ def ensure_benefit_is_not_in_active_consolidation(benefit, action):
 
 @transaction.atomic
 def reconcile_consolidated_sources(payroll, user):
-    """Mark consolidated source payrolls reconciled after their parent is reconciled.
-    
-    When a consolidated payroll is reconciled:
-    - Sources with all benefits reconciled are marked RECONCILED (ready for closure)
-    - Sources with unreconciled benefits remain in APPROVE_FOR_PAYMENT
-      (these follow the arrears workflow for partially paid benefits)
-    """
+    """Reconcile completed sources and release all sources when the parent closes."""
     if payroll.payroll_type != Payroll.PayrollType.CONSOLIDATED:
         return
 
@@ -201,14 +208,9 @@ def reconcile_consolidated_sources(payroll, user):
             is_deleted=False,
             benefit__is_deleted=False,
         ).exclude(benefit__status=BenefitConsumptionStatus.RECONCILED).exists()
-        
-        if not has_unreconciled_benefits:
-            # All benefits reconciled: close this source
+        if not has_unreconciled_benefits or payroll.status == PayrollStatus.RECONCILED:
             source_payroll.status = PayrollStatus.RECONCILED
             source_payroll.save(username=user.login_name)
-        else:
-            # Partially reconciled: source remains APPROVE_FOR_PAYMENT
-            # and follows the arrears workflow for unpaid benefits.
-            # This allows re-creation of new payrolls for these benefits
-            # during the arrears/recovery cycle (future work).
-            pass
+        if payroll.status == PayrollStatus.RECONCILED:
+            member.is_deleted = True
+            member.save(username=user.login_name)

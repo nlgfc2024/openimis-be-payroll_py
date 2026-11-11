@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pandas as pd
 
-from django.test import SimpleTestCase, TestCase
+from django.test import TestCase
 from django.core.exceptions import ValidationError
 
 from tasks_management.models import Task
@@ -17,13 +17,12 @@ from payroll.models import (
     BenefitConsumptionStatus,
     ConsolidatedPayrollMember,
     CsvReconciliationUpload,
-    ConsolidatedPayrollMember,
     Payroll,
     PayrollBenefitConsumption,
     PayrollStatus,
     ReconciliationUploadRow,
 )
-from payroll.services import CsvReconciliationService
+from payroll.services import CsvReconciliationService, PayrollService
 from payroll.strategies.strategy_of_payments_interface import StrategyOfPaymentInterface
 from payroll.gql_queries import BenefitConsumptionGQLType
 from core.test_helpers import LogInHelper
@@ -31,7 +30,7 @@ from individual.models import Individual
 from individual.tests.data import service_add_individual_payload
 
 
-class ReconciliationAuditPolicyTests(SimpleTestCase):
+class ReconciliationAuditPolicyTests(TestCase):
     """Fast unit coverage for the configurable audit policy and API summary."""
 
     def setUp(self):
@@ -443,7 +442,10 @@ class ReconciliationAuditPolicyTests(SimpleTestCase):
 
 class ReconciliationPayrollStatusTests(TestCase):
     def setUp(self):
-        self.user = LogInHelper().get_or_create_user_api(username='recon-status-user')
+        self.user = LogInHelper().get_or_create_user_api(
+            username='recon-status-user',
+            password='PayrollTestPassword1!',
+        )
 
     def test_standard_upload_applies_valid_rows_as_partial_success(self):
         individual = Individual(**service_add_individual_payload)
@@ -456,6 +458,7 @@ class ReconciliationPayrollStatusTests(TestCase):
         benefit = BenefitConsumption(
             individual=individual,
             code="partial-standard-valid-code",
+            date_due=date(2026, 1, 1),
             amount=Decimal("100"),
             type="Cash Transfer",
             status=BenefitConsumptionStatus.ACCEPTED,
@@ -500,7 +503,7 @@ class ReconciliationPayrollStatusTests(TestCase):
         self.assertEqual(upload.status, CsvReconciliationUpload.Status.PARTIAL_SUCCESS)
         self.assertEqual(payroll.status, PayrollStatus.APPROVE_FOR_PAYMENT)
 
-    def test_offline_reconciliation_does_not_mark_sources_without_completed_benefits(self):
+    def test_offline_reconciliation_releases_partially_paid_source_for_recovery(self):
         individual = Individual(**service_add_individual_payload)
         individual.save(username=self.user.login_name)
         source = Payroll(
@@ -521,13 +524,28 @@ class ReconciliationPayrollStatusTests(TestCase):
         benefit = BenefitConsumption(
             individual=individual,
             code="offline-unreconciled-benefit",
+            date_due=date(2026, 1, 1),
             amount=Decimal("100"),
             type="Cash Transfer",
             status=BenefitConsumptionStatus.APPROVE_FOR_PAYMENT,
         )
         benefit.save(username=self.user.login_name)
-        for payroll in (source, consolidated):
-            PayrollBenefitConsumption(payroll=payroll, benefit=benefit).save(
+        paid_benefit = BenefitConsumption(
+            individual=individual,
+            code="offline-reconciled-benefit",
+            date_due=date(2026, 1, 1),
+            amount=Decimal("100"),
+            type="Cash Transfer",
+            status=BenefitConsumptionStatus.RECONCILED,
+        )
+        paid_benefit.save(username=self.user.login_name)
+        for payroll, linked_benefit in (
+            (source, benefit),
+            (consolidated, benefit),
+            (source, paid_benefit),
+            (consolidated, paid_benefit),
+        ):
+            PayrollBenefitConsumption(payroll=payroll, benefit=linked_benefit).save(
                 username=self.user.login_name,
             )
 
@@ -536,9 +554,59 @@ class ReconciliationPayrollStatusTests(TestCase):
         StrategyOfflinePayment.reconcile_payroll(consolidated, self.user)
 
         source.refresh_from_db()
-        self.assertEqual(source.status, PayrollStatus.APPROVE_FOR_PAYMENT)
+        self.assertEqual(source.status, PayrollStatus.RECONCILED)
+        member = ConsolidatedPayrollMember.objects.get(
+            consolidated_payroll=consolidated,
+            source_payroll=source,
+        )
+        self.assertTrue(member.is_deleted)
+        self.assertTrue(
+            ConsolidatedPayrollMember.objects.filter(
+                pk=member.pk,
+                consolidated_payroll=consolidated,
+            ).exists(),
+        )
 
-    def test_gateway_reconciliation_marks_only_sources_with_completed_benefits(self):
+        destination = Payroll(
+            name="Unpaid benefit recovery",
+            status=PayrollStatus.PENDING_APPROVAL,
+        )
+        destination.save(username=self.user.login_name)
+        PayrollService(self.user)._move_benefit_consumptions(destination, source.id)
+
+        self.assertFalse(PayrollBenefitConsumption.objects.filter(
+            payroll=source,
+            benefit=benefit,
+            is_deleted=False,
+        ).exists())
+        self.assertTrue(PayrollBenefitConsumption.objects.filter(
+            payroll=consolidated,
+            benefit=benefit,
+            is_deleted=False,
+        ).exists())
+        self.assertTrue(PayrollBenefitConsumption.objects.filter(
+            payroll=destination,
+            benefit=benefit,
+            is_deleted=False,
+        ).exists())
+        self.assertTrue(PayrollBenefitConsumption.objects.filter(
+            payroll=source,
+            benefit=paid_benefit,
+            is_deleted=False,
+        ).exists())
+        self.assertFalse(PayrollBenefitConsumption.objects.filter(
+            payroll=destination,
+            benefit=paid_benefit,
+            is_deleted=False,
+        ).exists())
+        with self.assertRaises(ValidationError):
+            PayrollService(self.user).delete({"id": source.id})
+        benefit.refresh_from_db()
+        self.assertEqual(benefit.status, BenefitConsumptionStatus.ACCEPTED)
+        paid_benefit.refresh_from_db()
+        self.assertEqual(paid_benefit.status, BenefitConsumptionStatus.RECONCILED)
+
+    def test_gateway_reconciliation_releases_all_sources_after_parent_completion(self):
         individual = Individual(**service_add_individual_payload)
         individual.save(username=self.user.login_name)
         completed_source = Payroll(
@@ -565,6 +633,7 @@ class ReconciliationPayrollStatusTests(TestCase):
         completed_benefit = BenefitConsumption(
             individual=individual,
             code="gateway-completed-benefit",
+            date_due=date(2026, 1, 1),
             amount=Decimal("100"),
             type="Cash Transfer",
             status=BenefitConsumptionStatus.APPROVE_FOR_PAYMENT,
@@ -573,6 +642,7 @@ class ReconciliationPayrollStatusTests(TestCase):
         pending_benefit = BenefitConsumption(
             individual=individual,
             code="gateway-pending-benefit",
+            date_due=date(2026, 1, 1),
             amount=Decimal("100"),
             type="Cash Transfer",
             status=BenefitConsumptionStatus.APPROVE_FOR_PAYMENT,
@@ -617,7 +687,12 @@ class ReconciliationPayrollStatusTests(TestCase):
         completed_source.refresh_from_db()
         pending_source.refresh_from_db()
         self.assertEqual(completed_source.status, PayrollStatus.RECONCILED)
-        self.assertEqual(pending_source.status, PayrollStatus.APPROVE_FOR_PAYMENT)
+        self.assertEqual(pending_source.status, PayrollStatus.RECONCILED)
+        self.assertFalse(ConsolidatedPayrollMember.objects.filter(
+            consolidated_payroll=consolidated,
+            source_payroll__in=[completed_source, pending_source],
+            is_deleted=False,
+        ).exists())
 
     def test_approved_upload_with_only_unpaid_rows_does_not_reconcile_payroll(self):
         payroll = Payroll(name='Reconciliation status test', status=PayrollStatus.APPROVE_FOR_PAYMENT)
@@ -670,6 +745,7 @@ class ReconciliationPayrollStatusTests(TestCase):
         benefit_a = BenefitConsumption(
             individual=individual,
             code="completed-source-code",
+            date_due=date(2026, 1, 1),
             amount=Decimal("100"),
             type="Cash Transfer",
             status=BenefitConsumptionStatus.ACCEPTED,
@@ -678,6 +754,7 @@ class ReconciliationPayrollStatusTests(TestCase):
         benefit_b = BenefitConsumption(
             individual=individual,
             code="pending-source-code",
+            date_due=date(2026, 1, 1),
             amount=Decimal("100"),
             type="Cash Transfer",
             status=BenefitConsumptionStatus.ACCEPTED,
@@ -727,7 +804,7 @@ class ReconciliationPayrollStatusTests(TestCase):
         source_a.refresh_from_db()
         source_b.refresh_from_db()
         self.assertEqual(source_a.status, PayrollStatus.RECONCILED)
-        self.assertEqual(source_b.status, PayrollStatus.APPROVE_FOR_PAYMENT)
+        self.assertEqual(source_b.status, PayrollStatus.RECONCILED)
 
     def test_invalid_upload_batch_does_not_apply_its_valid_rows(self):
         individual = Individual(**service_add_individual_payload)
@@ -741,6 +818,7 @@ class ReconciliationPayrollStatusTests(TestCase):
         benefit = BenefitConsumption(
             individual=individual,
             code="all-or-nothing-valid-code",
+            date_due=date(2026, 1, 1),
             amount=Decimal("100"),
             type="Cash Transfer",
             status=BenefitConsumptionStatus.ACCEPTED,
@@ -801,7 +879,13 @@ class ReconciliationPayrollStatusTests(TestCase):
             consolidated_payroll=consolidated,
             source_payroll=source,
         ).save(username=self.user.login_name)
-        benefit = BenefitConsumption(individual=individual, code="released-upload-benefit")
+        benefit = BenefitConsumption(
+            individual=individual,
+            code="released-upload-benefit",
+            date_due=date(2026, 1, 1),
+            amount=Decimal("100"),
+            type="Cash Transfer",
+        )
         benefit.save(username=self.user.login_name)
         PayrollBenefitConsumption(payroll=source, benefit=benefit).save(username=self.user.login_name)
         PayrollBenefitConsumption(payroll=consolidated, benefit=benefit).save(username=self.user.login_name)
@@ -831,6 +915,9 @@ class ReconciliationPayrollStatusTests(TestCase):
         benefit = BenefitConsumption(
             individual=individual,
             code="rejected-consolidation-benefit",
+            date_due=date(2026, 1, 1),
+            amount=Decimal("100"),
+            type="Cash Transfer",
             status=BenefitConsumptionStatus.ACCEPTED,
         )
         benefit.save(username=self.user.login_name)
@@ -874,6 +961,9 @@ class ReconciliationPayrollStatusTests(TestCase):
         benefit = BenefitConsumption(
             individual=individual,
             code="reassigned-consolidation-benefit",
+            date_due=date(2026, 1, 1),
+            amount=Decimal("100"),
+            type="Cash Transfer",
             status=BenefitConsumptionStatus.ACCEPTED,
         )
         benefit.save(username=self.user.login_name)

@@ -357,8 +357,13 @@ The following features are intentionally deferred and planned for follow-up work
 2. **Bank name and account details**: To be collected through the planned KYC upload feature once KYC details can be uploaded to the system.
 3. **Cash-out fee handling**: Logic for calculating and applying cash-out fees in consolidated payrolls.
 4. **Consolidated wagesheet summary**: Summary reporting for consolidated payroll transactions.
-5. **Arrears processing**: Handling of partially paid sources and arrears for unpaid benefits.
-6. **Linking payments with grievances**: Flagging payment statuses as partially paid, fully paid, or not paid, and linking to grievance workflows.
+5. **Linking payments with grievances**: Flagging payment statuses as partially paid, fully paid, or not paid, and linking to grievance workflows.
+
+After a consolidated payroll is reconciled, its source payrolls are marked
+reconciled and their active membership is released while retaining the audit
+record. Any benefits still awaiting payment remain eligible for the existing
+unpaid-invoice recovery flow; already reconciled benefits are not moved into
+the recovery payroll.
 
 ## Testing
 
@@ -366,9 +371,11 @@ The following features are intentionally deferred and planned for follow-up work
 
 To run the payroll test suite, use Django's test runner:
 
+From the openIMIS project directory, run the payroll tests with the project's
+virtual environment:
+
 ```bash
-cd openimis-be_py/openIMIS
-python3 manage.py test payroll --verbosity=2
+../.venv/bin/python manage.py test payroll --verbosity=2
 ```
 
 ### Test Coverage
@@ -387,16 +394,11 @@ Tests require a complete test database schema including:
 - Payroll-specific tables
 - Related social protection tables (benefit plans, projects, etc.)
 
-Initialize the test database by running the schema script:
-
-```bash
-# For PostgreSQL
-psql -U postgres < openimis-be_py/openIMIS/init_test_db_pg.sql
-
-# For SQLite (default)
-cd openimis-be_py/openIMIS
-python3 manage.py migrate
-```
+The test database must include the legacy openIMIS schema, including
+`tblUsers`, before payroll migrations run. Use the deployment's supported
+database bootstrap for a disposable test database; do not run the suite against
+an incomplete or shared database. The checked-in `init_test_db_pg.sql` is empty
+and does not initialize this schema.
 
 ### PostgreSQL Compatibility Note
 

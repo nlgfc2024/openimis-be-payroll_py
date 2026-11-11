@@ -1,6 +1,6 @@
 import json
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from unittest.mock import patch
 
@@ -39,7 +39,7 @@ from social_protection.models import BenefitPlan, Beneficiary, BeneficiaryStatus
 from project_social_protection.models import BeneficiaryProjectEnrollment, ProjectStatus
 from social_protection.tests.data import service_add_payload
 from project_social_protection.tests.test_helpers import create_project
-from location.test_helpers import create_basic_test_locations
+from location.test_helpers import assign_user_districts, create_basic_test_locations
 
 
 class PayrollGQLTestCase(openIMISGraphQLTestCase):
@@ -69,8 +69,16 @@ class PayrollGQLTestCase(openIMISGraphQLTestCase):
         unauthorized_perms = []  # No permissions for unauthorized user
         cls.unauthorized_role = create_test_role(perm_names=unauthorized_perms, name="PayrollUnauthorizedRole")
 
-        cls.user = LogInHelper().get_or_create_user_api(username='username_authorized', roles=[cls.authorized_role.id])
-        cls.user_unauthorized = LogInHelper().get_or_create_user_api(username='username_unauthorized', roles=[cls.unauthorized_role.id])
+        cls.user = LogInHelper().get_or_create_user_api(
+            username='username_authorized',
+            roles=[cls.authorized_role.id],
+            password='PayrollTestPassword1!',
+        )
+        cls.user_unauthorized = LogInHelper().get_or_create_user_api(
+            username='username_unauthorized',
+            roles=[cls.unauthorized_role.id],
+            password='PayrollTestPassword1!',
+        )
         gql_schema = Schema(
             query=Query,
             mutation=Mutation
@@ -87,6 +95,7 @@ class PayrollGQLTestCase(openIMISGraphQLTestCase):
 
         cls.region = create_test_location("R", custom_props={"code": "REG-PAYROLL-01"})
         cls.district = create_test_location("D", custom_props={"code": "DIST-PAYROLL-01", "parent": cls.region})
+        assign_user_districts(cls.user, ["DIST-PAYROLL-01"])
         cls.ward = create_test_location("W", custom_props={"code": "WARD-PAYROLL-01", "parent": cls.district})
         cls.village = create_test_location("V", custom_props={"code": "VILL-PAYROLL-01", "parent": cls.ward})
         cls.other_location = create_test_location("V", custom_props={"code": "VILL-OTHER-01"})
@@ -850,6 +859,7 @@ class PayrollGQLTestCase(openIMISGraphQLTestCase):
         benefit = BenefitConsumption(
             individual=self.individual_2,
             code=str(uuid.uuid4()),
+            date_due=date(2026, 1, 1),
             amount=Decimal("100"),
             type="Cash Transfer",
             status=BenefitConsumptionStatus.ACCEPTED,
@@ -934,7 +944,7 @@ class PayrollGQLTestCase(openIMISGraphQLTestCase):
         individual = Individual(**object_data)
         individual.json_ext = {"able_bodied": able_bodied}
         individual.save(username=cls.user.username)
-        group = Group(code=str(uuid.uuid4()))
+        group = Group(code=str(uuid.uuid4()), location=location)
         group.save(username=cls.user.username)
         GroupIndividual(
             group=group,
