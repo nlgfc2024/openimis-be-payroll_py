@@ -228,7 +228,22 @@ class PayrollService(BaseService):
             status=PayrollStatus.APPROVE_FOR_PAYMENT,
             payroll_type=Payroll.PayrollType.STANDARD,
             is_deleted=False,
-        ).select_related("payment_plan", "payment_cycle", "payment_point"))
+        ))
+        # Load related objects separately after locking to avoid "FOR UPDATE cannot be 
+        # applied to the nullable side of an outer join" error on PostgreSQL.
+        # Fetch payment plans, cycles, and points for all sources in bulk.
+        payment_plan_ids = {s.payment_plan_id for s in sources if s.payment_plan_id}
+        payment_cycle_ids = {s.payment_cycle_id for s in sources if s.payment_cycle_id}
+        payment_point_ids = {s.payment_point_id for s in sources if s.payment_point_id}
+        
+        payment_plans = {p.id: p for p in PaymentPlan.objects.filter(id__in=payment_plan_ids)}
+        payment_cycles = {c.id: c for c in PaymentCycle.objects.filter(id__in=payment_cycle_ids)}
+        payment_points = {pt.id: pt for pt in PaymentPoint.objects.filter(id__in=payment_point_ids)}
+        
+        for source in sources:
+            source.payment_plan = payment_plans.get(source.payment_plan_id)
+            source.payment_cycle = payment_cycles.get(source.payment_cycle_id)
+            source.payment_point = payment_points.get(source.payment_point_id)
         if len(sources) != len(source_payroll_ids):
             raise ValidationError("Every selected payroll must still be approved and belong to the selected phase.")
         eligible_source_ids = {

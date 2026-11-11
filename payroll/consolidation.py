@@ -180,7 +180,13 @@ def ensure_benefit_is_not_in_active_consolidation(benefit, action):
 
 @transaction.atomic
 def reconcile_consolidated_sources(payroll, user):
-    """Mark consolidated source payrolls reconciled after their parent is reconciled."""
+    """Mark consolidated source payrolls reconciled after their parent is reconciled.
+    
+    When a consolidated payroll is reconciled:
+    - Sources with all benefits reconciled are marked RECONCILED (ready for closure)
+    - Sources with unreconciled benefits remain in APPROVE_FOR_PAYMENT
+      (these follow the arrears workflow for partially paid benefits)
+    """
     if payroll.payroll_type != Payroll.PayrollType.CONSOLIDATED:
         return
 
@@ -190,11 +196,19 @@ def reconcile_consolidated_sources(payroll, user):
         source_payroll__is_deleted=False,
     ).select_related("source_payroll"):
         source_payroll = member.source_payroll
-        if PayrollBenefitConsumption.objects.filter(
+        has_unreconciled_benefits = PayrollBenefitConsumption.objects.filter(
             payroll=source_payroll,
             is_deleted=False,
             benefit__is_deleted=False,
-        ).exclude(benefit__status=BenefitConsumptionStatus.RECONCILED).exists():
-            continue
-        source_payroll.status = PayrollStatus.RECONCILED
-        source_payroll.save(username=user.login_name)
+        ).exclude(benefit__status=BenefitConsumptionStatus.RECONCILED).exists()
+        
+        if not has_unreconciled_benefits:
+            # All benefits reconciled: close this source
+            source_payroll.status = PayrollStatus.RECONCILED
+            source_payroll.save(username=user.login_name)
+        else:
+            # Partially reconciled: source remains APPROVE_FOR_PAYMENT
+            # and follows the arrears workflow for unpaid benefits.
+            # This allows re-creation of new payrolls for these benefits
+            # during the arrears/recovery cycle (future work).
+            pass
