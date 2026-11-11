@@ -359,3 +359,48 @@ The following features are intentionally deferred and planned for follow-up work
 4. **Consolidated wagesheet summary**: Summary reporting for consolidated payroll transactions.
 5. **Arrears processing**: Handling of partially paid sources and arrears for unpaid benefits.
 6. **Linking payments with grievances**: Flagging payment statuses as partially paid, fully paid, or not paid, and linking to grievance workflows.
+
+## Testing
+
+### Running Tests
+
+To run the payroll test suite, use Django's test runner:
+
+```bash
+cd openimis-be_py/openIMIS
+python3 manage.py test payroll --verbosity=2
+```
+
+### Test Coverage
+
+The following tests are included:
+
+- **consolidation_resolver_tests.py** - Tests for consolidation candidate resolution and phase eligibility
+- **reconciliation_audit_tests.py** - Tests for reconciliation upload validation, audit policies, and payroll status updates
+- **payroll_gql_tests.py** - GraphQL API tests for payroll operations
+- **Other tests** - GQL tests for payment points, benefit consumption, and payment strategies
+
+### Database Requirements
+
+Tests require a complete test database schema including:
+- All core openIMIS tables (tblUsers, locations, etc.)
+- Payroll-specific tables
+- Related social protection tables (benefit plans, projects, etc.)
+
+Initialize the test database by running the schema script:
+
+```bash
+# For PostgreSQL
+psql -U postgres < openimis-be_py/openIMIS/init_test_db_pg.sql
+
+# For SQLite (default)
+cd openimis-be_py/openIMIS
+python3 manage.py migrate
+```
+
+### PostgreSQL Compatibility Note
+
+The payroll service includes fixes for PostgreSQL compatibility:
+- Locked queries for consolidation creation no longer use select_related() on nullable FKs
+- Related objects (payment_plan, payment_cycle, payment_point) are loaded in bulk after locking
+- This avoids "FOR UPDATE cannot be applied to outer join" errors on PostgreSQL
