@@ -348,3 +348,14 @@ When the `payment_method` of a Payroll is set to `StrategyOfflinePayment`, the c
    - Unpaid payroll invoices can be recreated during the re-creation of payroll in the reconciled payroll section.
    - The unpaid invoices will be included in the new payroll.
    - Use the `Create Payroll from Unpaid Invoices` button available when you go to `Legal and Finance -> Reconciled Payrolls -> View Reconciled Payroll -> Create Payment from Failed Invoice`.
+
+## Consolidated Payroll - Deferred Scope
+
+The following features are intentionally deferred and planned for follow-up work:
+
+1. **Two-stage approval workflow**: District-level approval (DPD/Director) followed by national-level approval (EPS/National) with reject-back capability.
+2. **Bank name and account details**: To be collected through the planned KYC upload feature once KYC details can be uploaded to the system.
+3. **Cash-out fee handling**: Logic for calculating and applying cash-out fees in consolidated payrolls.
+4. **Consolidated wagesheet summary**: Summary reporting for consolidated payroll transactions.
+5. **Arrears processing**: Handling of partially paid sources and arrears for unpaid benefits.
+6. **Linking payments with grievances**: Flagging payment statuses as partially paid, fully paid, or not paid, and linking to grievance workflows.
