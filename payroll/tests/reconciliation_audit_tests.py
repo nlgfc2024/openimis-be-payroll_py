@@ -503,7 +503,7 @@ class ReconciliationPayrollStatusTests(TestCase):
         self.assertEqual(upload.status, CsvReconciliationUpload.Status.PARTIAL_SUCCESS)
         self.assertEqual(payroll.status, PayrollStatus.APPROVE_FOR_PAYMENT)
 
-    def test_offline_reconciliation_releases_partially_paid_source_for_recovery(self):
+    def test_offline_reconciliation_keeps_incomplete_source_open_for_recovery(self):
         individual = Individual(**service_add_individual_payload)
         individual.save(username=self.user.login_name)
         source = Payroll(
@@ -554,7 +554,7 @@ class ReconciliationPayrollStatusTests(TestCase):
         StrategyOfflinePayment.reconcile_payroll(consolidated, self.user)
 
         source.refresh_from_db()
-        self.assertEqual(source.status, PayrollStatus.RECONCILED)
+        self.assertEqual(source.status, PayrollStatus.APPROVE_FOR_PAYMENT)
         member = ConsolidatedPayrollMember.objects.get(
             consolidated_payroll=consolidated,
             source_payroll=source,
@@ -606,7 +606,7 @@ class ReconciliationPayrollStatusTests(TestCase):
         paid_benefit.refresh_from_db()
         self.assertEqual(paid_benefit.status, BenefitConsumptionStatus.RECONCILED)
 
-    def test_gateway_reconciliation_releases_all_sources_after_parent_completion(self):
+    def test_gateway_reconciliation_keeps_incomplete_sources_open(self):
         individual = Individual(**service_add_individual_payload)
         individual.save(username=self.user.login_name)
         completed_source = Payroll(
@@ -687,7 +687,7 @@ class ReconciliationPayrollStatusTests(TestCase):
         completed_source.refresh_from_db()
         pending_source.refresh_from_db()
         self.assertEqual(completed_source.status, PayrollStatus.RECONCILED)
-        self.assertEqual(pending_source.status, PayrollStatus.RECONCILED)
+        self.assertEqual(pending_source.status, PayrollStatus.APPROVE_FOR_PAYMENT)
         self.assertFalse(ConsolidatedPayrollMember.objects.filter(
             consolidated_payroll=consolidated,
             source_payroll__in=[completed_source, pending_source],
@@ -804,7 +804,7 @@ class ReconciliationPayrollStatusTests(TestCase):
         source_a.refresh_from_db()
         source_b.refresh_from_db()
         self.assertEqual(source_a.status, PayrollStatus.RECONCILED)
-        self.assertEqual(source_b.status, PayrollStatus.RECONCILED)
+        self.assertEqual(source_b.status, PayrollStatus.APPROVE_FOR_PAYMENT)
 
     def test_invalid_upload_batch_does_not_apply_its_valid_rows(self):
         individual = Individual(**service_add_individual_payload)

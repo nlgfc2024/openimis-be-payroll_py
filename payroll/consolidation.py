@@ -193,7 +193,7 @@ def ensure_benefit_is_not_in_active_consolidation(benefit, action):
 
 @transaction.atomic
 def reconcile_consolidated_sources(payroll, user):
-    """Reconcile completed sources and release all sources when the parent closes."""
+    """Reconcile completed sources and release memberships when the parent closes."""
     if payroll.payroll_type != Payroll.PayrollType.CONSOLIDATED:
         return
 
@@ -208,7 +208,7 @@ def reconcile_consolidated_sources(payroll, user):
             is_deleted=False,
             benefit__is_deleted=False,
         ).exclude(benefit__status=BenefitConsumptionStatus.RECONCILED).exists()
-        if not has_unreconciled_benefits or payroll.status == PayrollStatus.RECONCILED:
+        if not has_unreconciled_benefits:
             source_payroll.status = PayrollStatus.RECONCILED
             source_payroll.save(username=user.login_name)
         if payroll.status == PayrollStatus.RECONCILED:

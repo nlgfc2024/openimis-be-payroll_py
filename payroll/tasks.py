@@ -5,7 +5,6 @@ from core.models import User
 from payroll.models import Payroll, PayrollStatus, BenefitConsumptionStatus
 from payroll.consolidation import (
     ensure_payroll_is_not_consolidated_source,
-    reconcile_consolidated_sources,
 )
 from payroll.strategies import StrategyOnlinePayment
 from payroll.payments_registry import PaymentMethodStorage
@@ -31,7 +30,6 @@ def send_request_to_reconcile(payroll_id, user_id):
     user = User.objects.get(id=user_id)
     strategy = StrategyOnlinePayment
     strategy.initialize_payment_gateway(payroll.payment_point)
-    strategy.change_status_of_payroll(payroll, PayrollStatus.RECONCILED, user)
     benefits = strategy.get_benefits_attached_to_payroll(payroll, BenefitConsumptionStatus.APPROVE_FOR_PAYMENT)
     payment_gateway_connector = strategy.PAYMENT_GATEWAY
     benefits_to_reconcile = []
@@ -56,4 +54,4 @@ def send_request_to_reconcile(payroll_id, user_id):
             logger.info(f"Payment for benefit ({benefit.code}) was rejected.")
     if benefits_to_reconcile:
         strategy.reconcile_benefit_consumption(benefits_to_reconcile, user)
-    reconcile_consolidated_sources(payroll, user)
+    strategy.change_status_of_payroll(payroll, PayrollStatus.RECONCILED, user)
