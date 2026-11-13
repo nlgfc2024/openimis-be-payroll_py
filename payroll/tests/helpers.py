@@ -19,7 +19,9 @@ class PaymentPointHelper:
         return payment_point
 
     def __create_payment_point(self, **kwargs):
-        user = LogInHelper().get_or_create_user_api()
+        user = LogInHelper().get_or_create_user_api(
+            password='PayrollTestPassword1!',
+        )
         name = {**self._TEST_DATA_PAYMENT_POINT, **kwargs}["name"],
         location = {**self._TEST_DATA_PAYMENT_POINT, **kwargs}["location"]
         payment_point = PaymentPoint(
