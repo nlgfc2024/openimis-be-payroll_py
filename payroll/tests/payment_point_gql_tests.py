@@ -40,8 +40,16 @@ class PaymentPointGQLTestCase(openIMISGraphQLTestCase):
         unauthorized_perms = []  # No permissions for unauthorized user
         cls.unauthorized_role = create_test_role(perm_names=unauthorized_perms, name="PaymentPointUnauthorizedRole")
 
-        cls.user = LogInHelper().get_or_create_user_api(username='username_authorized', roles=[cls.authorized_role.id])
-        cls.user_unauthorized = LogInHelper().get_or_create_user_api(username='username_unauthorized', roles=[cls.unauthorized_role.id])
+        cls.user = LogInHelper().get_or_create_user_api(
+            username='username_authorized',
+            roles=[cls.authorized_role.id],
+            password='PayrollTestPassword1!',
+        )
+        cls.user_unauthorized = LogInHelper().get_or_create_user_api(
+            username='username_unauthorized',
+            roles=[cls.unauthorized_role.id],
+            password='PayrollTestPassword1!',
+        )
         gql_schema = Schema(
             query=Query,
             mutation=Mutation

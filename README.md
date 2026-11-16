@@ -76,8 +76,9 @@ This section details the configuration settings required for integrating with a 
 
 ## Reconciliation Upload Validation Configuration
 
-- **csv_reconciliation_blocking_mismatch_reasons**: Mismatch reasons that prevent a row from being applied. The default is strict and blocks every known mismatch.
-- **csv_reconciliation_warning_mismatch_reasons**: Safe data mismatches that may remain valid: first name, last name, date of birth, amount, or micro-catchment. Structural and payment-integrity failures cannot be warnings.
+- **csv_reconciliation_blocking_mismatch_reasons**: Mismatch reasons that prevent a row from being applied. Any blocking row rejects the whole upload; no rows are applied.
+- **National ID mismatch**: Blocks consolidated payroll uploads and is treated as a warning for standard payroll uploads.
+- **csv_reconciliation_warning_mismatch_reasons**: Safe data mismatches configured to remain valid. Structural and payment-integrity failures cannot be configured as warnings.
 - **csv_reconciliation_amount_tolerance**: Maximum permitted absolute difference between the submitted and expected amount. The default is `0`.
 - **csv_reconciliation_micro_catchment_column**: CSV header containing the micro-catchment value. The default is `Micro Catchment`.
 
@@ -348,3 +349,19 @@ When the `payment_method` of a Payroll is set to `StrategyOfflinePayment`, the c
    - Unpaid payroll invoices can be recreated during the re-creation of payroll in the reconciled payroll section.
    - The unpaid invoices will be included in the new payroll.
    - Use the `Create Payroll from Unpaid Invoices` button available when you go to `Legal and Finance -> Reconciled Payrolls -> View Reconciled Payroll -> Create Payment from Failed Invoice`.
+
+## Consolidated Payroll - Deferred Scope
+
+The following features are intentionally deferred and planned for follow-up work:
+
+1. **Two-stage approval workflow**: District-level approval (DPD/Director) followed by national-level approval (EPS/National) with reject-back capability.
+2. **Payment provider integration**: The separate KYC feature captures approved household bank/account details; integrating those details with payment-provider instructions remains follow-up work.
+3. **Cash-out fee handling**: Logic for calculating and applying cash-out fees in consolidated payrolls.
+4. **Consolidated wagesheet summary**: Summary reporting for consolidated payroll transactions.
+5. **Linking payments with grievances**: Flagging payment statuses as partially paid, fully paid, or not paid, and linking to grievance workflows.
+
+After a consolidated payroll is reconciled, its source payrolls are marked
+reconciled while retaining their source membership and audit context. Any
+benefits still awaiting payment remain eligible for the existing unpaid-invoice
+recovery flow; already reconciled benefits are not moved into the recovery
+payroll.
