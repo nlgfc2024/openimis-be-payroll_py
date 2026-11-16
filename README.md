@@ -355,7 +355,7 @@ When the `payment_method` of a Payroll is set to `StrategyOfflinePayment`, the c
 The following features are intentionally deferred and planned for follow-up work:
 
 1. **Two-stage approval workflow**: District-level approval (DPD/Director) followed by national-level approval (EPS/National) with reject-back capability.
-2. **Bank name and account details**: To be collected through the planned KYC upload feature once KYC details can be uploaded to the system.
+2. **Payment provider integration**: The separate KYC feature captures approved household bank/account details; integrating those details with payment-provider instructions remains follow-up work.
 3. **Cash-out fee handling**: Logic for calculating and applying cash-out fees in consolidated payrolls.
 4. **Consolidated wagesheet summary**: Summary reporting for consolidated payroll transactions.
 5. **Linking payments with grievances**: Flagging payment statuses as partially paid, fully paid, or not paid, and linking to grievance workflows.

@@ -255,6 +255,7 @@ class Query(graphene.ObjectType):
         filters = {
             "status": 'APPROVE_FOR_PAYMENT',
             "payroll_type": Payroll.PayrollType.STANDARD,
+            "payment_plan__isnull": False,
             "is_deleted": False,
         }
         if benefit_plan_id:
@@ -355,7 +356,7 @@ class Query(graphene.ObjectType):
                 district_id,
                 user=info.context.user,
             )
-            if payroll.payment_plan_id
+            if payroll.payment_plan_id and payroll.payment_plan
         }
         return BenefitPlan.objects.filter(id__in=phase_ids, is_deleted=False).order_by("name")
 

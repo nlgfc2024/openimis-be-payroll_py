@@ -525,6 +525,68 @@ class ReconciliationAuditPolicyTests(TestCase):
             {"id": "task-id", "failed": True},
         )
 
+    def test_completed_reject_delete_and_benefit_tasks_fail_when_callback_errors(self):
+        user = SimpleNamespace(id="user-id")
+        payroll = SimpleNamespace(payment_method="offline")
+        benefit = SimpleNamespace()
+        with patch("payroll.signals.bind_service_signal") as bind_service_signal:
+            signals.bind_service_signals()
+        handlers = {
+            call.args[1].__name__: call.args[1]
+            for call in bind_service_signal.call_args_list
+        }
+        cases = (
+            (
+                "on_task_complete_payroll_reject_approved_payroll",
+                PayrollConfig.payroll_reject_event,
+                "payroll-id",
+            ),
+            ("on_task_delete_payroll", PayrollConfig.payroll_delete_event, "payroll-id"),
+            ("on_task_delete_benefit", PayrollConfig.benefit_delete_event, "benefit-id"),
+        )
+
+        for handler_name, event, entity_id in cases:
+            with self.subTest(event=event):
+                task = {
+                    "id": "task-id",
+                    "business_event": event,
+                    "status": Task.Status.COMPLETED,
+                    "entity_id": entity_id,
+                    "data": {},
+                }
+                strategy = SimpleNamespace(
+                    reject_approved_payroll=MagicMock(
+                        side_effect=ValidationError("Callback failed"),
+                    ),
+                )
+                with (
+                    patch("payroll.signals.User.objects.get", return_value=user),
+                    patch("payroll.signals.Payroll.objects.get", return_value=payroll),
+                    patch("payroll.signals.BenefitConsumption.objects.get", return_value=benefit),
+                    patch(
+                        "payroll.signals.ensure_payroll_is_not_consolidated_source",
+                        side_effect=ValidationError("Source payroll is locked"),
+                    ),
+                    patch(
+                        "payroll.signals.ensure_benefit_is_not_in_active_consolidation",
+                        side_effect=ValidationError("Benefit is in consolidation"),
+                    ),
+                    patch(
+                        "payroll.signals.PaymentMethodStorage.get_chosen_payment_method",
+                        return_value=strategy,
+                    ),
+                    patch("payroll.signals.TaskService") as task_service,
+                ):
+                    task_service.return_value.complete_task.return_value = {"success": True}
+                    handlers[handler_name](result={
+                        "success": True,
+                        "data": {"user": {"id": user.id}, "task": task},
+                    })
+
+                task_service.return_value.complete_task.assert_called_once_with(
+                    {"id": "task-id", "failed": True},
+                )
+
 
 class ReconciliationPayrollStatusTests(TestCase):
     def setUp(self):

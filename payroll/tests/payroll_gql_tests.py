@@ -556,6 +556,8 @@ class PayrollGQLTestCase(openIMISGraphQLTestCase):
         self.assertTrue(
             PayrollBenefitConsumption.history.filter(id=consolidated_link.id).exists(),
         )
+        self.assertEqual(consolidated_link.user_created_id, self.user.id)
+        self.assertEqual(consolidated_link.user_updated_id, self.user.id)
         task_service.return_value.create.assert_called_once()
 
         second_source = self._create_consolidation_source("Duplicate membership source")

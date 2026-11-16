@@ -31,6 +31,7 @@ class ConsolidationResolverTests(SimpleTestCase):
             result = Query._consolidation_candidates("district-uuid")
 
         self.assertEqual(result, [])
+        self.assertFalse(payroll_filter.call_args.kwargs["payment_plan__isnull"])
         locations.return_value.get.assert_called_once_with(
             uuid="district-uuid",
             validity_to__isnull=True,
@@ -154,6 +155,23 @@ class ConsolidationResolverTests(SimpleTestCase):
             result = Query._consolidation_candidates("district-uuid")
 
         self.assertEqual(result, [candidate])
+
+    def test_consolidation_phases_skip_candidates_without_payment_plan(self):
+        candidate = SimpleNamespace(payment_plan_id=None, payment_plan=None)
+        phase_queryset = MagicMock()
+        phase_queryset.order_by.return_value = []
+        with patch.object(
+            Query,
+            "_consolidation_candidates",
+            return_value=[candidate],
+        ), patch(
+            "payroll.schema.BenefitPlan.objects.filter",
+            return_value=phase_queryset,
+        ) as phases:
+            result = Query.resolve_consolidation_phases(None, self.info, "district-uuid")
+
+        self.assertEqual(result, [])
+        phases.assert_called_once_with(id__in=set(), is_deleted=False)
 
     def test_payrolls_in_district_resolves_saved_location_uuids(self):
         district = SimpleNamespace(id=102, uuid="district-uuid", parent_id=None)

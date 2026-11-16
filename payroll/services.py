@@ -377,7 +377,12 @@ class PayrollService(BaseService):
                 beneficiaries_count=len(benefit_ids), total_amount=total,
             ).save(username=self.user.login_name)
             for benefit_id in benefit_ids:
-                link = PayrollBenefitConsumption(payroll=payroll, benefit_id=benefit_id)
+                link = PayrollBenefitConsumption(
+                    payroll=payroll,
+                    benefit_id=benefit_id,
+                    user_created=self.user,
+                    user_updated=self.user,
+                )
                 link.set_pk()
                 consolidated_links.append(link)
         if consolidated_links:
@@ -1319,11 +1324,7 @@ class CsvReconciliationService:
             benefit = locked_benefits.get(row.benefit_id)
             if benefit and benefit.status == BenefitConsumptionStatus.ACCEPTED:
                 self._reconcile_bc(pd.Series(row.submitted_data), benefit)
-        upload.status = (
-            CsvReconciliationUpload.Status.PARTIAL_SUCCESS
-            if upload.unmatched_records
-            else CsvReconciliationUpload.Status.SUCCESS
-        )
+        upload.status = CsvReconciliationUpload.Status.SUCCESS
         upload.save(username=self.user.login_name)
 
         # A payroll is fully reconciled only when this approved upload has no
