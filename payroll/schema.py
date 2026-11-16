@@ -291,27 +291,48 @@ class Query(graphene.ObjectType):
         candidate_ids = [payroll.id for payroll in candidates]
         if not candidate_ids:
             return candidates
+        candidate_payrolls_by_id = {
+            payroll.id: (
+                payroll.payment_cycle_id,
+                payroll.payment_plan.benefit_plan_id,
+            )
+            for payroll in candidates
+        }
         candidate_recipient_links = PayrollBenefitConsumption.objects.filter(
             payroll_id__in=candidate_ids,
             is_deleted=False,
             benefit__is_deleted=False,
         ).values_list("payroll_id", "benefit__individual_id")
+        payment_cycle_ids = {
+            context[0] for context in candidate_payrolls_by_id.values()
+        }
+        benefit_plan_ids = {
+            context[1] for context in candidate_payrolls_by_id.values()
+        }
         previously_consolidated_recipients = set(
             PayrollBenefitConsumption.objects.filter(
                 payroll__payroll_type=Payroll.PayrollType.CONSOLIDATED,
+                payroll__payment_cycle_id__in=payment_cycle_ids,
+                payroll__payment_plan__benefit_plan_id__in=benefit_plan_ids,
                 payroll__is_deleted=False,
-                payroll__consolidation_members__is_deleted=False,
                 payroll__consolidation_members__source_payroll__is_deleted=False,
                 is_deleted=False,
                 benefit__is_deleted=False,
             ).exclude(
                 payroll__status=PayrollStatus.REJECTED,
-            ).values_list("benefit__individual_id", flat=True).distinct()
+            ).values_list(
+                "payroll__payment_cycle_id",
+                "payroll__payment_plan__benefit_plan_id",
+                "benefit__individual_id",
+            ).distinct()
         )
         blocked_payroll_ids = {
             payroll_id
             for payroll_id, individual_id in candidate_recipient_links
-            if individual_id in previously_consolidated_recipients
+            if (
+                *candidate_payrolls_by_id[payroll_id],
+                individual_id,
+            ) in previously_consolidated_recipients
         }
         return [
             payroll for payroll in candidates

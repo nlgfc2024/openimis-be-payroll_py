@@ -307,6 +307,7 @@ class PayrollService(BaseService):
             raise ValidationError(
                 "Selected payrolls cannot contain benefits pending deletion or already reconciled."
             )
+        first = sources[0]
         duplicate_recipients = PayrollBenefitConsumption.objects.filter(
             payroll_id__in=source_ids,
             is_deleted=False,
@@ -325,6 +326,8 @@ class PayrollService(BaseService):
             )
         if PayrollBenefitConsumption.objects.filter(
             payroll__payroll_type=Payroll.PayrollType.CONSOLIDATED,
+            payroll__payment_cycle_id=first.payment_cycle_id,
+            payroll__payment_plan__benefit_plan_id=first.payment_plan.benefit_plan_id,
             payroll__is_deleted=False,
             is_deleted=False,
             benefit__is_deleted=False,
@@ -332,7 +335,6 @@ class PayrollService(BaseService):
                 benefit.individual_id for benefit in source_benefits
             },
             payroll__consolidation_members__source_payroll__is_deleted=False,
-            payroll__consolidation_members__is_deleted=False,
         ).exclude(payroll__status=PayrollStatus.REJECTED).exists():
             raise ValidationError(
                 "A selected recipient was already included in a consolidated payroll."
@@ -343,7 +345,6 @@ class PayrollService(BaseService):
                 consolidated_payroll__is_deleted=False,
         ).exclude(consolidated_payroll__status=PayrollStatus.REJECTED).exists():
             raise ValidationError("A selected payroll already belongs to a consolidated payroll.")
-        first = sources[0]
         if any((source.payment_method, source.payment_point_id, source.payment_cycle_id) !=
                (first.payment_method, first.payment_point_id, first.payment_cycle_id) for source in sources):
             raise ValidationError("Selected payrolls must use the same payment method, point, and cycle.")
@@ -366,6 +367,7 @@ class PayrollService(BaseService):
             json_ext={"consolidated_source_payroll_ids": [str(source.id) for source in sources]},
         )
         payroll.save(username=self.user.login_name)
+        consolidated_links = []
         for source in sources:
             benefits = PayrollBenefitConsumption.objects.filter(payroll=source, is_deleted=False)
             benefit_ids = list(benefits.values_list("benefit_id", flat=True))
@@ -374,9 +376,17 @@ class PayrollService(BaseService):
                 consolidated_payroll=payroll, source_payroll=source,
                 beneficiaries_count=len(benefit_ids), total_amount=total,
             ).save(username=self.user.login_name)
-            # This is the intentional shared-link exception for consolidation.
             for benefit_id in benefit_ids:
-                PayrollBenefitConsumption(payroll=payroll, benefit_id=benefit_id).save(username=self.user.login_name)
+                link = PayrollBenefitConsumption(payroll=payroll, benefit_id=benefit_id)
+                link.set_pk()
+                consolidated_links.append(link)
+        if consolidated_links:
+            bulk_create_with_history(
+                consolidated_links,
+                PayrollBenefitConsumption,
+                default_user=self.user,
+                batch_size=1000,
+            )
         self.create_accept_payroll_task(payroll.id, {
             "id": payroll.id, "district": district.name, "phase": phase,
             "included_payrolls": [{"id": str(source.id), "name": source.name} for source in sources],
@@ -672,13 +682,32 @@ class PayrollService(BaseService):
         if source_payroll.payroll_type == Payroll.PayrollType.CONSOLIDATED:
             raise ValidationError("Cannot move benefits from a consolidated payroll.")
         ensure_payroll_is_not_consolidated_source(source_payroll, "move benefits from")
-        payroll_benefits = PayrollBenefitConsumption.objects.filter(
+        payroll_benefits = list(PayrollBenefitConsumption.objects.select_for_update().filter(
             payroll_id=from_payroll_id,
+            is_deleted=False,
             benefit__status__in=[BenefitConsumptionStatus.ACCEPTED, BenefitConsumptionStatus.APPROVE_FOR_PAYMENT]
+        ).select_related("benefit"))
+        benefit_ids = {link.benefit_id for link in payroll_benefits}
+        for link in payroll_benefits:
+            link.payroll = payroll
+            link.save(username=self.user.login_name)
+        reconciled_consolidated_payroll_ids = ConsolidatedPayrollMember.objects.filter(
+            source_payroll=source_payroll,
+            consolidated_payroll__status=PayrollStatus.RECONCILED,
+            consolidated_payroll__is_deleted=False,
+        ).values_list("consolidated_payroll_id", flat=True)
+        consolidated_links = PayrollBenefitConsumption.objects.select_for_update().filter(
+            benefit_id__in=benefit_ids,
+            payroll__payroll_type=Payroll.PayrollType.CONSOLIDATED,
+            payroll_id__in=reconciled_consolidated_payroll_ids,
+            is_deleted=False,
         )
-        payroll_benefits.update(payroll=payroll)
-        benefits = BenefitConsumption.objects.filter(payrollbenefitconsumption__payroll=payroll)
-        benefits.update(status=BenefitConsumptionStatus.ACCEPTED)
+        for link in consolidated_links:
+            link.delete(user=self.user)
+        BenefitConsumption.objects.filter(
+            id__in=benefit_ids,
+            is_deleted=False,
+        ).update(status=BenefitConsumptionStatus.ACCEPTED)
 
 
 class BenefitConsumptionService(BaseService):
@@ -847,7 +876,10 @@ class CsvReconciliationService:
         if payroll.payroll_type != Payroll.PayrollType.CONSOLIDATED:
             return {}
         members = list(ConsolidatedPayrollMember.objects.filter(
-            consolidated_payroll=payroll, is_deleted=False,
+            consolidated_payroll=payroll,
+            consolidated_payroll__is_deleted=False,
+        ).exclude(
+            consolidated_payroll__status=PayrollStatus.REJECTED,
         ).select_related("source_payroll"))
         source_payrolls = {member.source_payroll_id: member.source_payroll for member in members}
         return {
@@ -948,7 +980,7 @@ class CsvReconciliationService:
         source_payroll_by_benefit = {}
         if payroll.payroll_type == Payroll.PayrollType.CONSOLIDATED:
             member_ids = ConsolidatedPayrollMember.objects.filter(
-                consolidated_payroll=payroll, is_deleted=False,
+                consolidated_payroll=payroll,
             ).values_list("source_payroll_id", flat=True)
             source_payroll_by_benefit = dict(PayrollBenefitConsumption.objects.filter(
                 payroll_id__in=member_ids, is_deleted=False,
@@ -978,14 +1010,15 @@ class CsvReconciliationService:
                        if benefit and benefit.id in source_payroll_by_benefit else {}),
                 },
                 mismatch_reasons=reasons,
-                status=(ReconciliationUploadRow.Status.INVALID if self._has_blocking_reason(reasons)
+                status=(ReconciliationUploadRow.Status.INVALID
+                        if self._has_blocking_reason(reasons, payroll.payroll_type)
                         else ReconciliationUploadRow.Status.VALID),
             )
             # HistoryModel deliberately has no database UUID default.  These rows
             # are inserted in bulk, so assign the primary key before bulk_create.
             upload_row.set_pk()
             upload_rows.append(upload_row)
-            if self._has_blocking_reason(reasons):
+            if self._has_blocking_reason(reasons, payroll.payroll_type):
                 errors[str(row_number)] = reasons
             else:
                 valid_indexes.append(index)
@@ -1005,7 +1038,7 @@ class CsvReconciliationService:
         )
         bulk_create_with_history(upload_rows, ReconciliationUploadRow, default_user=self.user, batch_size=1000)
 
-        if errors and payroll.payroll_type == Payroll.PayrollType.CONSOLIDATED:
+        if errors:
             upload.error = errors
             upload.status = CsvReconciliationUpload.Status.FAIL
             upload.json_ext = {"extra_info": self._upload_summary(upload)}
@@ -1071,7 +1104,6 @@ class CsvReconciliationService:
         if consolidated:
             members = list(ConsolidatedPayrollMember.objects.filter(
                 consolidated_payroll=payroll,
-                is_deleted=False,
                 source_payroll__is_deleted=False,
             ).select_related("source_payroll").order_by("source_payroll__name"))
             source_payrolls = [member.source_payroll for member in members]
@@ -1242,9 +1274,9 @@ class CsvReconciliationService:
         upload = CsvReconciliationUpload.objects.select_for_update().get(id=upload.id)
         if upload.status != CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION:
             return
-        if upload.unmatched_records and payroll.payroll_type == Payroll.PayrollType.CONSOLIDATED:
+        if upload.unmatched_records:
             raise ValidationError(
-                "A reconciliation upload with unmatched rows cannot be applied."
+                "A reconciliation upload with blocking validation errors cannot be applied."
             )
         if payroll.payroll_type == Payroll.PayrollType.CONSOLIDATED:
             if payroll.is_deleted or payroll.status == PayrollStatus.REJECTED:
@@ -1454,9 +1486,12 @@ class CsvReconciliationService:
             return False
 
     @staticmethod
-    def _has_blocking_reason(reasons):
+    def _has_blocking_reason(reasons, payroll_type=None):
         blocking_reasons = set(PayrollConfig.csv_reconciliation_blocking_mismatch_reasons or [])
         warning_reasons = set(PayrollConfig.csv_reconciliation_warning_mismatch_reasons or [])
+        if payroll_type == Payroll.PayrollType.STANDARD:
+            warning_reasons.add("national_id_mismatch")
+            blocking_reasons.discard("national_id_mismatch")
         # Unknown reasons stay blocking so a new validator cannot silently
         # make an upload applicable before policy has been configured.
         return any(reason in blocking_reasons or reason not in warning_reasons for reason in reasons)

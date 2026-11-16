@@ -43,9 +43,8 @@ DEFAULT_CONFIG = {
     "csv_reconciliation_code_column": "code",
     "csv_reconciliation_paid_yes": "Yes",
     "csv_reconciliation_paid_no": "No",
-    # Reconciliation validation is policy driven.  The defaults deliberately
-    # preserve the current behaviour: every known mismatch blocks application
-    # and amount values must match exactly.
+    # National ID mismatches are blocking for consolidated payrolls and warnings
+    # for standard payrolls; other blocking rules remain configurable.
     "csv_reconciliation_blocking_mismatch_reasons": [
         "missing_code", "duplicate_code_in_file", "duplicate_national_id_in_file",
         "code_not_found", "code_not_in_payroll", "payroll_name_mismatch",

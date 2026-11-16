@@ -100,8 +100,16 @@ def bind_service_signals():
                             "apply_error": str(exc),
                         }
                         failed_upload.save(username=user.login_name if user else None)
-                    if user:
-                        TaskService(user).complete_task({"id": task["id"], "failed": True})
+                if user:
+                    task_result = TaskService(user).complete_task(
+                        {"id": task["id"], "failed": True},
+                    )
+                    if not task_result.get("success"):
+                        logger.error(
+                            "Unable to mark failed reconciliation task %s as failed: %s",
+                            task.get("id"),
+                            task_result.get("error"),
+                        )
 
     def on_task_complete_payroll_reject_approved_payroll(**kwargs):
         def reject_approved_payroll(payroll, user):

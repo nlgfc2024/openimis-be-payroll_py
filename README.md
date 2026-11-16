@@ -76,8 +76,9 @@ This section details the configuration settings required for integrating with a 
 
 ## Reconciliation Upload Validation Configuration
 
-- **csv_reconciliation_blocking_mismatch_reasons**: Mismatch reasons that prevent a row from being applied. The default is strict and blocks every known mismatch.
-- **csv_reconciliation_warning_mismatch_reasons**: Safe data mismatches that may remain valid: first name, last name, date of birth, amount, or micro-catchment. Structural and payment-integrity failures cannot be warnings.
+- **csv_reconciliation_blocking_mismatch_reasons**: Mismatch reasons that prevent a row from being applied. Any blocking row rejects the whole upload; no rows are applied.
+- **National ID mismatch**: Blocks consolidated payroll uploads and is treated as a warning for standard payroll uploads.
+- **csv_reconciliation_warning_mismatch_reasons**: Safe data mismatches configured to remain valid. Structural and payment-integrity failures cannot be configured as warnings.
 - **csv_reconciliation_amount_tolerance**: Maximum permitted absolute difference between the submitted and expected amount. The default is `0`.
 - **csv_reconciliation_micro_catchment_column**: CSV header containing the micro-catchment value. The default is `Micro Catchment`.
 
@@ -360,49 +361,7 @@ The following features are intentionally deferred and planned for follow-up work
 5. **Linking payments with grievances**: Flagging payment statuses as partially paid, fully paid, or not paid, and linking to grievance workflows.
 
 After a consolidated payroll is reconciled, its source payrolls are marked
-reconciled and their active membership is released while retaining the audit
-record. Any benefits still awaiting payment remain eligible for the existing
-unpaid-invoice recovery flow; already reconciled benefits are not moved into
-the recovery payroll.
-
-## Testing
-
-### Running Tests
-
-To run the payroll test suite, use Django's test runner:
-
-From the openIMIS project directory, run the payroll tests with the project's
-virtual environment:
-
-```bash
-../.venv/bin/python manage.py test payroll --verbosity=2
-```
-
-### Test Coverage
-
-The following tests are included:
-
-- **consolidation_resolver_tests.py** - Tests for consolidation candidate resolution and phase eligibility
-- **reconciliation_audit_tests.py** - Tests for reconciliation upload validation, audit policies, and payroll status updates
-- **payroll_gql_tests.py** - GraphQL API tests for payroll operations
-- **Other tests** - GQL tests for payment points, benefit consumption, and payment strategies
-
-### Database Requirements
-
-Tests require a complete test database schema including:
-- All core openIMIS tables (tblUsers, locations, etc.)
-- Payroll-specific tables
-- Related social protection tables (benefit plans, projects, etc.)
-
-The test database must include the legacy openIMIS schema, including
-`tblUsers`, before payroll migrations run. Use the deployment's supported
-database bootstrap for a disposable test database; do not run the suite against
-an incomplete or shared database. The checked-in `init_test_db_pg.sql` is empty
-and does not initialize this schema.
-
-### PostgreSQL Compatibility Note
-
-The payroll service includes fixes for PostgreSQL compatibility:
-- Locked queries for consolidation creation no longer use select_related() on nullable FKs
-- Related objects (payment_plan, payment_cycle, payment_point) are loaded in bulk after locking
-- This avoids "FOR UPDATE cannot be applied to outer join" errors on PostgreSQL
+reconciled while retaining their source membership and audit context. Any
+benefits still awaiting payment remain eligible for the existing unpaid-invoice
+recovery flow; already reconciled benefits are not moved into the recovery
+payroll.

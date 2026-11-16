@@ -85,11 +85,17 @@ class ConsolidationResolverTests(SimpleTestCase):
         self.assertIsInstance(exclusion, NegatedExpression)
 
     def test_candidates_exclude_recipients_from_prior_consolidations(self):
-        candidate = SimpleNamespace(id=1)
+        candidate = SimpleNamespace(
+            id=1,
+            payment_cycle_id=10,
+            payment_plan=SimpleNamespace(benefit_plan_id=20),
+        )
         candidate_links = MagicMock()
         candidate_links.values_list.return_value = [(1, 25)]
         prior_links = MagicMock()
-        prior_links.exclude.return_value.values_list.return_value.distinct.return_value = [25]
+        prior_links.exclude.return_value.values_list.return_value.distinct.return_value = [
+            (10, 20, 25),
+        ]
         benefit_links = MagicMock()
         benefit_links.filter.return_value = MagicMock()
         with patch("payroll.schema.Location.objects.only") as locations, \
@@ -112,6 +118,42 @@ class ConsolidationResolverTests(SimpleTestCase):
             result = Query._consolidation_candidates("district-uuid")
 
         self.assertEqual(result, [])
+
+    def test_candidates_allow_prior_recipient_in_other_cycle_or_phase(self):
+        candidate = SimpleNamespace(
+            id=1,
+            payment_cycle_id=10,
+            payment_plan=SimpleNamespace(benefit_plan_id=20),
+        )
+        candidate_links = MagicMock()
+        candidate_links.values_list.return_value = [(1, 25)]
+        prior_links = MagicMock()
+        prior_links.exclude.return_value.values_list.return_value.distinct.return_value = [
+            (11, 20, 25),
+            (10, 21, 25),
+        ]
+        benefit_links = MagicMock()
+        benefit_links.filter.return_value = MagicMock()
+        with patch("payroll.schema.Location.objects.only") as locations, \
+                patch("payroll.schema.ContentType.objects.get_for_model", return_value=1), \
+                patch("payroll.schema.Payroll.objects.filter") as payroll_filter, \
+                patch("payroll.schema.ConsolidatedPayrollMember.objects.filter"), \
+                patch("payroll.schema.PayrollBenefitConsumption.objects.filter") as benefit_filter, \
+                patch("payroll.schema.Task.objects.filter"), \
+                patch(
+                    "payroll.schema.payrolls_in_district",
+                    return_value=[candidate],
+                ):
+            locations.return_value.get.return_value = SimpleNamespace(id=102)
+            benefit_filter.side_effect = [
+                benefit_links,
+                candidate_links,
+                prior_links,
+            ]
+
+            result = Query._consolidation_candidates("district-uuid")
+
+        self.assertEqual(result, [candidate])
 
     def test_payrolls_in_district_resolves_saved_location_uuids(self):
         district = SimpleNamespace(id=102, uuid="district-uuid", parent_id=None)

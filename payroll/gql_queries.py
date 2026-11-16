@@ -262,7 +262,7 @@ class PayrollGQLType(DjangoObjectType):
             "beneficiaries_count": member.beneficiaries_count,
             "total_amount": member.total_amount,
         } for member in ConsolidatedPayrollMember.objects.filter(
-            consolidated_payroll=self, is_deleted=False,
+            consolidated_payroll=self,
         ).select_related("source_payroll")]
 
 

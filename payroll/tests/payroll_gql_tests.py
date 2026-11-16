@@ -546,6 +546,16 @@ class PayrollGQLTestCase(openIMISGraphQLTestCase):
             source_payroll=source,
             is_deleted=False,
         ).exists())
+        consolidated_link = PayrollBenefitConsumption.objects.get(
+            payroll=consolidated,
+            benefit=PayrollBenefitConsumption.objects.get(
+                payroll=source,
+            ).benefit,
+            is_deleted=False,
+        )
+        self.assertTrue(
+            PayrollBenefitConsumption.history.filter(id=consolidated_link.id).exists(),
+        )
         task_service.return_value.create.assert_called_once()
 
         second_source = self._create_consolidation_source("Duplicate membership source")
@@ -595,6 +605,45 @@ class PayrollGQLTestCase(openIMISGraphQLTestCase):
                 self.benefit_plan.id,
                 [source_b.id],
             )
+
+    def test_consolidated_creation_allows_prior_recipient_in_another_cycle(self):
+        source_a = self._create_consolidation_source("Prior cycle source")
+        self._attach_benefit(source_a)
+        service = PayrollService(self.user)
+        with patch("payroll.services.TaskService") as task_service:
+            task_service.return_value.create.return_value = {"success": True}
+            service.create_consolidated_payroll(
+                self.district.uuid,
+                self.benefit_plan.id,
+                [source_a.id],
+            )
+
+        next_cycle = PaymentCycle(
+            start_date="2024-02-01",
+            end_date="2024-03-01",
+            type=ContentType.objects.get_for_model(BenefitPlan),
+            code=str(uuid.uuid4()),
+        )
+        next_cycle.save(username=self.user.username)
+        source_b = self._create_consolidation_source(
+            "Next cycle source",
+            payment_cycle=next_cycle,
+        )
+        self._attach_benefit(source_b)
+
+        with patch("payroll.services.TaskService") as task_service:
+            task_service.return_value.create.return_value = {"success": True}
+            consolidated = service.create_consolidated_payroll(
+                self.district.uuid,
+                self.benefit_plan.id,
+                [source_b.id],
+            )
+
+        self.assertTrue(ConsolidatedPayrollMember.objects.filter(
+            consolidated_payroll=consolidated,
+            source_payroll=source_b,
+            is_deleted=False,
+        ).exists())
 
     def test_consolidated_creation_rejects_pending_source_tasks(self):
         source = self._create_consolidation_source("Pending task consolidation source")

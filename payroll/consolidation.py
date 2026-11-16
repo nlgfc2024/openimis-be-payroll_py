@@ -158,7 +158,12 @@ def ensure_payroll_is_not_consolidated_source(payroll, action):
         source_payroll=payroll,
         is_deleted=False,
         consolidated_payroll__is_deleted=False,
-    ).exclude(consolidated_payroll__status=PayrollStatus.REJECTED)
+    ).exclude(
+        consolidated_payroll__status__in=[
+            PayrollStatus.REJECTED,
+            PayrollStatus.RECONCILED,
+        ],
+    )
     if active_memberships.exists():
         from django.core.exceptions import ValidationError
 
@@ -168,7 +173,6 @@ def ensure_payroll_is_not_consolidated_source(payroll, action):
         )
     reconciled_memberships = ConsolidatedPayrollMember.objects.filter(
         source_payroll=payroll,
-        is_deleted=True,
         consolidated_payroll__is_deleted=False,
         consolidated_payroll__status=PayrollStatus.RECONCILED,
     )
@@ -193,7 +197,7 @@ def ensure_benefit_is_not_in_active_consolidation(benefit, action):
 
 @transaction.atomic
 def reconcile_consolidated_sources(payroll, user):
-    """Reconcile completed sources and release memberships when the parent closes."""
+    """Reconcile source payrolls while retaining membership for audit context."""
     if payroll.payroll_type != Payroll.PayrollType.CONSOLIDATED:
         return
 
@@ -208,9 +212,8 @@ def reconcile_consolidated_sources(payroll, user):
             is_deleted=False,
             benefit__is_deleted=False,
         ).exclude(benefit__status=BenefitConsumptionStatus.RECONCILED).exists()
-        if not has_unreconciled_benefits:
+        if payroll.status == PayrollStatus.RECONCILED or not has_unreconciled_benefits:
+            if source_payroll.status == PayrollStatus.RECONCILED:
+                continue
             source_payroll.status = PayrollStatus.RECONCILED
             source_payroll.save(username=user.login_name)
-        if payroll.status == PayrollStatus.RECONCILED:
-            member.is_deleted = True
-            member.save(username=user.login_name)
