@@ -10,7 +10,7 @@ from django.test import TestCase
 from django.core.exceptions import ValidationError
 
 from tasks_management.models import Task
-from payroll.apps import PayrollConfig
+from payroll.apps import DEFAULT_CONFIG, KYC_PAYMENT_DETAILS_FIELD_MAPPING, PayrollConfig
 from payroll import signals
 from payroll.models import (
     BenefitConsumption,
@@ -140,6 +140,57 @@ class ReconciliationAuditPolicyTests(TestCase):
     def test_uploaded_national_id_matching_ignores_surrounding_whitespace(self):
         self.assertTrue(CsvReconciliationService._matches_text(" ID-123 ", "ID-123"))
 
+    def test_kyc_export_preserves_configured_headers_without_duplicates(self):
+        original_mapping = PayrollConfig.csv_reconciliation_field_mapping
+        try:
+            PayrollConfig.csv_reconciliation_field_mapping = {
+                "individual__json_ext__sex": "Gender",
+                "code": "Code",
+            }
+
+            mapping = CsvReconciliationService._reconciliation_field_mapping()
+
+            self.assertEqual(mapping["individual__json_ext__sex"], "Gender")
+            self.assertEqual(list(mapping.values()).count("Gender"), 1)
+        finally:
+            PayrollConfig.csv_reconciliation_field_mapping = original_mapping
+
+    def test_existing_kyc_mapping_reads_the_benefit_snapshot(self):
+        original_mapping = PayrollConfig.csv_reconciliation_field_mapping
+        try:
+            PayrollConfig.csv_reconciliation_field_mapping = {
+                "individual__json_ext__account_number": "Account Number",
+                "code": "Code",
+            }
+
+            mapping = CsvReconciliationService._reconciliation_field_mapping()
+
+            self.assertEqual(
+                mapping["json_ext__kyc_payment_details__account_number"],
+                "Account Number",
+            )
+            self.assertNotIn("individual__json_ext__account_number", mapping)
+        finally:
+            PayrollConfig.csv_reconciliation_field_mapping = original_mapping
+
+    def test_legacy_upload_does_not_require_kyc_columns_with_default_config(self):
+        original_mapping = PayrollConfig.csv_reconciliation_field_mapping
+        try:
+            default_mapping = DEFAULT_CONFIG["csv_reconciliation_field_mapping"]
+            PayrollConfig.csv_reconciliation_field_mapping = default_mapping
+            dataframe = pd.DataFrame([{
+                **{
+                    header: "value"
+                    for field, header in default_mapping.items()
+                    if field not in KYC_PAYMENT_DETAILS_FIELD_MAPPING
+                },
+                PayrollConfig.csv_reconciliation_paid_extra_field: "No",
+            }])
+
+            CsvReconciliationService(None)._validate_dataframe(dataframe)
+        finally:
+            PayrollConfig.csv_reconciliation_field_mapping = original_mapping
+
     def test_project_name_uses_source_payroll_not_consolidated_link(self):
         project = SimpleNamespace(id="project-id", name="Source project")
         source_payroll = SimpleNamespace(
@@ -207,6 +258,98 @@ class ReconciliationAuditPolicyTests(TestCase):
             ))
 
         self.assertEqual(exported.loc[0, "Micro Catchment"], "Source catchment")
+        self.assertTrue({
+            "Gender", "Account Number", "Account Name", "Bank",
+        }.issubset(exported.columns))
+
+    def test_standard_export_includes_approved_kyc_payment_details(self):
+        payroll = SimpleNamespace(
+            id="standard-id",
+            payroll_type=Payroll.PayrollType.STANDARD,
+        )
+        benefit = SimpleNamespace(id="benefit-id", code="CODE-1", json_ext={})
+        record = {
+            key: "value" for key in PayrollConfig.csv_reconciliation_field_mapping
+        }
+        record.update({
+            "code": benefit.code,
+            "json_ext__kyc_payment_details__gender": "Female",
+            "json_ext__kyc_payment_details__account_number": "00123456",
+            "json_ext__kyc_payment_details__account_name": "Jane Banda",
+            "json_ext__kyc_payment_details__bank": "Mpamba",
+        })
+        benefits = MagicMock()
+        benefits.values.return_value = [record]
+        benefits.select_related.return_value = [benefit]
+        service = CsvReconciliationService(None)
+
+        with (
+            patch.object(service, "_resolve_payroll", return_value=payroll),
+            patch("payroll.services.ensure_payroll_is_not_consolidated_source"),
+            patch.object(service, "_get_benefit_consumption_qs", return_value=benefits),
+            patch.object(service, "_get_source_payrolls_by_benefit", return_value={}),
+            patch.object(service, "_get_payroll_micro_catchment", return_value=None),
+            patch.object(service, "_get_micro_catchment", return_value=None),
+        ):
+            exported = pd.read_csv(BytesIO(
+                service.download_reconciliation("standard-id").getvalue()
+            ), dtype=str)
+
+        self.assertEqual(exported.loc[0, "Gender"], "Female")
+        self.assertEqual(exported.loc[0, "Account Number"], "00123456")
+        self.assertEqual(exported.loc[0, "Account Name"], "Jane Banda")
+        self.assertEqual(exported.loc[0, "Bank"], "Mpamba")
+
+    def test_reconciliation_export_preserves_configured_column_order(self):
+        original_mapping = PayrollConfig.csv_reconciliation_field_mapping
+        PayrollConfig.csv_reconciliation_field_mapping = {
+            "code": "Code",
+            "json_ext__kyc_payment_details__account_number": "Account Number",
+            "json_ext__kyc_payment_details__gender": "Gender",
+            "json_ext__kyc_payment_details__account_name": "Account Name",
+            "json_ext__kyc_payment_details__bank": "Bank",
+            "individual__first_name": "First Name",
+        }
+        payroll = SimpleNamespace(
+            id="standard-id",
+            payroll_type=Payroll.PayrollType.STANDARD,
+        )
+        benefit = SimpleNamespace(id="benefit-id", code="CODE-1", json_ext={})
+        record = {
+            field: "value"
+            for field in PayrollConfig.csv_reconciliation_field_mapping
+        }
+        record["code"] = benefit.code
+        benefits = MagicMock()
+        benefits.values.return_value = [record]
+        benefits.select_related.return_value = [benefit]
+        service = CsvReconciliationService(None)
+
+        try:
+            with (
+                patch.object(service, "_resolve_payroll", return_value=payroll),
+                patch("payroll.services.ensure_payroll_is_not_consolidated_source"),
+                patch.object(service, "_get_benefit_consumption_qs", return_value=benefits),
+                patch.object(service, "_get_source_payrolls_by_benefit", return_value={}),
+                patch.object(service, "_get_payroll_micro_catchment", return_value=None),
+                patch.object(service, "_get_micro_catchment", return_value=None),
+            ):
+                exported = pd.read_csv(BytesIO(
+                    service.download_reconciliation("standard-id").getvalue()
+                ))
+        finally:
+            PayrollConfig.csv_reconciliation_field_mapping = original_mapping
+
+        self.assertEqual(list(exported.columns), [
+            "Code",
+            "Account Number",
+            "Gender",
+            "Account Name",
+            "Bank",
+            "First Name",
+            "Micro Catchment",
+            "Paid",
+        ])
 
     def test_source_cannot_download_reconciliation_file_during_consolidation(self):
         service = CsvReconciliationService(None)

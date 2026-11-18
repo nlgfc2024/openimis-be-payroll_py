@@ -7,6 +7,22 @@ from payroll.payments_registry import PaymentsMethodRegistryPoint
 
 MODULE_NAME = 'payroll'
 
+# Snapshot payment details onto each benefit at payroll generation so later
+# KYC edits cannot change a reconciliation export for an existing payroll.
+KYC_PAYMENT_DETAILS_FIELD_MAPPING = {
+    "json_ext__kyc_payment_details__gender": "Gender",
+    "json_ext__kyc_payment_details__account_number": "Account Number",
+    "json_ext__kyc_payment_details__account_name": "Account Name",
+    "json_ext__kyc_payment_details__bank": "Bank",
+}
+
+LEGACY_KYC_PAYMENT_DETAILS_FIELD_MAPPING = {
+    "individual__json_ext__gender": "Gender",
+    "individual__json_ext__account_number": "Account Number",
+    "individual__json_ext__account_name": "Account Name",
+    "individual__json_ext__bank": "Bank",
+}
+
 DEFAULT_CONFIG = {
     "gql_payment_point_search_perms": ["201001"],
     "gql_payment_point_create_perms": ["201002"],
@@ -30,6 +46,7 @@ DEFAULT_CONFIG = {
         "individual__last_name": "Last Name",
         "individual__json_ext__national_id": "National ID",
         "individual__dob": "Date of Birth",
+        **KYC_PAYMENT_DETAILS_FIELD_MAPPING,
         "code": "Code",
         "status": "Status",
         "amount": "Amount",

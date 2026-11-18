@@ -8,6 +8,17 @@ from payroll.utils import get_micro_catchment_name
 
 
 class BeneficiaryDisplayResolverTests(SimpleTestCase):
+    def test_kyc_resolvers_support_json_strings_and_legacy_aliases(self):
+        benefit = SimpleNamespace(individual=SimpleNamespace(json_ext=(
+            '{"sex":"Female","payment_account_number":"00012345",'
+            '"payment_account_name":"Jane Banda","payment_provider":"Mpamba"}'
+        )))
+
+        self.assertEqual(BenefitConsumptionGQLType.resolve_gender(benefit, None), "Female")
+        self.assertEqual(BenefitConsumptionGQLType.resolve_account_number(benefit, None), "00012345")
+        self.assertEqual(BenefitConsumptionGQLType.resolve_account_name(benefit, None), "Jane Banda")
+        self.assertEqual(BenefitConsumptionGQLType.resolve_bank(benefit, None), "Mpamba")
+
     def test_project_name_intersects_selected_projects_with_active_enrollments(self):
         project_a = SimpleNamespace(id="project-a", name="Project A")
         project_b = SimpleNamespace(id="project-b", name="Project B")

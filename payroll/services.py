@@ -21,7 +21,11 @@ from invoice.models import Bill, BillItem, PaymentInvoice, DetailPaymentInvoice
 from location.models import Location, LocationManager
 from invoice.services import PaymentInvoiceService
 from payment_cycle.models import PaymentCycle
-from payroll.apps import PayrollConfig
+from payroll.apps import (
+    LEGACY_KYC_PAYMENT_DETAILS_FIELD_MAPPING,
+    PayrollConfig,
+    KYC_PAYMENT_DETAILS_FIELD_MAPPING,
+)
 from payroll.consolidation import (
     ensure_benefit_is_not_in_active_consolidation,
     ensure_payroll_is_not_consolidated_source,
@@ -105,9 +109,8 @@ class PayrollService(BaseService):
                         )
                         if selected_projects and not enrollments_queryset.exists():
                             raise ValidationError(
-                                "No active household beneficiaries with a primary recipient are assigned "
-                                "to the selected completed project. Ensure the household assignments and "
-                                "their primary recipients were saved before creating the payroll."
+                                "No active household beneficiaries are assigned to the selected completed "
+                                "project. Ensure the household assignments were saved before creating the payroll."
                             )
                         # The timesheet GROUP strategy creates one benefit per group
                         # enrollment. Passing the explicit enrollment queryset is
@@ -149,6 +152,7 @@ class PayrollService(BaseService):
                         # and location criteria, so retain only the generated benefits
                         # belonging to the selected beneficiaries.
                         self._enforce_beneficiary_scope(payroll, beneficiaries_queryset)
+                    self._snapshot_kyc_payment_details(payroll)
                 else:
                     self._move_benefit_consumptions(payroll, from_failed_invoices_payroll_id)
                 self.create_accept_payroll_task(payroll.id, obj_data)
@@ -534,8 +538,6 @@ class PayrollService(BaseService):
 
         filter_criteria = json_ext.get("filter_criteria", {})
 
-        # Payrolls are paid to the primary recipient for a household, never
-        # to every member of the household.
         beneficiaries_queryset = beneficiaries_queryset.filter(
             individual__groupindividuals__recipient_type="PRIMARY",
             individual__groupindividuals__is_deleted=False,
@@ -602,15 +604,33 @@ class PayrollService(BaseService):
             **calculation_kwargs,
         )
 
-    def _assign_group_benefits_to_primary_recipients(self, payroll, enrollments_queryset):
-        """Make the primary recipient the payee for every household benefit.
+    def _snapshot_kyc_payment_details(self, payroll):
+        benefits = BenefitConsumption.objects.filter(
+            payrollbenefitconsumption__payroll=payroll,
+            payrollbenefitconsumption__is_deleted=False,
+            is_deleted=False,
+        ).select_related("individual")
+        snapshot_fields = {
+            field.rsplit("__", 1)[-1]
+            for field in KYC_PAYMENT_DETAILS_FIELD_MAPPING
+        }
+        for benefit in benefits:
+            benefit_json_ext = benefit.json_ext or {}
+            if benefit_json_ext.get("kyc_payment_details") is not None:
+                continue
+            individual_json_ext = (
+                benefit.individual.json_ext if benefit.individual else {}
+            ) or {}
+            benefit_json_ext = dict(benefit_json_ext)
+            benefit_json_ext["kyc_payment_details"] = {
+                field: individual_json_ext.get(field)
+                for field in snapshot_fields
+            }
+            benefit.json_ext = benefit_json_ext
+            benefit.save(user=self.user)
 
-        Timesheet bills deliberately remain attributed to the household because
-        the work and entitlement belong to that household.  The benefit record,
-        however, is the payment instruction consumed by the PSP and must name
-        the household's selected primary recipient (which can differ from the
-        household head).
-        """
+    def _assign_group_benefits_to_primary_recipients(self, payroll, enrollments_queryset):
+        """Make each generated household benefit payable to its PRIMARY member."""
         group_individual_model = apps.get_model("individual", "GroupIndividual")
         group_ids_by_beneficiary = dict(
             enrollments_queryset.values_list("group_beneficiary_id", "group_beneficiary__group_id")
@@ -640,8 +660,6 @@ class PayrollService(BaseService):
         for attachment in attachments:
             recipient_id = primary_recipient_by_beneficiary.get(str(attachment.bill.subject_id))
             if recipient_id is None:
-                # Benefits unrelated to this group calculation must never be
-                # reassigned as a side effect of creating the payroll.
                 continue
             attachment.benefit.individual_id = recipient_id
             attachment.benefit.save(user=self.user)
@@ -774,11 +792,35 @@ class CsvReconciliationService:
         # explicitly configured.
         return PayrollConfig.csv_reconciliation_micro_catchment_column or "Micro Catchment"
 
+    @staticmethod
+    def _reconciliation_field_mapping():
+        """Return configured fields, adding KYC fields for older installations."""
+        field_mapping = dict(PayrollConfig.csv_reconciliation_field_mapping or {})
+        snapshot_field_by_legacy = {
+            legacy_field: snapshot_field
+            for legacy_field, legacy_header in LEGACY_KYC_PAYMENT_DETAILS_FIELD_MAPPING.items()
+            for snapshot_field, snapshot_header in KYC_PAYMENT_DETAILS_FIELD_MAPPING.items()
+            if legacy_header == snapshot_header
+        }
+        mapped_fields = {
+            snapshot_field_by_legacy.get(field, field): header
+            for field, header in field_mapping.items()
+        }
+        mapped_headers = set(mapped_fields.values())
+        for field, header in KYC_PAYMENT_DETAILS_FIELD_MAPPING.items():
+            if field not in mapped_fields and header not in mapped_headers:
+                mapped_fields[field] = header
+                mapped_headers.add(header)
+        return mapped_fields
+
     def download_reconciliation(self, payroll_id) -> BytesIO:
         payroll = self._resolve_payroll(payroll_id)
         ensure_payroll_is_not_consolidated_source(payroll, "download a reconciliation file for")
         bc_qs = self._get_benefit_consumption_qs(payroll)
-        field_mapping = PayrollConfig.csv_reconciliation_field_mapping
+        # Module configuration is persisted by deployment. Merge the KYC
+        # fields at export time as well as defining them in DEFAULT_CONFIG so
+        # existing installations do not need a manual configuration migration.
+        field_mapping = self._reconciliation_field_mapping()
         records = list(bc_qs.values(*field_mapping.keys()))
         benefits_by_code = {
             benefit.code: benefit
@@ -820,37 +862,18 @@ class CsvReconciliationService:
             inplace=True,
         )
         export_columns = list(field_mapping.values())
-        try:
-            export_columns.insert(export_columns.index("District Name") + 1, self.micro_catchment_column)
-        except ValueError:
-            export_columns.append(self.micro_catchment_column)
-        export_columns.append(PayrollConfig.csv_reconciliation_paid_extra_field)
         if source_payroll_by_benefit:
             export_columns.insert(0, "Source Payroll")
-            preferred_columns = [
-                "Source Payroll",
-                "Payroll Name",
-                "Payroll Status",
-                "District Name",
-                self.micro_catchment_column,
-                "Form Number",
-                "Phone Number",
-                "First Name",
-                "Last Name",
-                "National ID",
-                "Date of Birth",
-                "Code",
-                "Status",
-                "Amount",
-                "Type",
-                "Receipt",
-                PayrollConfig.csv_reconciliation_paid_extra_field,
-            ]
-            export_columns = [
-                column for column in preferred_columns if column in export_columns
-            ] + [
-                column for column in export_columns if column not in preferred_columns
-            ]
+        if self.micro_catchment_column not in export_columns:
+            try:
+                export_columns.insert(
+                    export_columns.index("District Name") + 1,
+                    self.micro_catchment_column,
+                )
+            except ValueError:
+                export_columns.append(self.micro_catchment_column)
+        if PayrollConfig.csv_reconciliation_paid_extra_field not in export_columns:
+            export_columns.append(PayrollConfig.csv_reconciliation_paid_extra_field)
         for key in extra_info_keys:
             df[key] = [extra_info.get(key) for extra_info in extra_info_dicts]
             export_columns.append(key)
@@ -959,14 +982,15 @@ class CsvReconciliationService:
         except Exception as exc:
             raise ValueError(_("Unable to read CSV file: %(error)s") % {"error": str(exc)})
 
+        field_mapping = self._reconciliation_field_mapping()
         self._validate_dataframe(df)
         df.rename(
-            columns={v: k for k, v in PayrollConfig.csv_reconciliation_field_mapping.items()},
+            columns={v: k for k, v in field_mapping.items()},
             inplace=True,
         )
         code_column = PayrollConfig.csv_reconciliation_code_column
         national_id_column = next(
-            (field for field, header in PayrollConfig.csv_reconciliation_field_mapping.items()
+            (field for field, header in field_mapping.items()
              if header == "National ID"),
             None,
         )
@@ -1163,8 +1187,6 @@ class CsvReconciliationService:
                 ],
                 is_deleted=False,
                 benefit__is_deleted=False,
-                benefit__individual__groupindividuals__recipient_type="PRIMARY",
-                benefit__individual__groupindividuals__is_deleted=False,
             ).select_related(
                 "benefit__individual__location__parent__parent__parent",
             )
@@ -1211,8 +1233,6 @@ class CsvReconciliationService:
                 is_deleted=False,
                 payrollbenefitconsumption__payroll=payroll,
                 payrollbenefitconsumption__is_deleted=False,
-                individual__groupindividuals__recipient_type="PRIMARY",
-                individual__groupindividuals__is_deleted=False,
             ).select_related("individual", "individual__location").distinct()
         )
         benefits_by_code = {benefit.code: benefit for benefit in benefits}
@@ -1320,10 +1340,15 @@ class CsvReconciliationService:
                 is_deleted=False,
             )
         }
+        reconciliation_fields = set(self._reconciliation_field_mapping().values())
         for row in paid_rows:
             benefit = locked_benefits.get(row.benefit_id)
             if benefit and benefit.status == BenefitConsumptionStatus.ACCEPTED:
-                self._reconcile_bc(pd.Series(row.submitted_data), benefit)
+                self._reconcile_bc(
+                    pd.Series(row.submitted_data),
+                    benefit,
+                    reconciliation_fields,
+                )
         upload.status = CsvReconciliationUpload.Status.SUCCESS
         upload.save(username=self.user.login_name)
 
@@ -1397,8 +1422,8 @@ class CsvReconciliationService:
             benefit = BenefitConsumption.objects.filter(
                 code=code,
                 is_deleted=False,
-                individual__groupindividuals__recipient_type="PRIMARY",
-                individual__groupindividuals__is_deleted=False,
+                payrollbenefitconsumption__payroll=payroll,
+                payrollbenefitconsumption__is_deleted=False,
             ).select_related("individual").first()
         if not benefit:
             return None, reasons + ["code_not_found"]
@@ -1514,8 +1539,6 @@ class CsvReconciliationService:
         qs = BenefitConsumption.objects.filter(
             payrollbenefitconsumption__payroll=payroll,
             is_deleted=False,
-            individual__groupindividuals__recipient_type="PRIMARY",
-            individual__groupindividuals__is_deleted=False,
         ).distinct()
         if not qs.exists():
             raise ValueError('csv_reconciliation.validation.no_benefit_consumption_for_payroll')
@@ -1528,9 +1551,16 @@ class CsvReconciliationService:
             raise ValueError(_("Import file is empty"))
         if PayrollConfig.csv_reconciliation_errors_column in df.columns:
             raise ValueError(_("Column errors in csv."))
-        required_columns = set(PayrollConfig.csv_reconciliation_field_mapping.values()) | {
-            PayrollConfig.csv_reconciliation_paid_extra_field
-        }
+        kyc_fields = (
+            set(KYC_PAYMENT_DETAILS_FIELD_MAPPING)
+            | set(LEGACY_KYC_PAYMENT_DETAILS_FIELD_MAPPING)
+        )
+        kyc_headers = set(KYC_PAYMENT_DETAILS_FIELD_MAPPING.values())
+        required_columns = {
+            header
+            for field, header in (PayrollConfig.csv_reconciliation_field_mapping or {}).items()
+            if field not in kyc_fields and header not in kyc_headers
+        } | {PayrollConfig.csv_reconciliation_paid_extra_field}
         missing_columns = required_columns - set(df.columns)
         if missing_columns:
             raise ValueError(
@@ -1557,16 +1587,21 @@ class CsvReconciliationService:
             raise ValueError('csv_reconciliation.validation.payroll_not_found')
         return payroll
 
-    def _reconcile_bc(self, row, bc):
+    def _reconcile_bc(self, row, bc, reconciliation_fields=None):
         bc.status = BenefitConsumptionStatus.RECONCILED
         bc.receipt = row[PayrollConfig.csv_reconciliation_receipt_column]
+        if reconciliation_fields is None:
+            reconciliation_fields = set(self._reconciliation_field_mapping().values())
         extra_info = {
             k: row[k] for k in row.index
-            if k not in PayrollConfig.csv_reconciliation_field_mapping
+            if k not in reconciliation_fields
             and k != self.micro_catchment_column
             and not pd.isna(row[k])
         }
-        bc.json_ext = {'extra_info': extra_info}
+        bc.json_ext = {
+            **(bc.json_ext or {}),
+            'extra_info': extra_info,
+        }
         bc.save(username=self.user.login_name)
         bill = Bill.objects.filter(benefitattachment__benefit=bc, is_deleted=False).first()
         if bill:
