@@ -207,6 +207,46 @@ class ReconciliationAuditPolicyTests(TestCase):
             ))
 
         self.assertEqual(exported.loc[0, "Micro Catchment"], "Source catchment")
+        self.assertTrue({
+            "Gender", "Account Number", "Account Name", "Bank",
+        }.issubset(exported.columns))
+
+    def test_standard_export_includes_approved_kyc_payment_details(self):
+        payroll = SimpleNamespace(
+            id="standard-id",
+            payroll_type=Payroll.PayrollType.STANDARD,
+        )
+        benefit = SimpleNamespace(id="benefit-id", code="CODE-1", json_ext={})
+        record = {
+            key: "value" for key in PayrollConfig.csv_reconciliation_field_mapping
+        }
+        record.update({
+            "code": benefit.code,
+            "individual__json_ext__gender": "Female",
+            "individual__json_ext__account_number": "00123456",
+            "individual__json_ext__account_name": "Jane Banda",
+            "individual__json_ext__bank": "Mpamba",
+        })
+        benefits = MagicMock()
+        benefits.values.return_value = [record]
+        benefits.select_related.return_value = [benefit]
+        service = CsvReconciliationService(None)
+
+        with (
+            patch.object(service, "_resolve_payroll", return_value=payroll),
+            patch.object(service, "_get_benefit_consumption_qs", return_value=benefits),
+            patch.object(service, "_get_source_payrolls_by_benefit", return_value={}),
+            patch.object(service, "_get_payroll_micro_catchment", return_value=None),
+            patch.object(service, "_get_micro_catchment", return_value=None),
+        ):
+            exported = pd.read_csv(BytesIO(
+                service.download_reconciliation("standard-id").getvalue()
+            ), dtype=str)
+
+        self.assertEqual(exported.loc[0, "Gender"], "Female")
+        self.assertEqual(exported.loc[0, "Account Number"], "00123456")
+        self.assertEqual(exported.loc[0, "Account Name"], "Jane Banda")
+        self.assertEqual(exported.loc[0, "Bank"], "Mpamba")
 
     def test_source_cannot_download_reconciliation_file_during_consolidation(self):
         service = CsvReconciliationService(None)

@@ -21,7 +21,11 @@ from invoice.models import Bill, BillItem, PaymentInvoice, DetailPaymentInvoice
 from location.models import Location, LocationManager
 from invoice.services import PaymentInvoiceService
 from payment_cycle.models import PaymentCycle
-from payroll.apps import PayrollConfig
+from individual.primary_recipients import (
+    authoritative_primary_worker_memberships,
+    primary_worker_membership_filter,
+)
+from payroll.apps import PayrollConfig, KYC_PAYMENT_DETAILS_FIELD_MAPPING
 from payroll.consolidation import (
     ensure_benefit_is_not_in_active_consolidation,
     ensure_payroll_is_not_consolidated_source,
@@ -498,11 +502,10 @@ class PayrollService(BaseService):
         json_ext = obj_data.get("json_ext", {})
         filter_criteria = json_ext.get("filter_criteria", {})
         enrollments_queryset = enrollment_model.objects.filter(
+            primary_worker_membership_filter("group_beneficiary__group__groupindividuals"),
             group_beneficiary__benefit_plan_id=payment_plan.benefit_plan.id,
             group_beneficiary__status=BeneficiaryStatus.ACTIVE,
             group_beneficiary__is_deleted=False,
-            group_beneficiary__group__groupindividuals__recipient_type="PRIMARY",
-            group_beneficiary__group__groupindividuals__is_deleted=False,
             project__status="COMPLETED",
             project__is_deleted=False,
             is_deleted=False,
@@ -537,8 +540,7 @@ class PayrollService(BaseService):
         # Payrolls are paid to the primary recipient for a household, never
         # to every member of the household.
         beneficiaries_queryset = beneficiaries_queryset.filter(
-            individual__groupindividuals__recipient_type="PRIMARY",
-            individual__groupindividuals__is_deleted=False,
+            primary_worker_membership_filter("individual__groupindividuals"),
         )
 
         project_ids = filter_criteria.get("project_ids", [])
@@ -611,15 +613,12 @@ class PayrollService(BaseService):
         the household's selected primary recipient (which can differ from the
         household head).
         """
-        group_individual_model = apps.get_model("individual", "GroupIndividual")
         group_ids_by_beneficiary = dict(
             enrollments_queryset.values_list("group_beneficiary_id", "group_beneficiary__group_id")
         )
         primary_recipient_by_group = dict(
-            group_individual_model.objects.filter(
+            authoritative_primary_worker_memberships().filter(
                 group_id__in=group_ids_by_beneficiary.values(),
-                recipient_type="PRIMARY",
-                is_deleted=False,
             ).values_list("group_id", "individual_id")
         )
         primary_recipient_by_beneficiary = {
@@ -774,11 +773,22 @@ class CsvReconciliationService:
         # explicitly configured.
         return PayrollConfig.csv_reconciliation_micro_catchment_column or "Micro Catchment"
 
+    @staticmethod
+    def _reconciliation_field_mapping():
+        """Return configured fields plus mandatory recipient payment details."""
+        field_mapping = dict(PayrollConfig.csv_reconciliation_field_mapping or {})
+        for field, header in KYC_PAYMENT_DETAILS_FIELD_MAPPING.items():
+            field_mapping.setdefault(field, header)
+        return field_mapping
+
     def download_reconciliation(self, payroll_id) -> BytesIO:
         payroll = self._resolve_payroll(payroll_id)
         ensure_payroll_is_not_consolidated_source(payroll, "download a reconciliation file for")
         bc_qs = self._get_benefit_consumption_qs(payroll)
-        field_mapping = PayrollConfig.csv_reconciliation_field_mapping
+        # Module configuration is persisted by deployment. Merge the KYC
+        # fields at export time as well as defining them in DEFAULT_CONFIG so
+        # existing installations do not need a manual configuration migration.
+        field_mapping = self._reconciliation_field_mapping()
         records = list(bc_qs.values(*field_mapping.keys()))
         benefits_by_code = {
             benefit.code: benefit
@@ -827,30 +837,38 @@ class CsvReconciliationService:
         export_columns.append(PayrollConfig.csv_reconciliation_paid_extra_field)
         if source_payroll_by_benefit:
             export_columns.insert(0, "Source Payroll")
-            preferred_columns = [
-                "Source Payroll",
-                "Payroll Name",
-                "Payroll Status",
-                "District Name",
-                self.micro_catchment_column,
-                "Form Number",
-                "Phone Number",
-                "First Name",
-                "Last Name",
-                "National ID",
-                "Date of Birth",
-                "Code",
-                "Status",
-                "Amount",
-                "Type",
-                "Receipt",
-                PayrollConfig.csv_reconciliation_paid_extra_field,
-            ]
-            export_columns = [
-                column for column in preferred_columns if column in export_columns
-            ] + [
-                column for column in export_columns if column not in preferred_columns
-            ]
+
+        # Keep the provider-facing reconciliation layout stable for standard
+        # and consolidated payrolls. Columns which do not apply (for example
+        # Source Payroll on a standard payroll) are simply omitted.
+        preferred_columns = [
+            "Source Payroll",
+            "Payroll Name",
+            "Payroll Status",
+            "District Name",
+            self.micro_catchment_column,
+            "Form Number",
+            "Phone Number",
+            "First Name",
+            "Last Name",
+            "National ID",
+            "Date of Birth",
+            "Code",
+            "Status",
+            "Amount",
+            "Type",
+            "Gender",
+            "Account Number",
+            "Account Name",
+            "Bank",
+            "Receipt",
+            PayrollConfig.csv_reconciliation_paid_extra_field,
+        ]
+        export_columns = [
+            column for column in preferred_columns if column in export_columns
+        ] + [
+            column for column in export_columns if column not in preferred_columns
+        ]
         for key in extra_info_keys:
             df[key] = [extra_info.get(key) for extra_info in extra_info_dicts]
             export_columns.append(key)
@@ -961,12 +979,12 @@ class CsvReconciliationService:
 
         self._validate_dataframe(df)
         df.rename(
-            columns={v: k for k, v in PayrollConfig.csv_reconciliation_field_mapping.items()},
+            columns={v: k for k, v in self._reconciliation_field_mapping().items()},
             inplace=True,
         )
         code_column = PayrollConfig.csv_reconciliation_code_column
         national_id_column = next(
-            (field for field, header in PayrollConfig.csv_reconciliation_field_mapping.items()
+            (field for field, header in self._reconciliation_field_mapping().items()
              if header == "National ID"),
             None,
         )
@@ -1158,13 +1176,12 @@ class CsvReconciliationService:
         }
         if fallback_payroll_ids:
             fallback_memberships = PayrollBenefitConsumption.objects.filter(
+                primary_worker_membership_filter("benefit__individual__groupindividuals"),
                 payroll_id__in=[
                     source_payroll_id_by_value[payroll_id] for payroll_id in fallback_payroll_ids
                 ],
                 is_deleted=False,
                 benefit__is_deleted=False,
-                benefit__individual__groupindividuals__recipient_type="PRIMARY",
-                benefit__individual__groupindividuals__is_deleted=False,
             ).select_related(
                 "benefit__individual__location__parent__parent__parent",
             )
@@ -1207,12 +1224,11 @@ class CsvReconciliationService:
     def _load_upload_context(self, payroll, codes):
         benefits = list(
             BenefitConsumption.objects.filter(
+                primary_worker_membership_filter("individual__groupindividuals"),
                 code__in=list(codes.dropna().unique()),
                 is_deleted=False,
                 payrollbenefitconsumption__payroll=payroll,
                 payrollbenefitconsumption__is_deleted=False,
-                individual__groupindividuals__recipient_type="PRIMARY",
-                individual__groupindividuals__is_deleted=False,
             ).select_related("individual", "individual__location").distinct()
         )
         benefits_by_code = {benefit.code: benefit for benefit in benefits}
@@ -1395,10 +1411,9 @@ class CsvReconciliationService:
         benefit = (benefits_by_code or {}).get(code)
         if benefit is None and benefits_by_code is None:
             benefit = BenefitConsumption.objects.filter(
+                primary_worker_membership_filter("individual__groupindividuals"),
                 code=code,
                 is_deleted=False,
-                individual__groupindividuals__recipient_type="PRIMARY",
-                individual__groupindividuals__is_deleted=False,
             ).select_related("individual").first()
         if not benefit:
             return None, reasons + ["code_not_found"]
@@ -1512,10 +1527,9 @@ class CsvReconciliationService:
 
     def _get_benefit_consumption_qs(self, payroll):
         qs = BenefitConsumption.objects.filter(
+            primary_worker_membership_filter("individual__groupindividuals"),
             payrollbenefitconsumption__payroll=payroll,
             is_deleted=False,
-            individual__groupindividuals__recipient_type="PRIMARY",
-            individual__groupindividuals__is_deleted=False,
         ).distinct()
         if not qs.exists():
             raise ValueError('csv_reconciliation.validation.no_benefit_consumption_for_payroll')
@@ -1528,7 +1542,7 @@ class CsvReconciliationService:
             raise ValueError(_("Import file is empty"))
         if PayrollConfig.csv_reconciliation_errors_column in df.columns:
             raise ValueError(_("Column errors in csv."))
-        required_columns = set(PayrollConfig.csv_reconciliation_field_mapping.values()) | {
+        required_columns = set(self._reconciliation_field_mapping().values()) | {
             PayrollConfig.csv_reconciliation_paid_extra_field
         }
         missing_columns = required_columns - set(df.columns)
@@ -1562,7 +1576,7 @@ class CsvReconciliationService:
         bc.receipt = row[PayrollConfig.csv_reconciliation_receipt_column]
         extra_info = {
             k: row[k] for k in row.index
-            if k not in PayrollConfig.csv_reconciliation_field_mapping
+            if k not in self._reconciliation_field_mapping()
             and k != self.micro_catchment_column
             and not pd.isna(row[k])
         }
