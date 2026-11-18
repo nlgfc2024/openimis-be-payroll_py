@@ -61,11 +61,9 @@ class PrimaryRecipientFilterTests(SimpleTestCase):
     @patch("payroll.services.Beneficiary.objects.filter")
     def test_project_payroll_requires_primary_recipient_and_project_enrollment(self, beneficiary_filter):
         initial_queryset = MagicMock()
-        primary_queryset = MagicMock()
         project_queryset = MagicMock()
         beneficiary_filter.return_value = initial_queryset
-        initial_queryset.filter.return_value = primary_queryset
-        primary_queryset.filter.return_value = project_queryset
+        initial_queryset.filter.return_value = project_queryset
         project_queryset.distinct.return_value = project_queryset
 
         payment_plan = SimpleNamespace(benefit_plan=SimpleNamespace(id="benefit-plan-id"))
@@ -74,11 +72,79 @@ class PrimaryRecipientFilterTests(SimpleTestCase):
         }, payment_plan)
 
         initial_queryset.filter.assert_called_once()
-        self.assertIn("individual_id__in", initial_queryset.filter.call_args.kwargs)
-        primary_queryset.filter.assert_called_once_with(
+        self.assertEqual(
+            initial_queryset.filter.call_args.kwargs,
+            {
+                "individual__groupindividuals__recipient_type": "PRIMARY",
+                "individual__groupindividuals__is_deleted": False,
+            },
+        )
+        project_queryset.filter.assert_called_once_with(
             project_enrollments__project__id__in=["project-id"],
             project_enrollments__is_deleted=False,
         )
+
+    @patch("payroll.services.apps.get_model")
+    def test_group_payroll_uses_existing_primary_recipient_membership(self, get_model):
+        enrollments = MagicMock()
+        enrollments.distinct.return_value = enrollments
+        get_model.return_value.objects.filter.return_value = enrollments
+        payment_plan = SimpleNamespace(benefit_plan=SimpleNamespace(id="benefit-plan-id"))
+
+        result = PayrollService(None)._select_group_enrollments_based_on_criteria(
+            {"json_ext": {}}, payment_plan,
+        )
+
+        self.assertIs(result, enrollments)
+        get_model.assert_called_once_with(
+            "project_social_protection", "GroupBeneficiaryProjectEnrollment",
+        )
+        get_model.return_value.objects.filter.assert_called_once_with(
+            group_beneficiary__benefit_plan_id="benefit-plan-id",
+            group_beneficiary__status="ACTIVE",
+            group_beneficiary__is_deleted=False,
+            group_beneficiary__group__groupindividuals__recipient_type="PRIMARY",
+            group_beneficiary__group__groupindividuals__is_deleted=False,
+            project__status="COMPLETED",
+            project__is_deleted=False,
+            is_deleted=False,
+        )
+
+    @patch("payroll.services.BenefitConsumption.objects.filter")
+    def test_payment_details_are_snapshotted_once_on_generated_benefits(self, benefit_filter):
+        benefit = SimpleNamespace(
+            json_ext={"extra_info": {"provider_note": "keep"}},
+            individual=SimpleNamespace(json_ext={
+                "gender": "Female",
+                "account_number": "00123456",
+                "account_name": "Ada Lovelace",
+                "bank": "Example Bank",
+            }),
+            save=MagicMock(),
+        )
+        benefit_filter.return_value.select_related.return_value = [benefit]
+        payroll = SimpleNamespace(id="payroll-id")
+        user = SimpleNamespace(id="user-id")
+        service = PayrollService(user)
+
+        service._snapshot_kyc_payment_details(payroll)
+        self.assertEqual(benefit.json_ext, {
+            "extra_info": {"provider_note": "keep"},
+            "kyc_payment_details": {
+                "gender": "Female",
+                "account_number": "00123456",
+                "account_name": "Ada Lovelace",
+                "bank": "Example Bank",
+            },
+        })
+
+        benefit.individual.json_ext["account_number"] = "99999999"
+        service._snapshot_kyc_payment_details(payroll)
+        self.assertEqual(
+            benefit.json_ext["kyc_payment_details"]["account_number"],
+            "00123456",
+        )
+        self.assertEqual(benefit.save.call_count, 1)
 
     @patch("payroll.services.BenefitConsumption.objects.filter")
     def test_reconciliation_export_uses_saved_payroll_benefits(self, benefit_filter):

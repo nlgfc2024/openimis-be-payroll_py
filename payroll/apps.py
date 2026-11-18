@@ -7,11 +7,16 @@ from payroll.payments_registry import PaymentsMethodRegistryPoint
 
 MODULE_NAME = 'payroll'
 
-# Payment details are saved on the active primary recipient's individual
-# json_ext by the household KYC approval workflow. Keep these fields in every
-# reconciliation export so payment providers receive the same data for normal
-# and consolidated payrolls.
+# Snapshot payment details onto each benefit at payroll generation so later
+# KYC edits cannot change a reconciliation export for an existing payroll.
 KYC_PAYMENT_DETAILS_FIELD_MAPPING = {
+    "json_ext__kyc_payment_details__gender": "Gender",
+    "json_ext__kyc_payment_details__account_number": "Account Number",
+    "json_ext__kyc_payment_details__account_name": "Account Name",
+    "json_ext__kyc_payment_details__bank": "Bank",
+}
+
+LEGACY_KYC_PAYMENT_DETAILS_FIELD_MAPPING = {
     "individual__json_ext__gender": "Gender",
     "individual__json_ext__account_number": "Account Number",
     "individual__json_ext__account_name": "Account Name",
