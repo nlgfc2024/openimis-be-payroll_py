@@ -1,3 +1,5 @@
+import json
+
 import graphene
 from graphene_django import DjangoObjectType
 from django.apps import apps
@@ -27,6 +29,23 @@ def _malawi_locations(individual):
         locations[location.type] = location
         location = location.parent
     return locations
+
+
+def _json_ext_value(individual, *keys):
+    """Return the first non-empty supported value from an individual's JSON data."""
+    json_ext = getattr(individual, "json_ext", None) or {}
+    if isinstance(json_ext, str):
+        try:
+            json_ext = json.loads(json_ext)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(json_ext, dict):
+        return None
+    for key in keys:
+        value = json_ext.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return None
 
 
 def benefit_consumption_queryset(queryset):
@@ -105,6 +124,10 @@ class BenefitConsumptionGQLType(DjangoObjectType):
     national_id = graphene.String()
     form_number = graphene.String()
     phone_number = graphene.String()
+    gender = graphene.String()
+    account_number = graphene.String()
+    account_name = graphene.String()
+    bank = graphene.String()
     district_name = graphene.String()
     traditional_authority_name = graphene.String()
     group_village_head_name = graphene.String()
@@ -141,15 +164,40 @@ class BenefitConsumptionGQLType(DjangoObjectType):
         )
 
     def resolve_national_id(self, info):
-        return (self.individual.json_ext or {}).get("national_id")
+        return _json_ext_value(self.individual, "national_id", "nationalId", "nid")
 
     def resolve_form_number(self, info):
-        form_number = (self.individual.json_ext or {}).get("form_number")
-        return str(form_number) if form_number is not None else None
+        return _json_ext_value(self.individual, "form_number", "formNumber")
 
     def resolve_phone_number(self, info):
-        phone_number = (self.individual.json_ext or {}).get("household_mobile_number")
-        return str(phone_number) if phone_number is not None else None
+        return _json_ext_value(
+            self.individual,
+            "household_mobile_number", "householdMobileNumber", "phone_number", "phoneNumber",
+            "mobile_number", "mobileNumber",
+        )
+
+    def resolve_gender(self, info):
+        return _json_ext_value(self.individual, "gender", "sex")
+
+    def resolve_account_number(self, info):
+        return _json_ext_value(
+            self.individual,
+            "account_number", "accountNumber", "payment_account_number", "paymentAccountNumber",
+            "bank_account_number", "bankAccountNumber", "account_no", "accountNo",
+        )
+
+    def resolve_account_name(self, info):
+        return _json_ext_value(
+            self.individual,
+            "account_name", "accountName", "payment_account_name", "paymentAccountName",
+            "bank_account_name", "bankAccountName", "account_holder_name", "accountHolderName",
+        )
+
+    def resolve_bank(self, info):
+        return _json_ext_value(
+            self.individual,
+            "bank", "bank_name", "bankName", "provider", "payment_provider", "paymentProvider",
+        )
 
     def resolve_district_name(self, info):
         location = _malawi_locations(self.individual).get("R")
