@@ -37,6 +37,7 @@ from payroll.models import (
     Payroll,
     PayrollBenefitConsumption,
     BenefitConsumption,
+    BenefitAttachment,
     BenefitConsumptionStatus,
     ConsolidatedPayrollMember,
     PayrollStatus,
@@ -123,6 +124,9 @@ class PayrollService(BaseService):
                             payroll,
                             payment_cycle,
                             enrollments_queryset=enrollments_queryset,
+                        )
+                        self._assign_group_benefits_to_primary_recipients(
+                            payroll, enrollments_queryset
                         )
                     else:
                         beneficiaries_queryset = self._select_beneficiary_based_on_criteria(
@@ -614,7 +618,9 @@ class PayrollService(BaseService):
             benefit_json_ext = benefit.json_ext or {}
             if benefit_json_ext.get("kyc_payment_details") is not None:
                 continue
-            individual_json_ext = benefit.individual.json_ext or {}
+            individual_json_ext = (
+                benefit.individual.json_ext if benefit.individual else {}
+            ) or {}
             benefit_json_ext = dict(benefit_json_ext)
             benefit_json_ext["kyc_payment_details"] = {
                 field: individual_json_ext.get(field)
@@ -622,6 +628,53 @@ class PayrollService(BaseService):
             }
             benefit.json_ext = benefit_json_ext
             benefit.save(user=self.user)
+
+    def _assign_group_benefits_to_primary_recipients(self, payroll, enrollments_queryset):
+        """Make each generated household benefit payable to its PRIMARY member."""
+        group_individual_model = apps.get_model("individual", "GroupIndividual")
+        group_ids_by_beneficiary = dict(
+            enrollments_queryset.values_list("group_beneficiary_id", "group_beneficiary__group_id")
+        )
+        primary_recipient_by_group = dict(
+            group_individual_model.objects.filter(
+                group_id__in=group_ids_by_beneficiary.values(),
+                recipient_type="PRIMARY",
+                is_deleted=False,
+            ).values_list("group_id", "individual_id")
+        )
+        primary_recipient_by_beneficiary = {
+            str(group_beneficiary_id): primary_recipient_by_group.get(group_id)
+            for group_beneficiary_id, group_id in group_ids_by_beneficiary.items()
+        }
+        if any(recipient_id is None for recipient_id in primary_recipient_by_beneficiary.values()):
+            raise ValidationError(
+                "Every household selected for payroll must have a primary recipient."
+            )
+
+        attachments = BenefitAttachment.objects.filter(
+            benefit__payrollbenefitconsumption__payroll=payroll,
+            benefit__payrollbenefitconsumption__is_deleted=False,
+            is_deleted=False,
+        ).select_related("benefit", "bill")
+        benefits_updated = set()
+        for attachment in attachments:
+            recipient_id = primary_recipient_by_beneficiary.get(str(attachment.bill.subject_id))
+            if recipient_id is None:
+                continue
+            attachment.benefit.individual_id = recipient_id
+            attachment.benefit.save(user=self.user)
+            benefits_updated.add(attachment.benefit_id)
+
+        expected_benefit_ids = set(
+            PayrollBenefitConsumption.objects.filter(
+                payroll=payroll,
+                is_deleted=False,
+            ).values_list("benefit_id", flat=True)
+        )
+        if expected_benefit_ids != benefits_updated:
+            raise ValidationError(
+                "Unable to assign every household benefit to its primary recipient."
+            )
 
     @staticmethod
     def _enforce_beneficiary_scope(payroll, beneficiaries_queryset):

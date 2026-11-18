@@ -147,6 +147,52 @@ class PrimaryRecipientFilterTests(SimpleTestCase):
         self.assertEqual(benefit.save.call_count, 1)
 
     @patch("payroll.services.BenefitConsumption.objects.filter")
+    def test_payment_snapshot_handles_a_benefit_without_an_individual(self, benefit_filter):
+        benefit = SimpleNamespace(json_ext=None, individual=None, save=MagicMock())
+        benefit_filter.return_value.select_related.return_value = [benefit]
+
+        PayrollService(SimpleNamespace(id="user-id"))._snapshot_kyc_payment_details(
+            SimpleNamespace(id="payroll-id")
+        )
+
+        self.assertEqual(benefit.json_ext, {
+            "kyc_payment_details": {
+                "gender": None,
+                "account_number": None,
+                "account_name": None,
+                "bank": None,
+            },
+        })
+        benefit.save.assert_called_once()
+
+    @patch("payroll.services.PayrollBenefitConsumption.objects.filter")
+    @patch("payroll.services.BenefitAttachment.objects.filter")
+    @patch("payroll.services.apps.get_model")
+    def test_group_benefits_are_reassigned_to_the_primary_recipient(
+        self, get_model, attachment_filter, payroll_benefit_filter,
+    ):
+        enrollments = MagicMock()
+        enrollments.values_list.return_value = [("beneficiary-id", "group-id")]
+        get_model.return_value.objects.filter.return_value.values_list.return_value = [
+            ("group-id", "recipient-id"),
+        ]
+        benefit = SimpleNamespace(id="benefit-id", individual_id="worker-id", save=MagicMock())
+        attachment = SimpleNamespace(
+            benefit=benefit,
+            benefit_id="benefit-id",
+            bill=SimpleNamespace(subject_id="beneficiary-id"),
+        )
+        attachment_filter.return_value.select_related.return_value = [attachment]
+        payroll_benefit_filter.return_value.values_list.return_value = ["benefit-id"]
+
+        PayrollService(SimpleNamespace(id="user-id"))._assign_group_benefits_to_primary_recipients(
+            SimpleNamespace(id="payroll-id"), enrollments,
+        )
+
+        self.assertEqual(benefit.individual_id, "recipient-id")
+        benefit.save.assert_called_once()
+
+    @patch("payroll.services.BenefitConsumption.objects.filter")
     def test_reconciliation_export_uses_saved_payroll_benefits(self, benefit_filter):
         queryset = MagicMock()
         queryset.distinct.return_value = queryset
