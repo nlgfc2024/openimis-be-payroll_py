@@ -9,7 +9,7 @@ from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError
 from django.db import transaction
 from simple_history.utils import bulk_create_with_history
-from django.db.models import Count, Q, Sum
+from django.db.models import Count, Q, Subquery, Sum
 from django.utils.translation import gettext as _
 
 from core import datetime
@@ -21,9 +21,8 @@ from invoice.models import Bill, BillItem, PaymentInvoice, DetailPaymentInvoice
 from location.models import Location, LocationManager
 from invoice.services import PaymentInvoiceService
 from payment_cycle.models import PaymentCycle
-from individual.primary_recipients import (
+from enrolment.membership import (
     authoritative_primary_worker_memberships,
-    primary_worker_membership_filter,
 )
 from payroll.apps import PayrollConfig, KYC_PAYMENT_DETAILS_FIELD_MAPPING
 from payroll.consolidation import (
@@ -501,8 +500,9 @@ class PayrollService(BaseService):
         )
         json_ext = obj_data.get("json_ext", {})
         filter_criteria = json_ext.get("filter_criteria", {})
+        primary_worker_groups = authoritative_primary_worker_memberships().values("group_id")
         enrollments_queryset = enrollment_model.objects.filter(
-            primary_worker_membership_filter("group_beneficiary__group__groupindividuals"),
+            group_beneficiary__group_id__in=Subquery(primary_worker_groups),
             group_beneficiary__benefit_plan_id=payment_plan.benefit_plan.id,
             group_beneficiary__status=BeneficiaryStatus.ACTIVE,
             group_beneficiary__is_deleted=False,
@@ -539,8 +539,9 @@ class PayrollService(BaseService):
 
         # Payrolls are paid to the primary recipient for a household, never
         # to every member of the household.
+        primary_worker_ids = authoritative_primary_worker_memberships().values("individual_id")
         beneficiaries_queryset = beneficiaries_queryset.filter(
-            primary_worker_membership_filter("individual__groupindividuals"),
+            individual_id__in=Subquery(primary_worker_ids),
         )
 
         project_ids = filter_criteria.get("project_ids", [])
@@ -616,10 +617,26 @@ class PayrollService(BaseService):
         group_ids_by_beneficiary = dict(
             enrollments_queryset.values_list("group_beneficiary_id", "group_beneficiary__group_id")
         )
+        group_ids = set(group_ids_by_beneficiary.values())
+        primary_recipients = authoritative_primary_worker_memberships().filter(
+            group_id__in=group_ids,
+        )
+        recipient_counts = dict(
+            primary_recipients.values("group_id")
+            .annotate(recipient_count=Count("id"))
+            .values_list("group_id", "recipient_count")
+        )
+        invalid_group_ids = [
+            group_id for group_id in group_ids if recipient_counts.get(group_id) != 1
+        ]
+        if invalid_group_ids:
+            raise ValidationError(
+                "Every household selected for payroll must have exactly one primary recipient. "
+                "Invalid household IDs: "
+                + ", ".join(str(group_id) for group_id in invalid_group_ids)
+            )
         primary_recipient_by_group = dict(
-            authoritative_primary_worker_memberships().filter(
-                group_id__in=group_ids_by_beneficiary.values(),
-            ).values_list("group_id", "individual_id")
+            primary_recipients.values_list("group_id", "individual_id")
         )
         primary_recipient_by_beneficiary = {
             str(group_beneficiary_id): primary_recipient_by_group.get(group_id)
@@ -777,8 +794,15 @@ class CsvReconciliationService:
     def _reconciliation_field_mapping():
         """Return configured fields plus mandatory recipient payment details."""
         field_mapping = dict(PayrollConfig.csv_reconciliation_field_mapping or {})
-        for field, header in KYC_PAYMENT_DETAILS_FIELD_MAPPING.items():
-            field_mapping.setdefault(field, header)
+        # KYC values must come from the approved recipient fields. Remove any
+        # legacy aliases using the same provider header so CSV headers stay
+        # unique and pandas can round-trip the file without ``.1`` columns.
+        kyc_headers = set(KYC_PAYMENT_DETAILS_FIELD_MAPPING.values())
+        field_mapping = {
+            field: header for field, header in field_mapping.items()
+            if header not in kyc_headers
+        }
+        field_mapping.update(KYC_PAYMENT_DETAILS_FIELD_MAPPING)
         return field_mapping
 
     def download_reconciliation(self, payroll_id) -> BytesIO:
@@ -977,14 +1001,15 @@ class CsvReconciliationService:
         except Exception as exc:
             raise ValueError(_("Unable to read CSV file: %(error)s") % {"error": str(exc)})
 
+        field_mapping = self._reconciliation_field_mapping()
         self._validate_dataframe(df)
         df.rename(
-            columns={v: k for k, v in self._reconciliation_field_mapping().items()},
+            columns={v: k for k, v in field_mapping.items()},
             inplace=True,
         )
         code_column = PayrollConfig.csv_reconciliation_code_column
         national_id_column = next(
-            (field for field, header in self._reconciliation_field_mapping().items()
+            (field for field, header in field_mapping.items()
              if header == "National ID"),
             None,
         )
@@ -1176,7 +1201,6 @@ class CsvReconciliationService:
         }
         if fallback_payroll_ids:
             fallback_memberships = PayrollBenefitConsumption.objects.filter(
-                primary_worker_membership_filter("benefit__individual__groupindividuals"),
                 payroll_id__in=[
                     source_payroll_id_by_value[payroll_id] for payroll_id in fallback_payroll_ids
                 ],
@@ -1224,7 +1248,6 @@ class CsvReconciliationService:
     def _load_upload_context(self, payroll, codes):
         benefits = list(
             BenefitConsumption.objects.filter(
-                primary_worker_membership_filter("individual__groupindividuals"),
                 code__in=list(codes.dropna().unique()),
                 is_deleted=False,
                 payrollbenefitconsumption__payroll=payroll,
@@ -1411,9 +1434,10 @@ class CsvReconciliationService:
         benefit = (benefits_by_code or {}).get(code)
         if benefit is None and benefits_by_code is None:
             benefit = BenefitConsumption.objects.filter(
-                primary_worker_membership_filter("individual__groupindividuals"),
                 code=code,
                 is_deleted=False,
+                payrollbenefitconsumption__payroll=payroll,
+                payrollbenefitconsumption__is_deleted=False,
             ).select_related("individual").first()
         if not benefit:
             return None, reasons + ["code_not_found"]
@@ -1527,7 +1551,6 @@ class CsvReconciliationService:
 
     def _get_benefit_consumption_qs(self, payroll):
         qs = BenefitConsumption.objects.filter(
-            primary_worker_membership_filter("individual__groupindividuals"),
             payrollbenefitconsumption__payroll=payroll,
             is_deleted=False,
         ).distinct()
@@ -1542,7 +1565,7 @@ class CsvReconciliationService:
             raise ValueError(_("Import file is empty"))
         if PayrollConfig.csv_reconciliation_errors_column in df.columns:
             raise ValueError(_("Column errors in csv."))
-        required_columns = set(self._reconciliation_field_mapping().values()) | {
+        required_columns = set(PayrollConfig.csv_reconciliation_field_mapping.values()) | {
             PayrollConfig.csv_reconciliation_paid_extra_field
         }
         missing_columns = required_columns - set(df.columns)
@@ -1574,9 +1597,10 @@ class CsvReconciliationService:
     def _reconcile_bc(self, row, bc):
         bc.status = BenefitConsumptionStatus.RECONCILED
         bc.receipt = row[PayrollConfig.csv_reconciliation_receipt_column]
+        reconciliation_fields = set(self._reconciliation_field_mapping())
         extra_info = {
             k: row[k] for k in row.index
-            if k not in self._reconciliation_field_mapping()
+            if k not in reconciliation_fields
             and k != self.micro_catchment_column
             and not pd.isna(row[k])
         }

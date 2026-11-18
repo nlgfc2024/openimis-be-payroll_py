@@ -10,7 +10,7 @@ from django.test import TestCase
 from django.core.exceptions import ValidationError
 
 from tasks_management.models import Task
-from payroll.apps import PayrollConfig
+from payroll.apps import KYC_PAYMENT_DETAILS_FIELD_MAPPING, PayrollConfig
 from payroll import signals
 from payroll.models import (
     BenefitConsumption,
@@ -140,6 +140,40 @@ class ReconciliationAuditPolicyTests(TestCase):
     def test_uploaded_national_id_matching_ignores_surrounding_whitespace(self):
         self.assertTrue(CsvReconciliationService._matches_text(" ID-123 ", "ID-123"))
 
+    def test_kyc_export_headers_replace_legacy_aliases(self):
+        original_mapping = PayrollConfig.csv_reconciliation_field_mapping
+        try:
+            PayrollConfig.csv_reconciliation_field_mapping = {
+                "individual__json_ext__sex": "Gender",
+                "code": "Code",
+            }
+
+            mapping = CsvReconciliationService._reconciliation_field_mapping()
+
+            self.assertEqual(mapping["individual__json_ext__gender"], "Gender")
+            self.assertNotIn("individual__json_ext__sex", mapping)
+            self.assertEqual(list(mapping.values()).count("Gender"), 1)
+        finally:
+            PayrollConfig.csv_reconciliation_field_mapping = original_mapping
+
+    def test_legacy_upload_does_not_require_kyc_payment_columns(self):
+        original_mapping = PayrollConfig.csv_reconciliation_field_mapping
+        try:
+            legacy_mapping = {
+                field: header
+                for field, header in original_mapping.items()
+                if field not in KYC_PAYMENT_DETAILS_FIELD_MAPPING
+            }
+            PayrollConfig.csv_reconciliation_field_mapping = legacy_mapping
+            dataframe = pd.DataFrame([{
+                **{header: "value" for header in legacy_mapping.values()},
+                PayrollConfig.csv_reconciliation_paid_extra_field: "No",
+            }])
+
+            CsvReconciliationService(None)._validate_dataframe(dataframe)
+        finally:
+            PayrollConfig.csv_reconciliation_field_mapping = original_mapping
+
     def test_project_name_uses_source_payroll_not_consolidated_link(self):
         project = SimpleNamespace(id="project-id", name="Source project")
         source_payroll = SimpleNamespace(
@@ -234,6 +268,7 @@ class ReconciliationAuditPolicyTests(TestCase):
 
         with (
             patch.object(service, "_resolve_payroll", return_value=payroll),
+            patch("payroll.services.ensure_payroll_is_not_consolidated_source"),
             patch.object(service, "_get_benefit_consumption_qs", return_value=benefits),
             patch.object(service, "_get_source_payrolls_by_benefit", return_value={}),
             patch.object(service, "_get_payroll_micro_catchment", return_value=None),

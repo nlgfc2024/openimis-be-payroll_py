@@ -73,17 +73,15 @@ class PrimaryRecipientFilterTests(SimpleTestCase):
             "json_ext": {"filter_criteria": {"project_ids": ["project-id"]}},
         }, payment_plan)
 
-        initial_queryset.filter.assert_called_once_with(
-            individual__groupindividuals__recipient_type="PRIMARY",
-            individual__groupindividuals__is_deleted=False,
-        )
+        initial_queryset.filter.assert_called_once()
+        self.assertIn("individual_id__in", initial_queryset.filter.call_args.kwargs)
         primary_queryset.filter.assert_called_once_with(
             project_enrollments__project__id__in=["project-id"],
             project_enrollments__is_deleted=False,
         )
 
     @patch("payroll.services.BenefitConsumption.objects.filter")
-    def test_reconciliation_export_uses_primary_recipients_only(self, benefit_filter):
+    def test_reconciliation_export_uses_saved_payroll_benefits(self, benefit_filter):
         queryset = MagicMock()
         queryset.distinct.return_value = queryset
         queryset.exists.return_value = True
@@ -96,6 +94,4 @@ class PrimaryRecipientFilterTests(SimpleTestCase):
         benefit_filter.assert_called_once_with(
             payrollbenefitconsumption__payroll=payroll,
             is_deleted=False,
-            individual__groupindividuals__recipient_type="PRIMARY",
-            individual__groupindividuals__is_deleted=False,
         )
