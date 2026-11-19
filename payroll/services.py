@@ -25,6 +25,11 @@ from payroll.apps import (
     LEGACY_KYC_PAYMENT_DETAILS_FIELD_MAPPING,
     PayrollConfig,
     KYC_PAYMENT_DETAILS_FIELD_MAPPING,
+    KYC_PAYMENT_PREPARATION_FIELD_MAPPING,
+)
+from payroll.kyc_payment import (
+    PayrollKycPaymentPreparationService,
+    get_prepared_cash_out_fee,
 )
 from payroll.consolidation import (
     ensure_benefit_is_not_in_active_consolidation,
@@ -152,7 +157,6 @@ class PayrollService(BaseService):
                         # and location criteria, so retain only the generated benefits
                         # belonging to the selected beneficiaries.
                         self._enforce_beneficiary_scope(payroll, beneficiaries_queryset)
-                    self._snapshot_kyc_payment_details(payroll)
                 else:
                     self._move_benefit_consumptions(payroll, from_failed_invoices_payroll_id)
                 self.create_accept_payroll_task(payroll.id, obj_data)
@@ -434,6 +438,7 @@ class PayrollService(BaseService):
     def make_payment_for_payroll(self, obj_data):
         payroll = Payroll.objects.get(id=obj_data['id'], is_deleted=False)
         ensure_payroll_is_not_consolidated_source(payroll, "pay")
+        PayrollKycPaymentPreparationService(self.user).prepare(payroll)
         send_requests_to_gateway_payment.delay(payroll.id, self.user.id)
 
     def _save_payroll(self, obj_data, payment_plan, payment_cycle, project_names):
@@ -603,31 +608,6 @@ class PayrollService(BaseService):
             payment_plan,
             **calculation_kwargs,
         )
-
-    def _snapshot_kyc_payment_details(self, payroll):
-        benefits = BenefitConsumption.objects.filter(
-            payrollbenefitconsumption__payroll=payroll,
-            payrollbenefitconsumption__is_deleted=False,
-            is_deleted=False,
-        ).select_related("individual")
-        snapshot_fields = {
-            field.rsplit("__", 1)[-1]
-            for field in KYC_PAYMENT_DETAILS_FIELD_MAPPING
-        }
-        for benefit in benefits:
-            benefit_json_ext = benefit.json_ext or {}
-            if benefit_json_ext.get("kyc_payment_details") is not None:
-                continue
-            individual_json_ext = (
-                benefit.individual.json_ext if benefit.individual else {}
-            ) or {}
-            benefit_json_ext = dict(benefit_json_ext)
-            benefit_json_ext["kyc_payment_details"] = {
-                field: individual_json_ext.get(field)
-                for field in snapshot_fields
-            }
-            benefit.json_ext = benefit_json_ext
-            benefit.save(user=self.user)
 
     def _assign_group_benefits_to_primary_recipients(self, payroll, enrollments_queryset):
         """Make each generated household benefit payable to its PRIMARY member."""
@@ -807,7 +787,10 @@ class CsvReconciliationService:
             for field, header in field_mapping.items()
         }
         mapped_headers = set(mapped_fields.values())
-        for field, header in KYC_PAYMENT_DETAILS_FIELD_MAPPING.items():
+        for field, header in {
+            **KYC_PAYMENT_DETAILS_FIELD_MAPPING,
+            **KYC_PAYMENT_PREPARATION_FIELD_MAPPING,
+        }.items():
             if field not in mapped_fields and header not in mapped_headers:
                 mapped_fields[field] = header
                 mapped_headers.add(header)
@@ -816,6 +799,7 @@ class CsvReconciliationService:
     def download_reconciliation(self, payroll_id) -> BytesIO:
         payroll = self._resolve_payroll(payroll_id)
         ensure_payroll_is_not_consolidated_source(payroll, "download a reconciliation file for")
+        PayrollKycPaymentPreparationService(self.user).prepare(payroll)
         bc_qs = self._get_benefit_consumption_qs(payroll)
         # Module configuration is persisted by deployment. Merge the KYC
         # fields at export time as well as defining them in DEFAULT_CONFIG so
@@ -1553,9 +1537,13 @@ class CsvReconciliationService:
             raise ValueError(_("Column errors in csv."))
         kyc_fields = (
             set(KYC_PAYMENT_DETAILS_FIELD_MAPPING)
+            | set(KYC_PAYMENT_PREPARATION_FIELD_MAPPING)
             | set(LEGACY_KYC_PAYMENT_DETAILS_FIELD_MAPPING)
         )
-        kyc_headers = set(KYC_PAYMENT_DETAILS_FIELD_MAPPING.values())
+        kyc_headers = (
+            set(KYC_PAYMENT_DETAILS_FIELD_MAPPING.values())
+            | set(KYC_PAYMENT_PREPARATION_FIELD_MAPPING.values())
+        )
         required_columns = {
             header
             for field, header in (PayrollConfig.csv_reconciliation_field_mapping or {}).items()
@@ -1605,9 +1593,10 @@ class CsvReconciliationService:
         bc.save(username=self.user.login_name)
         bill = Bill.objects.filter(benefitattachment__benefit=bc, is_deleted=False).first()
         if bill:
-            self._reconcile_bill(row, bill)
+            self._reconcile_bill(row, bill, bc)
 
-    def _reconcile_bill(self, row, bill):
+    def _reconcile_bill(self, row, bill, benefit):
+        cash_out_fee = get_prepared_cash_out_fee(benefit)
         current_date = datetime.date.today()
         bill.status = Bill.Status.RECONCILIATED
         bill.date_payed = current_date
@@ -1619,7 +1608,7 @@ class CsvReconciliationService:
             "code_receipt": bill.code,
             "label": bill.terms,
             'reconciliation_status': PaymentInvoice.ReconciliationStatus.RECONCILIATED,
-            "fees": 0.0,
+            "fees": cash_out_fee,
             "amount_received": bill.amount_total,
             "date_payment": current_date,
             'payment_origin': "online payment",
@@ -1632,7 +1621,7 @@ class CsvReconciliationService:
             'subject_type': ContentType.objects.get_for_model(bill),
             'subject': bill,
             'status': DetailPaymentInvoice.DetailPaymentStatus.ACCEPTED,
-            'fees': 0.0,
+            'fees': cash_out_fee,
             'amount': bill.amount_total,
             'reconcilation_id': row[PayrollConfig.csv_reconciliation_receipt_column],
             'reconcilation_date': current_date,

@@ -95,6 +95,9 @@ class StrategyOnlinePayment(StrategyOfPaymentInterface):
         from django.contrib.contenttypes.models import ContentType
         from invoice.models import Bill, DetailPaymentInvoice, PaymentInvoice
         from invoice.services import PaymentInvoiceService
+        from payroll.kyc_payment import get_prepared_cash_out_fee
+
+        cash_out_fee = get_prepared_cash_out_fee(benefit)
         current_date = datetime.date.today()
         bill.status = Bill.Status.RECONCILIATED
         bill.date_payed = current_date
@@ -106,7 +109,7 @@ class StrategyOnlinePayment(StrategyOfPaymentInterface):
             "code_receipt": bill.code,
             "label": bill.terms,
             'reconciliation_status': PaymentInvoice.ReconciliationStatus.RECONCILIATED,
-            "fees": 0.0,
+            "fees": cash_out_fee,
             "amount_received": bill.amount_total,
             "date_payment": current_date,
             'payment_origin': "online payment",
@@ -119,7 +122,7 @@ class StrategyOnlinePayment(StrategyOfPaymentInterface):
             'subject_type': ContentType.objects.get_for_model(bill),
             'subject': bill,
             'status': DetailPaymentInvoice.DetailPaymentStatus.ACCEPTED,
-            'fees': 0.0,
+            'fees': cash_out_fee,
             'amount': bill.amount_total,
             'reconcilation_id': benefit.receipt,
             'reconcilation_date': current_date,

@@ -12,6 +12,8 @@ from location.gql_queries import LocationGQLType
 from individual.gql_queries import IndividualGQLType
 from payroll.models import PaymentPoint, Payroll, BenefitConsumption, \
     PayrollBenefitConsumption, BenefitAttachment, CsvReconciliationUpload, ReconciliationUploadRow, ConsolidatedPayrollMember
+from payroll.apps import PayrollConfig
+from payroll.kyc_payment import get_payroll_kyc_payment_readiness
 from contribution_plan.gql import PaymentPlanGQLType
 from payment_cycle.gql_queries import PaymentCycleGQLType
 from social_protection.models import BenefitPlan
@@ -265,6 +267,7 @@ class PayrollGQLType(DjangoObjectType):
     benefit_consumption = graphene.List(BenefitConsumptionGQLType)
     benefit_plan_name_code = graphene.String()
     consolidated_members = graphene.List(ConsolidatedPayrollMemberGQLType)
+    kyc_payment_readiness = graphene.JSONString()
 
     class Meta:
         model = Payroll
@@ -312,6 +315,15 @@ class PayrollGQLType(DjangoObjectType):
         } for member in ConsolidatedPayrollMember.objects.filter(
             consolidated_payroll=self,
         ).select_related("source_payroll")]
+
+    def resolve_kyc_payment_readiness(self, info):
+        from payroll.schema import Query
+
+        Query._check_permissions(
+            info.context.user,
+            PayrollConfig.gql_payroll_search_perms,
+        )
+        return get_payroll_kyc_payment_readiness(self)
 
 
 class PaymentMethodGQLType(graphene.ObjectType):

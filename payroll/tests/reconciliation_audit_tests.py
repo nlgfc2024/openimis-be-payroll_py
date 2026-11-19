@@ -243,6 +243,7 @@ class ReconciliationAuditPolicyTests(TestCase):
 
         with (
             patch.object(service, "_resolve_payroll", return_value=consolidated_payroll),
+            patch("payroll.services.PayrollKycPaymentPreparationService.prepare"),
             patch.object(service, "_get_benefit_consumption_qs", return_value=benefits),
             patch.object(
                 service, "_get_source_payrolls_by_benefit",
@@ -277,6 +278,8 @@ class ReconciliationAuditPolicyTests(TestCase):
             "json_ext__kyc_payment_details__account_number": "00123456",
             "json_ext__kyc_payment_details__account_name": "Jane Banda",
             "json_ext__kyc_payment_details__bank": "Mpamba",
+            "json_ext__kyc_payment_preparation__fee_mwk": "25.00",
+            "json_ext__kyc_payment_preparation__programme_total_cost": "1025.00",
         })
         benefits = MagicMock()
         benefits.values.return_value = [record]
@@ -286,6 +289,7 @@ class ReconciliationAuditPolicyTests(TestCase):
         with (
             patch.object(service, "_resolve_payroll", return_value=payroll),
             patch("payroll.services.ensure_payroll_is_not_consolidated_source"),
+            patch("payroll.services.PayrollKycPaymentPreparationService.prepare"),
             patch.object(service, "_get_benefit_consumption_qs", return_value=benefits),
             patch.object(service, "_get_source_payrolls_by_benefit", return_value={}),
             patch.object(service, "_get_payroll_micro_catchment", return_value=None),
@@ -299,6 +303,8 @@ class ReconciliationAuditPolicyTests(TestCase):
         self.assertEqual(exported.loc[0, "Account Number"], "00123456")
         self.assertEqual(exported.loc[0, "Account Name"], "Jane Banda")
         self.assertEqual(exported.loc[0, "Bank"], "Mpamba")
+        self.assertEqual(exported.loc[0, "Cash-out Fee"], "25.00")
+        self.assertEqual(exported.loc[0, "Programme Total Cost"], "1025.00")
 
     def test_reconciliation_export_preserves_configured_column_order(self):
         original_mapping = PayrollConfig.csv_reconciliation_field_mapping
@@ -317,7 +323,7 @@ class ReconciliationAuditPolicyTests(TestCase):
         benefit = SimpleNamespace(id="benefit-id", code="CODE-1", json_ext={})
         record = {
             field: "value"
-            for field in PayrollConfig.csv_reconciliation_field_mapping
+            for field in CsvReconciliationService._reconciliation_field_mapping()
         }
         record["code"] = benefit.code
         benefits = MagicMock()
@@ -329,6 +335,7 @@ class ReconciliationAuditPolicyTests(TestCase):
             with (
                 patch.object(service, "_resolve_payroll", return_value=payroll),
                 patch("payroll.services.ensure_payroll_is_not_consolidated_source"),
+                patch("payroll.services.PayrollKycPaymentPreparationService.prepare"),
                 patch.object(service, "_get_benefit_consumption_qs", return_value=benefits),
                 patch.object(service, "_get_source_payrolls_by_benefit", return_value={}),
                 patch.object(service, "_get_payroll_micro_catchment", return_value=None),
@@ -347,6 +354,8 @@ class ReconciliationAuditPolicyTests(TestCase):
             "Account Name",
             "Bank",
             "First Name",
+            "Cash-out Fee",
+            "Programme Total Cost",
             "Micro Catchment",
             "Paid",
         ])

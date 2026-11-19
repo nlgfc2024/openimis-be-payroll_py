@@ -110,61 +110,6 @@ class PrimaryRecipientFilterTests(SimpleTestCase):
             is_deleted=False,
         )
 
-    @patch("payroll.services.BenefitConsumption.objects.filter")
-    def test_payment_details_are_snapshotted_once_on_generated_benefits(self, benefit_filter):
-        benefit = SimpleNamespace(
-            json_ext={"extra_info": {"provider_note": "keep"}},
-            individual=SimpleNamespace(json_ext={
-                "gender": "Female",
-                "account_number": "00123456",
-                "account_name": "Ada Lovelace",
-                "bank": "Example Bank",
-            }),
-            save=MagicMock(),
-        )
-        benefit_filter.return_value.select_related.return_value = [benefit]
-        payroll = SimpleNamespace(id="payroll-id")
-        user = SimpleNamespace(id="user-id")
-        service = PayrollService(user)
-
-        service._snapshot_kyc_payment_details(payroll)
-        self.assertEqual(benefit.json_ext, {
-            "extra_info": {"provider_note": "keep"},
-            "kyc_payment_details": {
-                "gender": "Female",
-                "account_number": "00123456",
-                "account_name": "Ada Lovelace",
-                "bank": "Example Bank",
-            },
-        })
-
-        benefit.individual.json_ext["account_number"] = "99999999"
-        service._snapshot_kyc_payment_details(payroll)
-        self.assertEqual(
-            benefit.json_ext["kyc_payment_details"]["account_number"],
-            "00123456",
-        )
-        self.assertEqual(benefit.save.call_count, 1)
-
-    @patch("payroll.services.BenefitConsumption.objects.filter")
-    def test_payment_snapshot_handles_a_benefit_without_an_individual(self, benefit_filter):
-        benefit = SimpleNamespace(json_ext=None, individual=None, save=MagicMock())
-        benefit_filter.return_value.select_related.return_value = [benefit]
-
-        PayrollService(SimpleNamespace(id="user-id"))._snapshot_kyc_payment_details(
-            SimpleNamespace(id="payroll-id")
-        )
-
-        self.assertEqual(benefit.json_ext, {
-            "kyc_payment_details": {
-                "gender": None,
-                "account_number": None,
-                "account_name": None,
-                "bank": None,
-            },
-        })
-        benefit.save.assert_called_once()
-
     @patch("payroll.services.PayrollBenefitConsumption.objects.filter")
     @patch("payroll.services.BenefitAttachment.objects.filter")
     @patch("payroll.services.apps.get_model")

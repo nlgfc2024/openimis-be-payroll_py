@@ -19,6 +19,9 @@ def send_requests_to_gateway_payment(payroll_id, user_id):
     strategy = PaymentMethodStorage.get_chosen_payment_method(payroll.payment_method)
     if strategy:
         user = User.objects.get(id=user_id)
+        from payroll.kyc_payment import PayrollKycPaymentPreparationService
+
+        PayrollKycPaymentPreparationService(user).prepare(payroll)
         strategy.initialize_payment_gateway(payroll.payment_point)
         strategy.make_payment_for_payroll(payroll, user)
 

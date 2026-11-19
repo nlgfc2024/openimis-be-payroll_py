@@ -365,3 +365,22 @@ reconciled while retaining their source membership and audit context. Any
 benefits still awaiting payment remain eligible for the existing unpaid-invoice
 recovery flow; already reconciled benefits are not moved into the recovery
 payroll.
+
+## KYC Payment Readiness and Cash-out Fees
+
+Payroll module configuration accepts `kyc_payment_providers` and
+`kyc_cash_out_fee_bands`. Both default to empty lists, so payment preparation
+is blocked until Finance supplies the active providers and fee bands. Provider
+entries use `name` and optional boolean `active`; fee-band entries use
+`provider`, inclusive `min_amount` and `max_amount` (`null` for no upper
+bound), `fee_mwk`, `effective_from` (`YYYY-MM-DD`), and optional
+`effective_to` (`YYYY-MM-DD`). Fee bands for a provider may not overlap in
+amount and effective-date ranges.
+
+The `Payroll.kycPaymentReadiness` GraphQL field reports the benefit counts and
+blocking benefit codes, as well as estimated fee and programme-cost totals for
+benefits currently ready for payment. Payment initiation and reconciliation
+CSV generation run the same checks, then snapshot the approved recipient/payment
+details and matched fee on each benefit. The reconciliation CSV includes
+`Cash-out Fee` and `Programme Total Cost`; those two columns are optional when
+uploading provider reconciliation files for backward compatibility.

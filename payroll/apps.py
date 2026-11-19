@@ -16,6 +16,11 @@ KYC_PAYMENT_DETAILS_FIELD_MAPPING = {
     "json_ext__kyc_payment_details__bank": "Bank",
 }
 
+KYC_PAYMENT_PREPARATION_FIELD_MAPPING = {
+    "json_ext__kyc_payment_preparation__fee_mwk": "Cash-out Fee",
+    "json_ext__kyc_payment_preparation__programme_total_cost": "Programme Total Cost",
+}
+
 LEGACY_KYC_PAYMENT_DETAILS_FIELD_MAPPING = {
     "individual__json_ext__gender": "Gender",
     "individual__json_ext__account_number": "Account Number",
@@ -47,6 +52,7 @@ DEFAULT_CONFIG = {
         "individual__json_ext__national_id": "National ID",
         "individual__dob": "Date of Birth",
         **KYC_PAYMENT_DETAILS_FIELD_MAPPING,
+        **KYC_PAYMENT_PREPARATION_FIELD_MAPPING,
         "code": "Code",
         "status": "Status",
         "amount": "Amount",
@@ -74,6 +80,8 @@ DEFAULT_CONFIG = {
     "csv_reconciliation_warning_mismatch_reasons": [],
     "csv_reconciliation_amount_tolerance": "0",
     "csv_reconciliation_micro_catchment_column": "Micro Catchment",
+    "kyc_payment_providers": [],
+    "kyc_cash_out_fee_bands": [],
     "payroll_delete_event": "payroll.payroll_delete",
     "benefit_delete_event": "payroll.benefit_delete",
 
@@ -118,6 +126,8 @@ class PayrollConfig(AppConfig):
     csv_reconciliation_warning_mismatch_reasons = None
     csv_reconciliation_amount_tolerance = None
     csv_reconciliation_micro_catchment_column = None
+    kyc_payment_providers = []
+    kyc_cash_out_fee_bands = []
     payroll_delete_event = None
     benefit_delete_event = None
 
@@ -155,10 +165,21 @@ class PayrollConfig(AppConfig):
         """
         Load all config fields that match current AppConfig class fields, all custom fields have to be loaded separately
         """
+        cfg = {**DEFAULT_CONFIG, **(cfg or {})}
         for field in cfg:
             if hasattr(PayrollConfig, field):
                 setattr(PayrollConfig, field, cfg[field])
         cls.__validate_reconciliation_config()
+        cls.__validate_kyc_payment_config()
+
+    @classmethod
+    def __validate_kyc_payment_config(cls):
+        from payroll.kyc_payment import validate_kyc_payment_config
+
+        validate_kyc_payment_config(
+            cls.kyc_payment_providers,
+            cls.kyc_cash_out_fee_bands,
+        )
 
     @classmethod
     def __validate_reconciliation_config(cls):
