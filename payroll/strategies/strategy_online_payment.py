@@ -1,4 +1,5 @@
 import logging
+from decimal import Decimal
 
 from django.db.models import Q, Sum
 from django.db import transaction
@@ -96,6 +97,7 @@ class StrategyOnlinePayment(StrategyOfPaymentInterface):
         from invoice.models import Bill, DetailPaymentInvoice, PaymentInvoice
         from invoice.services import PaymentInvoiceService
         current_date = datetime.date.today()
+        withdrawal_fee = benefit.withdrawal_fee or Decimal("0.00")
         bill.status = Bill.Status.RECONCILIATED
         bill.date_payed = current_date
         bill.save(username=user.login_name)
@@ -106,7 +108,7 @@ class StrategyOnlinePayment(StrategyOfPaymentInterface):
             "code_receipt": bill.code,
             "label": bill.terms,
             'reconciliation_status': PaymentInvoice.ReconciliationStatus.RECONCILIATED,
-            "fees": 0.0,
+            "fees": withdrawal_fee,
             "amount_received": bill.amount_total,
             "date_payment": current_date,
             'payment_origin': "online payment",
@@ -119,7 +121,7 @@ class StrategyOnlinePayment(StrategyOfPaymentInterface):
             'subject_type': ContentType.objects.get_for_model(bill),
             'subject': bill,
             'status': DetailPaymentInvoice.DetailPaymentStatus.ACCEPTED,
-            'fees': 0.0,
+            'fees': withdrawal_fee,
             'amount': bill.amount_total,
             'reconcilation_id': benefit.receipt,
             'reconcilation_date': current_date,
