@@ -1332,7 +1332,7 @@ class CsvReconciliationService:
         export_columns[fee_insert_index:fee_insert_index] = [
             fee_header,
             amount_to_pay_header,
-            "Type",
+            field_mapping["type"],
         ]
         if source_payroll_by_benefit:
             export_columns.insert(0, "Source Payroll")

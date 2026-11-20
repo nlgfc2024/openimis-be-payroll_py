@@ -665,7 +665,7 @@ class ReconciliationAuditPolicyTests(TestCase):
             patch("payroll.services.Payroll.objects.filter") as find_payroll,
             patch("payroll.services.Payroll.objects.select_for_update") as lock_payroll,
             patch("payroll.services.CsvReconciliationUpload.objects.filter") as find_uploads,
-            patch("payroll.services.ReconciliationUploadRow"),
+            patch("payroll.services.ReconciliationUploadRow") as upload_row_constructor,
             patch("payroll.services.bulk_create_with_history") as bulk_create,
             patch("payroll.services.ensure_payroll_is_not_consolidated_source"),
             patch("payroll.services.TaskService") as task_service,
@@ -699,9 +699,8 @@ class ReconciliationAuditPolicyTests(TestCase):
         self.assertEqual(summary["unmatched_records"], 1)
         self.assertEqual(upload.status, CsvReconciliationUpload.Status.FAIL)
         task_service.return_value.create.assert_not_called()
-        submitted_rows = bulk_create.call_args.args[0]
         self.assertEqual(
-            submitted_rows[0].submitted_data["receipt"],
+            upload_row_constructor.call_args.kwargs["submitted_data"]["receipt"],
             "provider-ref-1",
         )
 
