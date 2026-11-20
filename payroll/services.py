@@ -22,6 +22,7 @@ from location.models import Location, LocationManager
 from invoice.services import PaymentInvoiceService
 from payment_cycle.models import PaymentCycle
 from payroll.apps import (
+    GROUP_BENEFIT_PAYEE_PRIMARY_WORKER,
     LEGACY_KYC_PAYMENT_DETAILS_FIELD_MAPPING,
     PayrollConfig,
     KYC_PAYMENT_DETAILS_FIELD_MAPPING,
@@ -50,6 +51,7 @@ from payroll.validation import PaymentPointValidation, PayrollValidation, Benefi
 from calculation.services import get_calculation_object
 from core.services.utils import output_exception, check_authentication
 from contribution_plan.models import PaymentPlan
+from individual.primary_recipients import authoritative_primary_worker_memberships
 from social_protection.models import Beneficiary, BeneficiaryStatus
 from tasks_management.apps import TasksManagementConfig
 from tasks_management.models import Task
@@ -491,6 +493,10 @@ class PayrollService(BaseService):
         return payment_plan.benefit_plan.type == "GROUP"
 
     @staticmethod
+    def _pays_group_benefits_to_primary_workers():
+        return PayrollConfig.group_benefit_payee == GROUP_BENEFIT_PAYEE_PRIMARY_WORKER
+
+    @staticmethod
     def _payable_project_filter(enrollment_model):
         """WORK projects are paid once COMPLETED. A training is paid whatever its
         status: its calculation rule decides which status counts."""
@@ -500,27 +506,41 @@ class PayrollService(BaseService):
             payable |= Q(project__project_type="TRAINING")
         return payable
 
+    @staticmethod
+    def _households_with_one_primary_worker():
+        """Group IDs whose verified household has exactly one primary worker, as
+        resolved for enrolment and KYC."""
+        return authoritative_primary_worker_memberships().values("group_id").annotate(
+            workers=Count("id"),
+        ).filter(workers=1).values("group_id")
+
     def _select_group_enrollments_based_on_criteria(self, obj_data, payment_plan):
         """Return the eligible household enrollments for a GROUP payroll.
 
-        A household is paid once, through its primary recipient, so the unit of
-        selection must be ``GroupBeneficiaryProjectEnrollment`` rather than the
-        individual ``Beneficiary`` model used by individual benefit plans.
+        A household is paid once, through its payee (``group_benefit_payee``), so
+        the unit of selection must be ``GroupBeneficiaryProjectEnrollment`` rather
+        than the individual ``Beneficiary`` model used by individual benefit plans.
         """
         enrollment_model = apps.get_model(
             "project_social_protection", "GroupBeneficiaryProjectEnrollment"
         )
         json_ext = obj_data.get("json_ext", {})
         filter_criteria = json_ext.get("filter_criteria", {})
+        if self._pays_group_benefits_to_primary_workers():
+            payee_filter = {"group_beneficiary__group_id__in": self._households_with_one_primary_worker()}
+        else:
+            payee_filter = {
+                "group_beneficiary__group__groupindividuals__recipient_type": "PRIMARY",
+                "group_beneficiary__group__groupindividuals__is_deleted": False,
+            }
         enrollments_queryset = enrollment_model.objects.filter(
             self._payable_project_filter(enrollment_model),
             group_beneficiary__benefit_plan_id=payment_plan.benefit_plan.id,
             group_beneficiary__status=BeneficiaryStatus.ACTIVE,
             group_beneficiary__is_deleted=False,
-            group_beneficiary__group__groupindividuals__recipient_type="PRIMARY",
-            group_beneficiary__group__groupindividuals__is_deleted=False,
             project__is_deleted=False,
             is_deleted=False,
+            **payee_filter,
         )
 
         project_ids = filter_criteria.get("project_ids", [])
@@ -654,23 +674,36 @@ class PayrollService(BaseService):
             benefit.save(user=self.user)
 
     def _assign_group_benefits_to_primary_recipients(self, payroll, enrollments_queryset):
-        """Make each generated household benefit payable to its PRIMARY member."""
-        group_individual_model = apps.get_model("individual", "GroupIndividual")
+        """Make each generated household benefit payable to its payee: the PRIMARY
+        member, or the primary worker when ``group_benefit_payee`` says so."""
         group_ids_by_beneficiary = dict(
             enrollments_queryset.values_list("group_beneficiary_id", "group_beneficiary__group_id")
         )
-        primary_recipient_by_group = dict(
-            group_individual_model.objects.filter(
-                group_id__in=group_ids_by_beneficiary.values(),
-                recipient_type="PRIMARY",
-                is_deleted=False,
-            ).values_list("group_id", "individual_id")
-        )
+        if self._pays_group_benefits_to_primary_workers():
+            primary_recipient_by_group = self._primary_worker_by_group(group_ids_by_beneficiary)
+        else:
+            group_individual_model = apps.get_model("individual", "GroupIndividual")
+            primary_recipient_by_group = dict(
+                group_individual_model.objects.filter(
+                    group_id__in=group_ids_by_beneficiary.values(),
+                    recipient_type="PRIMARY",
+                    is_deleted=False,
+                ).values_list("group_id", "individual_id")
+            )
         primary_recipient_by_beneficiary = {
             str(group_beneficiary_id): primary_recipient_by_group.get(group_id)
             for group_beneficiary_id, group_id in group_ids_by_beneficiary.items()
         }
         if any(recipient_id is None for recipient_id in primary_recipient_by_beneficiary.values()):
+            if self._pays_group_benefits_to_primary_workers():
+                missing = sorted(
+                    beneficiary_id for beneficiary_id, recipient_id in primary_recipient_by_beneficiary.items()
+                    if recipient_id is None
+                )
+                raise ValidationError(
+                    "Every household selected for payroll must have exactly one verified "
+                    "primary worker. Households without one: %s." % ", ".join(missing)
+                )
             raise ValidationError(
                 "Every household selected for payroll must have a primary recipient."
             )
@@ -699,6 +732,17 @@ class PayrollService(BaseService):
             raise ValidationError(
                 "Unable to assign every household benefit to its primary recipient."
             )
+
+    @staticmethod
+    def _primary_worker_by_group(group_ids_by_beneficiary):
+        """The single verified primary worker of each household; a household with
+        none or several has no entry."""
+        workers = {}
+        for group_id, individual_id in authoritative_primary_worker_memberships().filter(
+                group_id__in=group_ids_by_beneficiary.values(),
+        ).values_list("group_id", "individual_id"):
+            workers.setdefault(group_id, set()).add(individual_id)
+        return {group_id: ids.pop() for group_id, ids in workers.items() if len(ids) == 1}
 
     @staticmethod
     def _enforce_beneficiary_scope(payroll, beneficiaries_queryset):

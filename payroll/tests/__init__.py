@@ -8,6 +8,7 @@ from payroll.tests.reconciliation_audit_tests import (
     ReconciliationPayrollStatusTests,
 )
 from payroll.tests.training_payee_tests import (
+    GroupBenefitPayeeConfigTest,
     GroupPayeeSelectionTest,
     IndividualPayeeSelectionTest,
 )

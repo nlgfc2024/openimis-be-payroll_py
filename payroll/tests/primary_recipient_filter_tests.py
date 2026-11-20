@@ -1,8 +1,10 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from django.core.exceptions import ValidationError
 from django.test import SimpleTestCase
 
+from payroll.apps import PayrollConfig
 from payroll.services import CsvReconciliationService, PayrollService
 
 
@@ -191,6 +193,42 @@ class PrimaryRecipientFilterTests(SimpleTestCase):
 
         self.assertEqual(benefit.individual_id, "recipient-id")
         benefit.save.assert_called_once()
+
+    @patch.object(PayrollConfig, "group_benefit_payee", "PRIMARY_WORKER")
+    @patch("payroll.services.PayrollBenefitConsumption.objects.filter")
+    @patch("payroll.services.BenefitAttachment.objects.filter")
+    @patch("payroll.services.authoritative_primary_worker_memberships")
+    def test_group_benefits_are_reassigned_to_the_primary_worker_when_configured(
+        self, memberships, attachment_filter, payroll_benefit_filter,
+    ):
+        enrollments = MagicMock()
+        enrollments.values_list.return_value = [("beneficiary-id", "group-id")]
+        memberships.return_value.filter.return_value.values_list.return_value = [("group-id", "worker-id")]
+        benefit = SimpleNamespace(id="benefit-id", individual_id="head-id", save=MagicMock())
+        attachment_filter.return_value.select_related.return_value = [SimpleNamespace(
+            benefit=benefit, benefit_id="benefit-id", bill=SimpleNamespace(subject_id="beneficiary-id"),
+        )]
+        payroll_benefit_filter.return_value.values_list.return_value = ["benefit-id"]
+
+        PayrollService(SimpleNamespace(id="user-id"))._assign_group_benefits_to_primary_recipients(
+            SimpleNamespace(id="payroll-id"), enrollments,
+        )
+
+        self.assertEqual(benefit.individual_id, "worker-id")
+
+    @patch.object(PayrollConfig, "group_benefit_payee", "PRIMARY_WORKER")
+    @patch("payroll.services.authoritative_primary_worker_memberships")
+    def test_a_household_without_one_primary_worker_fails_the_payroll_naming_it(self, memberships):
+        enrollments = MagicMock()
+        enrollments.values_list.return_value = [("one-worker", "group-1"), ("two-workers", "group-2")]
+        memberships.return_value.filter.return_value.values_list.return_value = [
+            ("group-1", "worker-1"), ("group-2", "worker-2"), ("group-2", "worker-3"),
+        ]
+
+        with self.assertRaisesMessage(ValidationError, "Households without one: two-workers."):
+            PayrollService(SimpleNamespace(id="user-id"))._assign_group_benefits_to_primary_recipients(
+                SimpleNamespace(id="payroll-id"), enrollments,
+            )
 
     @patch("payroll.services.BenefitConsumption.objects.filter")
     def test_reconciliation_export_uses_saved_payroll_benefits(self, benefit_filter):

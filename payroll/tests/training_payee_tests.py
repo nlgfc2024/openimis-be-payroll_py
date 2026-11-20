@@ -2,6 +2,7 @@
 or verified primary worker, and individuals who belong to no household."""
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from django.test import TestCase
 
@@ -22,6 +23,7 @@ from social_protection.tests.test_helpers import (
     create_individual,
 )
 
+from payroll.apps import PayrollConfig
 from payroll.services import PayrollService
 
 HAS_PROJECT_TYPE = any(field.name == "project_type" for field in Project._meta.get_fields())
@@ -84,6 +86,19 @@ class GroupPayeeSelectionTest(TestCase):
         self.assertEqual(self.selected(self.running_work), set())
         self.assertNotIn(household.id, self.selected(self.running_work))
 
+    @patch.object(PayrollConfig, "group_benefit_payee", "PRIMARY_WORKER")
+    def test_primary_worker_payee_selects_verified_households_with_one_worker(self):
+        one, members = self.household('PRTP-D', [self.work], primary_recipient=False)
+        none, _ = self.household('PRTP-E', [self.work], primary_workers=0)
+        two, _ = self.household('PRTP-F', [self.work], primary_workers=2)
+        unverified, _ = self.household('PRTP-G', [self.work], verified=False)
+        self.assertEqual(self.selected(self.work), {one.id})
+
+        workers = PayrollService._primary_worker_by_group(
+            {one.id: one.group_id, two.id: two.group_id, none.id: none.group_id})
+        self.assertEqual(workers, {one.group_id: members[1].individual_id})
+        self.assertNotIn(unverified.id, self.selected(self.work))
+
     @unittest.skipUnless(HAS_PROJECT_TYPE, "needs Project.project_type from the project module")
     def test_trainings_are_selected_whatever_their_status(self):
         training = create_project('Payee running training', self.benefit_plan, self.user.username,
@@ -128,3 +143,12 @@ class IndividualPayeeSelectionTest(TestCase):
 
         self.assertEqual(set(selected.values_list("id", flat=True)), {alone.id, recipient.id, former.id})
         self.assertNotIn(member.id, set(selected.values_list("id", flat=True)))
+
+
+class GroupBenefitPayeeConfigTest(TestCase):
+    def test_an_invalid_payee_is_rejected_at_startup(self):
+        with self.assertRaisesMessage(ValueError, "group_benefit_payee must be one of PRIMARY_RECIPIENT, PRIMARY_WORKER"):
+            PayrollConfig._PayrollConfig__load_config({"group_benefit_payee": "HEAD"})
+
+    def test_the_default_keeps_paying_the_primary_recipient(self):
+        self.assertEqual(PayrollConfig.group_benefit_payee, "PRIMARY_RECIPIENT")
