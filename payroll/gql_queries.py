@@ -216,6 +216,7 @@ class BenefitConsumptionGQLType(DjangoObjectType):
             "id": ["exact"],
             "photo": ["iexact", "istartswith", "icontains"],
             "code": ["iexact", "istartswith", "icontains"],
+            "receipt": ["iexact", "istartswith", "icontains"],
             "status": ["exact", "startswith", "icontains", "contains"],
             "type": ["exact", "startswith", "icontains"],
             "amount": ["exact", "lt", "lte", "gt", "gte"],

@@ -140,12 +140,50 @@ class WithdrawalFeeBandValidationTests(TestCase):
         with self.assertRaises(ValidationError):
             WithdrawalFeeConfigService._validate_provider("Unknown", "UNKNOWN", "BANK")
 
+    def test_used_fee_band_cannot_be_updated(self):
+        band = SimpleNamespace(
+            prepared_benefits=MagicMock(),
+        )
+        band.prepared_benefits.filter.return_value.exists.return_value = True
+        fee_band_manager = MagicMock()
+        fee_band_manager.select_for_update.return_value.filter.return_value.first.return_value = band
+
+        with patch("payroll.services.WithdrawalFeeBand.objects", fee_band_manager):
+            with self.assertRaises(ValidationError):
+                WithdrawalFeeConfigService(
+                    SimpleNamespace(username="tester"),
+                ).update_fee_band("band-id", {})
+
+    @patch("payroll.services.PaymentProvider.objects")
+    @patch("payroll.services.WithdrawalFeeBand.objects")
+    def test_inactive_provider_band_can_be_updated_without_reassignment(
+        self, fee_band_manager, provider_manager,
+    ):
+        provider = SimpleNamespace(id="provider-id", is_active=False)
+        band = self.make_band(provider=provider)
+        band.id = "band-id"
+        band.provider_id = provider.id
+        band.prepared_benefits = MagicMock()
+        band.prepared_benefits.filter.return_value.exists.return_value = False
+        band.save = MagicMock()
+        fee_band_manager.select_for_update.return_value.filter.side_effect = [
+            SimpleNamespace(first=MagicMock(return_value=band)),
+            [],
+        ]
+        provider_manager.select_for_update.return_value.filter.return_value.first.return_value = provider
+
+        WithdrawalFeeConfigService(
+            SimpleNamespace(username="tester"),
+        ).update_fee_band("band-id", {})
+
+        band.save.assert_called_once_with(username="tester")
+
 
 class WithdrawalFeePreparationTests(TestCase):
     def setUp(self):
         self.user = SimpleNamespace(username="test-user")
         self.service = PayrollService(self.user)
-        self.payroll = SimpleNamespace()
+        self.payroll = SimpleNamespace(id="00000000-0000-0000-0000-000000000001")
         self.provider = PaymentProvider(code="BANK_A", name="Bank A")
         self.fee_band = WithdrawalFeeBand(
             transfer_cost=Decimal("5.25"),
@@ -161,13 +199,16 @@ class WithdrawalFeePreparationTests(TestCase):
                 },
             },
             withdrawal_fee_prepared_at=None,
+            withdrawal_provider=None,
+            withdrawal_fee_band=None,
+            withdrawal_fee=None,
             save=MagicMock(),
         )
 
     def mock_fee_queries(self, benefit=None):
         benefits = [benefit or self.benefit]
         benefit_query = MagicMock()
-        benefit_query.filter.return_value.select_related.return_value.distinct.return_value = benefits
+        benefit_query.filter.return_value.select_related.return_value = benefits
 
         provider_query = MagicMock()
         provider_query.filter.return_value = provider_query
@@ -177,6 +218,25 @@ class WithdrawalFeePreparationTests(TestCase):
         band_query.filter.return_value = band_query
         band_query.__getitem__.return_value = [self.fee_band]
         return benefit_query, provider_query, band_query
+
+    def test_gateway_task_is_queued_after_transaction_commit(self):
+        user = SimpleNamespace(id="user-id", username="test-user")
+        payroll = SimpleNamespace(id="payroll-id")
+        service = PayrollService(user)
+
+        with (
+            patch("payroll.services.Payroll.objects.get", return_value=payroll),
+            patch("payroll.services.ensure_payroll_is_not_consolidated_source"),
+            patch.object(service, "_prepare_withdrawal_fee_snapshots"),
+            patch("payroll.services.transaction.on_commit") as on_commit,
+            patch("payroll.services.send_requests_to_gateway_payment.delay") as send_payment,
+        ):
+            service.make_payment_for_payroll({"id": payroll.id})
+
+            on_commit.assert_called_once()
+            send_payment.assert_not_called()
+            on_commit.call_args.args[0]()
+            send_payment.assert_called_once_with(payroll.id, user.id)
 
     @patch("payroll.services.WithdrawalFeeBand.objects")
     @patch("payroll.services.PaymentProvider.objects")
@@ -191,6 +251,7 @@ class WithdrawalFeePreparationTests(TestCase):
 
         self.service._prepare_withdrawal_fee_snapshots(self.payroll)
 
+        benefit_manager.select_for_update.assert_called_once_with(of=("self",))
         self.assertEqual(self.benefit.withdrawal_provider, self.provider)
         self.assertEqual(self.benefit.withdrawal_fee_band, self.fee_band)
         self.assertEqual(self.benefit.withdrawal_fee, Decimal("5.25"))
@@ -201,18 +262,43 @@ class WithdrawalFeePreparationTests(TestCase):
     @patch("payroll.services.WithdrawalFeeBand.objects")
     @patch("payroll.services.PaymentProvider.objects")
     @patch("payroll.services.BenefitConsumption.objects")
-    def test_blocks_payment_when_kyc_account_details_are_missing(
+    def test_uses_zero_fee_snapshot_when_kyc_account_details_are_missing(
         self, benefit_manager, provider_manager, fee_band_manager,
     ):
         self.benefit.json_ext["kyc_payment_details"]["account_number"] = ""
         benefit_query, _, _ = self.mock_fee_queries()
         benefit_manager.select_for_update.return_value = benefit_query
 
-        with self.assertRaises(ValidationError):
+        with self.assertLogs("payroll.services", level="WARNING") as logs:
             self.service._prepare_withdrawal_fee_snapshots(self.payroll)
 
+        self.assertIn("using zero fee", logs.output[0])
+        self.assertIsNone(self.benefit.withdrawal_provider)
+        self.assertIsNone(self.benefit.withdrawal_fee_band)
+        self.assertEqual(self.benefit.withdrawal_fee, Decimal("0.00"))
+        self.assertIsNotNone(self.benefit.withdrawal_fee_prepared_at)
+        self.benefit.save.assert_called_once_with(username="test-user")
         provider_manager.select_for_update.assert_not_called()
         fee_band_manager.select_for_update.assert_not_called()
+
+    @patch("payroll.services.WithdrawalFeeBand.objects")
+    @patch("payroll.services.PaymentProvider.objects")
+    @patch("payroll.services.BenefitConsumption.objects")
+    def test_uses_zero_fee_snapshot_when_no_band_matches(
+        self, benefit_manager, provider_manager, fee_band_manager,
+    ):
+        benefit_query, provider_query, band_query = self.mock_fee_queries()
+        band_query.__getitem__.return_value = []
+        benefit_manager.select_for_update.return_value = benefit_query
+        provider_manager.select_for_update.return_value = provider_query
+        fee_band_manager.select_for_update.return_value = band_query
+
+        with self.assertLogs("payroll.services", level="WARNING") as logs:
+            self.service._prepare_withdrawal_fee_snapshots(self.payroll)
+
+        self.assertIn("using zero fee", logs.output[0])
+        self.assertEqual(self.benefit.withdrawal_fee, Decimal("0.00"))
+        self.assertIsNotNone(self.benefit.withdrawal_fee_prepared_at)
 
     @patch("payroll.services.WithdrawalFeeBand.objects")
     @patch("payroll.services.PaymentProvider.objects")
@@ -230,6 +316,26 @@ class WithdrawalFeePreparationTests(TestCase):
         self.service._prepare_withdrawal_fee_snapshots(self.payroll)
 
         self.assertEqual(self.benefit.withdrawal_fee, Decimal("3.00"))
+        self.benefit.save.assert_not_called()
+        provider_manager.select_for_update.assert_not_called()
+        fee_band_manager.select_for_update.assert_not_called()
+
+    @patch("payroll.services.WithdrawalFeeBand.objects")
+    @patch("payroll.services.PaymentProvider.objects")
+    @patch("payroll.services.BenefitConsumption.objects")
+    def test_existing_zero_fee_snapshot_is_not_repriced(
+        self, benefit_manager, provider_manager, fee_band_manager,
+    ):
+        self.benefit.withdrawal_fee_prepared_at = object()
+        self.benefit.withdrawal_fee = Decimal("0.00")
+        self.benefit.withdrawal_provider_id = None
+        self.benefit.withdrawal_fee_band_id = None
+        benefit_query, _, _ = self.mock_fee_queries()
+        benefit_manager.select_for_update.return_value = benefit_query
+
+        self.service._prepare_withdrawal_fee_snapshots(self.payroll)
+
+        self.assertEqual(self.benefit.withdrawal_fee, Decimal("0.00"))
         self.benefit.save.assert_not_called()
         provider_manager.select_for_update.assert_not_called()
         fee_band_manager.select_for_update.assert_not_called()

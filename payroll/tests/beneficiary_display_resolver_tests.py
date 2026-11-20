@@ -11,6 +11,9 @@ from payroll.utils import get_micro_catchment_name
 
 
 class BeneficiaryDisplayResolverTests(SimpleTestCase):
+    def test_receipt_filter_remains_exposed(self):
+        self.assertIn("receipt", BenefitConsumptionGQLType._meta.filter_fields)
+
     def test_kyc_resolvers_support_json_strings_and_legacy_aliases(self):
         benefit = SimpleNamespace(individual=SimpleNamespace(json_ext=(
             '{"sex":"Female","payment_account_number":"00012345",'
