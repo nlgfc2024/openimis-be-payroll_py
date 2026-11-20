@@ -288,11 +288,13 @@ class ReconciliationAuditPolicyTests(TestCase):
         finally:
             PayrollConfig.csv_reconciliation_field_mapping = original_mapping
 
+        fee_header = service._withdrawal_fee_header()
+        amount_to_pay_header = service._amount_to_pay_header()
         self.assertIn("Code", exported.columns)
         self.assertNotIn("Receipt", exported.columns)
         self.assertIn("Payment type", exported.columns)
-        self.assertEqual(exported.loc[0, "Withdrawal fee (MWK)"], 2.5)
-        self.assertEqual(exported.loc[0, "Amount to pay (gross + fee) (MWK)"], 12.5)
+        self.assertEqual(exported.loc[0, fee_header], 2.5)
+        self.assertEqual(exported.loc[0, amount_to_pay_header], 12.5)
         self.assertEqual(exported.loc[0, "Payment type"], "CASH")
         build_fee_catalog.assert_called_once()
 
@@ -488,8 +490,8 @@ class ReconciliationAuditPolicyTests(TestCase):
             "Account Name",
             "Bank",
             "First Name",
-            "Withdrawal fee (MWK)",
-            "Amount to pay (gross + fee) (MWK)",
+            service._withdrawal_fee_header(),
+            service._amount_to_pay_header(),
             "Type",
             "Micro Catchment",
             "Paid",

@@ -227,6 +227,10 @@ class DeletePayrollInputType(DeletePaymentPointInputType):
     pass
 
 
+class RefreshWithdrawalFeeSnapshotsInput(OpenIMISMutation.Input):
+    payroll_id = graphene.UUID(required=True)
+
+
 class ClosePayrollInputType(DeletePaymentPointInputType):
     pass
 
@@ -358,6 +362,35 @@ class CreateConsolidatedPayrollMutation(BaseMutation):
             )
 
     class Input(CreateConsolidatedPayrollInput):
+        pass
+
+
+class RefreshWithdrawalFeeSnapshotsMutation(BaseMutation):
+    _mutation_class = "RefreshWithdrawalFeeSnapshotsMutation"
+    _mutation_module = "payroll"
+
+    @classmethod
+    def _validate_mutation(cls, user, **data):
+        if type(user) is AnonymousUser or not user.has_perms(
+            PayrollConfig.gql_payroll_create_perms,
+        ):
+            raise ValidationError("mutation.authentication_required")
+
+    @classmethod
+    def _mutate(cls, user, **data):
+        client_mutation_id = data.pop("client_mutation_id", None)
+        data.pop("client_mutation_label", None)
+        payroll = PayrollService(user).refresh_withdrawal_fee_snapshots(
+            data["payroll_id"],
+        )
+        if client_mutation_id:
+            PayrollMutation.object_mutated(
+                user,
+                client_mutation_id=client_mutation_id,
+                payroll=payroll,
+            )
+
+    class Input(RefreshWithdrawalFeeSnapshotsInput):
         pass
 
 

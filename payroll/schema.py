@@ -19,6 +19,7 @@ from payroll.consolidation import payrolls_in_district
 from payroll.gql_mutations import CreatePaymentPointMutation, UpdatePaymentPointMutation, DeletePaymentPointMutation, \
     CreatePayrollMutation, DeletePayrollMutation, ClosePayrollMutation, \
     RejectPayrollMutation, MakePaymentForPayrollMutation, DeleteBenefitConsumptionMutation, CreateConsolidatedPayrollMutation, \
+    RefreshWithdrawalFeeSnapshotsMutation, \
     CreatePaymentProviderMutation, UpdatePaymentProviderMutation, \
     CreateWithdrawalFeeBandMutation, UpdateWithdrawalFeeBandMutation, DeleteWithdrawalFeeBandMutation, \
     SavePaymentProviderWithFeeBandMutation
@@ -551,6 +552,7 @@ class Mutation(graphene.ObjectType):
 
     create_payroll = CreatePayrollMutation.Field()
     create_consolidated_payroll = CreateConsolidatedPayrollMutation.Field()
+    refresh_withdrawal_fee_snapshots = RefreshWithdrawalFeeSnapshotsMutation.Field()
     delete_payroll = DeletePayrollMutation.Field()
     close_payroll = ClosePayrollMutation.Field()
     reject_payroll = RejectPayrollMutation.Field()

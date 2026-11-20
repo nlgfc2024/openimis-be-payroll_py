@@ -36,7 +36,10 @@ def _get_withdrawal_fee_preview(benefit, info):
     if cached_preview is not None:
         return cached_preview
 
-    if getattr(benefit, "withdrawal_fee", None) is not None:
+    saved_error = getattr(benefit, "withdrawal_fee_error", None)
+    if saved_error:
+        preview = (getattr(benefit, "withdrawal_fee", None), saved_error)
+    elif getattr(benefit, "withdrawal_fee", None) is not None:
         preview = (benefit.withdrawal_fee, None)
     elif getattr(benefit, "withdrawal_fee_prepared_at", None):
         preview = (None, "The saved withdrawal fee snapshot is incomplete.")
@@ -217,6 +220,7 @@ class BenefitConsumptionGQLType(DjangoObjectType):
             "photo": ["iexact", "istartswith", "icontains"],
             "code": ["iexact", "istartswith", "icontains"],
             "receipt": ["iexact", "istartswith", "icontains"],
+            "withdrawal_fee_error": ["isnull", "icontains"],
             "status": ["exact", "startswith", "icontains", "contains"],
             "type": ["exact", "startswith", "icontains"],
             "amount": ["exact", "lt", "lte", "gt", "gte"],
@@ -275,16 +279,6 @@ class BenefitConsumptionGQLType(DjangoObjectType):
         )
 
     def resolve_receipt(self, info):
-        from payroll.apps import PayrollConfig
-
-        user = info.context.user
-        if (
-            not user
-            or not user.is_authenticated
-            or not PayrollConfig.gql_withdrawal_fee_manage_perms
-            or not user.has_perms(PayrollConfig.gql_withdrawal_fee_manage_perms)
-        ):
-            return None
         return self.receipt
 
     def resolve_has_receipt(self, info):

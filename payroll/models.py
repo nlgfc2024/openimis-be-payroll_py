@@ -154,6 +154,7 @@ class BenefitConsumption(HistoryBusinessModel):
         max_digits=18, decimal_places=2, blank=True, null=True,
     )
     withdrawal_fee_prepared_at = models.DateTimeField(blank=True, null=True)
+    withdrawal_fee_error = models.TextField(blank=True, null=True)
     status = models.CharField(
         max_length=100, choices=BenefitConsumptionStatus.choices, default=BenefitConsumptionStatus.ACCEPTED, null=False
     )

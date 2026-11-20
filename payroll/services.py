@@ -94,7 +94,10 @@ class WithdrawalFeeConfigService:
     @staticmethod
     def preview_fee_for_benefit(benefit, catalog):
         withdrawal_fee = getattr(benefit, "withdrawal_fee", None)
+        withdrawal_fee_error = getattr(benefit, "withdrawal_fee_error", None)
         amount = getattr(benefit, "amount", None)
+        if withdrawal_fee_error:
+            return withdrawal_fee, withdrawal_fee_error
         if withdrawal_fee is not None:
             return withdrawal_fee, None
         if getattr(benefit, "withdrawal_fee_prepared_at", None):
@@ -635,6 +638,7 @@ class PayrollService(BaseService):
                 default_user=self.user,
                 batch_size=1000,
             )
+        self._prepare_withdrawal_fee_snapshots(payroll)
         self.create_accept_payroll_task(payroll.id, {
             "id": payroll.id, "district": district.name, "phase": phase,
             "included_payrolls": [{"id": str(source.id), "name": source.name} for source in sources],
@@ -679,17 +683,47 @@ class PayrollService(BaseService):
         )
 
     @transaction.atomic
-    def _prepare_withdrawal_fee_snapshots(self, payroll):
+    def refresh_withdrawal_fee_snapshots(self, payroll_id):
+        payroll = Payroll.objects.select_for_update().get(
+            id=payroll_id,
+            is_deleted=False,
+        )
+        if (
+            payroll.payroll_type != Payroll.PayrollType.CONSOLIDATED
+            or payroll.status != PayrollStatus.PENDING_APPROVAL
+        ):
+            raise ValidationError(
+                "Withdrawal fees can only be refreshed for a consolidated payroll "
+                "awaiting approval."
+            )
+        if not LocationManager().is_allowed(self.user, [payroll.district_id]):
+            raise ValidationError(
+                "You are not allowed to refresh fees for this district."
+            )
+        self._prepare_withdrawal_fee_snapshots(payroll, retry_unresolved=True)
+        return payroll
+
+    @transaction.atomic
+    def _prepare_withdrawal_fee_snapshots(self, payroll, retry_unresolved=False):
         benefit_ids = PayrollBenefitConsumption.objects.filter(
             payroll_id=payroll.id,
             is_deleted=False,
         ).values("benefit_id").distinct()
+        snapshot_filter = (
+            Q(withdrawal_fee_prepared_at__isnull=True)
+            | Q(withdrawal_fee_error__isnull=False)
+            if retry_unresolved
+            else Q(withdrawal_fee_prepared_at__isnull=True)
+        )
         benefits = list(
             BenefitConsumption.objects.select_for_update(of=("self",)).filter(
                 id__in=benefit_ids,
                 is_deleted=False,
-                status=BenefitConsumptionStatus.ACCEPTED,
-            ).select_related("individual")
+                status__in=[
+                    BenefitConsumptionStatus.ACCEPTED,
+                    BenefitConsumptionStatus.APPROVE_FOR_PAYMENT,
+                ],
+            ).filter(snapshot_filter).select_related("individual")
         )
         as_of = datetime.date.today()
         prepared = []
@@ -701,16 +735,20 @@ class PayrollService(BaseService):
                 benefit.code,
                 reason,
             )
-            prepared.append((benefit, None, None, Decimal("0.00")))
+            prepared.append((benefit, None, None, Decimal("0.00"), reason))
 
         for benefit in benefits:
             if benefit.amount is None:
                 errors.append(f"{benefit.code}: missing benefit amount")
                 continue
             if benefit.withdrawal_fee_prepared_at:
-                if benefit.withdrawal_fee is None:
+                if benefit.withdrawal_fee is None and not (
+                    retry_unresolved and benefit.withdrawal_fee_error
+                ):
                     errors.append(f"{benefit.code}: incomplete withdrawal fee snapshot")
-                continue
+                    continue
+                if not (retry_unresolved and benefit.withdrawal_fee_error):
+                    continue
             details = ((benefit.json_ext or {}).get("kyc_payment_details") or {})
             account_number = details.get("account_number")
             account_name = details.get("account_name")
@@ -756,7 +794,7 @@ class PayrollService(BaseService):
                     f"and amount {benefit.amount}, found {len(fee_bands)}",
                 )
                 continue
-            prepared.append((benefit, provider, fee_bands[0], fee_bands[0].transfer_cost))
+            prepared.append((benefit, provider, fee_bands[0], fee_bands[0].transfer_cost, None))
 
         if errors:
             raise ValidationError(
@@ -765,11 +803,12 @@ class PayrollService(BaseService):
             )
 
         now = timezone.now()
-        for benefit, provider, fee_band, withdrawal_fee in prepared:
+        for benefit, provider, fee_band, withdrawal_fee, withdrawal_fee_error in prepared:
             benefit.withdrawal_provider = provider
             benefit.withdrawal_fee_band = fee_band
             benefit.withdrawal_fee = withdrawal_fee
             benefit.withdrawal_fee_prepared_at = now
+            benefit.withdrawal_fee_error = withdrawal_fee_error
             benefit.save(username=self.user.username)
 
     def _save_payroll(self, obj_data, payment_plan, payment_cycle, project_names):
@@ -1118,9 +1157,6 @@ class BenefitConsumptionService(BaseService):
 
 
 class CsvReconciliationService:
-    WITHDRAWAL_FEE_HEADER = "Withdrawal fee (MWK)"
-    AMOUNT_TO_PAY_HEADER = "Amount to pay (gross + fee) (MWK)"
-
     def __init__(self, user: InteractiveUser):
         self.user = user
 
@@ -1132,7 +1168,25 @@ class CsvReconciliationService:
         return PayrollConfig.csv_reconciliation_micro_catchment_column or "Micro Catchment"
 
     @staticmethod
-    def _reconciliation_field_mapping():
+    def _currency_label():
+        import core
+        from django.core.exceptions import ImproperlyConfigured
+
+        currency = getattr(core, "currency", None)
+        if not currency:
+            raise ImproperlyConfigured("The core currency is not configured.")
+        return str(currency)
+
+    @classmethod
+    def _withdrawal_fee_header(cls):
+        return f"Withdrawal fee ({cls._currency_label()})"
+
+    @classmethod
+    def _amount_to_pay_header(cls):
+        return f"Amount to pay (gross + fee) ({cls._currency_label()})"
+
+    @classmethod
+    def _reconciliation_field_mapping(cls):
         """Return configured fields, adding KYC fields for older installations."""
         field_mapping = dict(PayrollConfig.csv_reconciliation_field_mapping or {})
         snapshot_field_by_legacy = {
@@ -1150,7 +1204,7 @@ class CsvReconciliationService:
             if field not in mapped_fields and header not in mapped_headers:
                 mapped_fields[field] = header
                 mapped_headers.add(header)
-        mapped_fields["withdrawal_fee"] = "Withdrawal fee (MWK)"
+        mapped_fields["withdrawal_fee"] = cls._withdrawal_fee_header()
         if not mapped_fields.get("type"):
             mapped_fields["type"] = "Type"
         code_field = PayrollConfig.csv_reconciliation_code_column or "code"
@@ -1185,8 +1239,8 @@ class CsvReconciliationService:
                 and header.strip().lower() not in reference_headers
             )
         }
-        fee_header = self.WITHDRAWAL_FEE_HEADER
-        amount_to_pay_header = self.AMOUNT_TO_PAY_HEADER
+        fee_header = self._withdrawal_fee_header()
+        amount_to_pay_header = self._amount_to_pay_header()
         field_mapping["withdrawal_fee"] = fee_header
         if not field_mapping.get("type"):
             field_mapping["type"] = "Type"
@@ -1762,7 +1816,7 @@ class CsvReconciliationService:
         reconciliation_fields = (
             set(field_mapping)
             | set(field_mapping.values())
-            | {self.AMOUNT_TO_PAY_HEADER}
+            | {self._amount_to_pay_header()}
         )
         for row in paid_rows:
             benefit = locked_benefits.get(row.benefit_id)
@@ -2037,7 +2091,7 @@ class CsvReconciliationService:
             reconciliation_fields = (
                 set(field_mapping)
                 | set(field_mapping.values())
-                | {self.AMOUNT_TO_PAY_HEADER}
+                | {self._amount_to_pay_header()}
             )
         extra_info = {
             k: row[k] for k in row.index

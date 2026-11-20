@@ -14,6 +14,25 @@ class BeneficiaryDisplayResolverTests(SimpleTestCase):
     def test_receipt_filter_remains_exposed(self):
         self.assertIn("receipt", BenefitConsumptionGQLType._meta.filter_fields)
 
+    def test_unresolved_fee_error_is_filterable_and_survives_zero_snapshot(self):
+        benefit = SimpleNamespace(
+            withdrawal_fee=Decimal("0.00"),
+            withdrawal_fee_error="No effective fee band.",
+        )
+
+        self.assertIn(
+            "withdrawal_fee_error",
+            BenefitConsumptionGQLType._meta.filter_fields,
+        )
+        self.assertEqual(
+            BenefitConsumptionGQLType.resolve_withdrawal_fee(benefit, None),
+            Decimal("0.00"),
+        )
+        self.assertEqual(
+            BenefitConsumptionGQLType.resolve_withdrawal_fee_error(benefit, None),
+            "No effective fee band.",
+        )
+
     def test_kyc_resolvers_support_json_strings_and_legacy_aliases(self):
         benefit = SimpleNamespace(individual=SimpleNamespace(json_ext=(
             '{"sex":"Female","payment_account_number":"00012345",'
@@ -25,12 +44,15 @@ class BeneficiaryDisplayResolverTests(SimpleTestCase):
         self.assertEqual(BenefitConsumptionGQLType.resolve_account_name(benefit, None), "Jane Banda")
         self.assertEqual(BenefitConsumptionGQLType.resolve_bank(benefit, None), "Mpamba")
 
-    def test_receipt_is_hidden_but_paid_state_remains_available_to_non_admins(self):
+    def test_receipt_is_visible_to_payroll_users_without_fee_admin_right(self):
         benefit = SimpleNamespace(receipt="provider-reference-1")
         user = SimpleNamespace(is_authenticated=True, has_perms=lambda _perms: False)
         info = SimpleNamespace(context=SimpleNamespace(user=user))
 
-        self.assertIsNone(BenefitConsumptionGQLType.resolve_receipt(benefit, info))
+        self.assertEqual(
+            BenefitConsumptionGQLType.resolve_receipt(benefit, info),
+            "provider-reference-1",
+        )
         self.assertTrue(BenefitConsumptionGQLType.resolve_has_receipt(benefit, info))
 
     def test_receiptless_reconciled_benefit_still_has_paid_state(self):

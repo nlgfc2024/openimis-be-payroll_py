@@ -19,6 +19,20 @@ from payroll.services import (
 
 
 class WithdrawalFeeProviderInputTests(SimpleTestCase):
+    def test_csv_fee_headers_use_the_configured_core_currency(self):
+        service = CsvReconciliationService(SimpleNamespace(login_name="tester"))
+
+        with patch("core.currency", "TEST", create=True):
+            self.assertEqual(service._withdrawal_fee_header(), "Withdrawal fee (TEST)")
+            self.assertEqual(
+                service._amount_to_pay_header(),
+                "Amount to pay (gross + fee) (TEST)",
+            )
+            self.assertEqual(
+                service._reconciliation_field_mapping()["withdrawal_fee"],
+                "Withdrawal fee (TEST)",
+            )
+
     def test_create_provider_input_accepts_active_status(self):
         self.assertIn(
             "is_active",
@@ -208,7 +222,8 @@ class WithdrawalFeePreparationTests(TestCase):
     def mock_fee_queries(self, benefit=None):
         benefits = [benefit or self.benefit]
         benefit_query = MagicMock()
-        benefit_query.filter.return_value.select_related.return_value = benefits
+        benefit_query.filter.return_value = benefit_query
+        benefit_query.select_related.return_value = benefits
 
         provider_query = MagicMock()
         provider_query.filter.return_value = provider_query
@@ -277,6 +292,7 @@ class WithdrawalFeePreparationTests(TestCase):
         self.assertIsNone(self.benefit.withdrawal_fee_band)
         self.assertEqual(self.benefit.withdrawal_fee, Decimal("0.00"))
         self.assertIsNotNone(self.benefit.withdrawal_fee_prepared_at)
+        self.assertIn("missing KYC account details", self.benefit.withdrawal_fee_error)
         self.benefit.save.assert_called_once_with(username="test-user")
         provider_manager.select_for_update.assert_not_called()
         fee_band_manager.select_for_update.assert_not_called()
@@ -299,6 +315,7 @@ class WithdrawalFeePreparationTests(TestCase):
         self.assertIn("using zero fee", logs.output[0])
         self.assertEqual(self.benefit.withdrawal_fee, Decimal("0.00"))
         self.assertIsNotNone(self.benefit.withdrawal_fee_prepared_at)
+        self.assertIn("found 0", self.benefit.withdrawal_fee_error)
 
     @patch("payroll.services.WithdrawalFeeBand.objects")
     @patch("payroll.services.PaymentProvider.objects")
@@ -328,6 +345,7 @@ class WithdrawalFeePreparationTests(TestCase):
     ):
         self.benefit.withdrawal_fee_prepared_at = object()
         self.benefit.withdrawal_fee = Decimal("0.00")
+        self.benefit.withdrawal_fee_error = "No matching fee band."
         self.benefit.withdrawal_provider_id = None
         self.benefit.withdrawal_fee_band_id = None
         benefit_query, _, _ = self.mock_fee_queries()
@@ -339,6 +357,31 @@ class WithdrawalFeePreparationTests(TestCase):
         self.benefit.save.assert_not_called()
         provider_manager.select_for_update.assert_not_called()
         fee_band_manager.select_for_update.assert_not_called()
+
+    @patch("payroll.services.WithdrawalFeeBand.objects")
+    @patch("payroll.services.PaymentProvider.objects")
+    @patch("payroll.services.BenefitConsumption.objects")
+    def test_refresh_reprices_only_a_zero_fee_snapshot_with_an_issue(
+        self, benefit_manager, provider_manager, fee_band_manager,
+    ):
+        self.benefit.withdrawal_fee_prepared_at = object()
+        self.benefit.withdrawal_fee = Decimal("0.00")
+        self.benefit.withdrawal_fee_error = "No matching fee band."
+        benefit_query, provider_query, band_query = self.mock_fee_queries()
+        benefit_manager.select_for_update.return_value = benefit_query
+        provider_manager.select_for_update.return_value = provider_query
+        fee_band_manager.select_for_update.return_value = band_query
+
+        self.service._prepare_withdrawal_fee_snapshots(
+            self.payroll,
+            retry_unresolved=True,
+        )
+
+        self.assertEqual(self.benefit.withdrawal_fee, Decimal("5.25"))
+        self.assertIsNone(self.benefit.withdrawal_fee_error)
+        self.assertEqual(self.benefit.withdrawal_provider, self.provider)
+        self.assertEqual(self.benefit.withdrawal_fee_band, self.fee_band)
+        self.benefit.save.assert_called_once_with(username="test-user")
 
 
 class PaymentReferenceAccessTests(SimpleTestCase):
