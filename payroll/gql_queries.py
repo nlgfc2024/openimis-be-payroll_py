@@ -152,10 +152,20 @@ class WithdrawalFeeBandGQLType(DjangoObjectType):
     class Meta:
         model = WithdrawalFeeBand
         interfaces = (graphene.relay.Node,)
+        filter_fields = {
+            "provider__code": ["exact", "icontains"],
+            "provider__name": ["icontains"],
+            "minimum_amount": ["exact", "gte", "lte"],
+            "maximum_amount": ["exact", "gte", "lte"],
+            "transfer_cost": ["exact", "gte", "lte"],
+            "effective_from": ["exact", "gte", "lte"],
+            "effective_to": ["exact", "gte", "lte"],
+        }
         fields = (
             "id", "provider", "minimum_amount", "maximum_amount",
             "transfer_cost", "effective_from", "effective_to", "is_deleted",
         )
+        connection_class = ExtendedConnection
 
 
 class BenefitAttachmentGQLType(DjangoObjectType):

@@ -151,6 +151,22 @@ class WithdrawalFeeConfigService:
         return provider
 
     @transaction.atomic
+    def save_provider_with_fee_band(self, provider_data, fee_band_data):
+        provider_id = provider_data.pop("id", None)
+        if provider_id:
+            provider = self.update_provider(provider_id, provider_data)
+        else:
+            provider = self.create_provider(provider_data)
+
+        fee_band_data["provider_id"] = provider.id
+        fee_band_id = fee_band_data.pop("id", None)
+        if fee_band_id:
+            fee_band = self.update_fee_band(fee_band_id, fee_band_data)
+        else:
+            fee_band = self.create_fee_band(fee_band_data)
+        return provider, fee_band
+
+    @transaction.atomic
     def update_provider(self, provider_id, data):
         provider = PaymentProvider.objects.select_for_update().filter(
             id=provider_id, is_deleted=False,

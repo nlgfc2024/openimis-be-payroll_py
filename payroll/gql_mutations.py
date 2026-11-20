@@ -69,6 +69,20 @@ class DeleteWithdrawalFeeBandInput(OpenIMISMutation.Input):
     id = graphene.UUID(required=True)
 
 
+class SavePaymentProviderWithFeeBandInput(OpenIMISMutation.Input):
+    provider_id = graphene.UUID(required=False)
+    fee_band_id = graphene.UUID(required=False)
+    code = graphene.String(required=True, max_length=64)
+    name = graphene.String(required=True, max_length=255)
+    provider_type = graphene.String(required=True, max_length=32)
+    is_active = graphene.Boolean(required=True)
+    minimum_amount = graphene.Decimal(required=True)
+    maximum_amount = graphene.Decimal(required=False)
+    transfer_cost = graphene.Decimal(required=True)
+    effective_from = graphene.Date(required=True)
+    effective_to = graphene.Date(required=False)
+
+
 class WithdrawalFeeConfigMutation(BaseMutation):
     _mutation_module = PayrollConfig.name
 
@@ -148,6 +162,36 @@ class DeleteWithdrawalFeeBandMutation(WithdrawalFeeConfigMutation):
         WithdrawalFeeConfigService(user).delete_fee_band(band_id)
 
     class Input(DeleteWithdrawalFeeBandInput):
+        pass
+
+
+class SavePaymentProviderWithFeeBandMutation(WithdrawalFeeConfigMutation):
+    _mutation_class = "SavePaymentProviderWithFeeBandMutation"
+
+    @classmethod
+    def _mutate(cls, user, **data):
+        data.pop("client_mutation_id", None)
+        data.pop("client_mutation_label", None)
+        provider_data = {
+            key: data.pop(key)
+            for key in ("provider_id", "code", "name", "provider_type", "is_active")
+            if key in data
+        }
+        if "provider_id" in provider_data:
+            provider_data["id"] = provider_data.pop("provider_id")
+        fee_band_data = {
+            key: data.pop(key)
+            for key in (
+                "fee_band_id", "minimum_amount", "maximum_amount",
+                "transfer_cost", "effective_from", "effective_to",
+            )
+            if key in data
+        }
+        if "fee_band_id" in fee_band_data:
+            fee_band_data["id"] = fee_band_data.pop("fee_band_id")
+        WithdrawalFeeConfigService(user).save_provider_with_fee_band(provider_data, fee_band_data)
+
+    class Input(SavePaymentProviderWithFeeBandInput):
         pass
 
 

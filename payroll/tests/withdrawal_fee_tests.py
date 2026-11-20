@@ -6,7 +6,10 @@ from unittest.mock import MagicMock, patch
 from django.core.exceptions import ValidationError
 from django.test import SimpleTestCase, TestCase
 
-from payroll.gql_mutations import CreatePaymentProviderMutation
+from payroll.gql_mutations import (
+    CreatePaymentProviderMutation,
+    SavePaymentProviderWithFeeBandMutation,
+)
 from payroll.models import BenefitConsumption, PaymentProvider, WithdrawalFeeBand
 from payroll.services import (
     CsvReconciliationService,
@@ -21,6 +24,22 @@ class WithdrawalFeeProviderInputTests(SimpleTestCase):
             "is_active",
             CreatePaymentProviderMutation.Input._meta.fields,
         )
+
+    def test_combined_provider_and_fee_band_input_accepts_both_records(self):
+        fields = SavePaymentProviderWithFeeBandMutation.Input._meta.fields
+        self.assertTrue({
+            "provider_id",
+            "code",
+            "name",
+            "provider_type",
+            "is_active",
+            "fee_band_id",
+            "minimum_amount",
+            "maximum_amount",
+            "transfer_cost",
+            "effective_from",
+            "effective_to",
+        }.issubset(fields))
 
     def test_preview_calculates_fee_from_provider_and_amount_band(self):
         provider = SimpleNamespace(id="provider-1", name="Mpamba", code="MP")

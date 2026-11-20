@@ -20,7 +20,8 @@ from payroll.gql_mutations import CreatePaymentPointMutation, UpdatePaymentPoint
     CreatePayrollMutation, DeletePayrollMutation, ClosePayrollMutation, \
     RejectPayrollMutation, MakePaymentForPayrollMutation, DeleteBenefitConsumptionMutation, CreateConsolidatedPayrollMutation, \
     CreatePaymentProviderMutation, UpdatePaymentProviderMutation, \
-    CreateWithdrawalFeeBandMutation, UpdateWithdrawalFeeBandMutation, DeleteWithdrawalFeeBandMutation
+    CreateWithdrawalFeeBandMutation, UpdateWithdrawalFeeBandMutation, DeleteWithdrawalFeeBandMutation, \
+    SavePaymentProviderWithFeeBandMutation
 from payroll.gql_queries import BenefitConsumptionGQLType, PaymentPointGQLType, benefit_consumption_queryset, \
     PayrollGQLType, PaymentMethodGQLType, \
     PaymentMethodListGQLType, BenefitAttachmentListGQLType, \
@@ -47,9 +48,12 @@ class Query(graphene.ObjectType):
         PaymentProviderGQLType,
         active_only=graphene.Boolean(default_value=True),
     )
-    withdrawal_fee_bands = graphene.List(
+    withdrawal_fee_bands = OrderedDjangoFilterConnectionField(
         WithdrawalFeeBandGQLType,
+        orderBy=graphene.List(of_type=graphene.String),
         provider_id=graphene.UUID(),
+        provider_name=graphene.String(),
+        provider_code=graphene.String(),
     )
     payment_point = OrderedDjangoFilterConnectionField(
         PaymentPointGQLType,
@@ -435,7 +439,9 @@ class Query(graphene.ObjectType):
             )
         return providers.order_by("name")
 
-    def resolve_withdrawal_fee_bands(self, info, provider_id=None):
+    def resolve_withdrawal_fee_bands(
+        self, info, provider_id=None, provider_name=None, provider_code=None, **kwargs,
+    ):
         Query._check_permissions(
             info.context.user,
             PayrollConfig.gql_withdrawal_fee_manage_perms,
@@ -446,7 +452,11 @@ class Query(graphene.ObjectType):
         )
         if provider_id:
             bands = bands.filter(provider_id=provider_id)
-        return bands.select_related("provider")
+        if provider_name:
+            bands = bands.filter(provider__name__icontains=provider_name.strip())
+        if provider_code:
+            bands = bands.filter(provider__code__icontains=provider_code.strip())
+        return gql_optimizer.query(bands.select_related("provider"), info)
 
     def resolve_payment_gateway_config(self, info):
         return PaymentGatewayConfigGQLType(
@@ -529,6 +539,7 @@ class Query(graphene.ObjectType):
 
 
 class Mutation(graphene.ObjectType):
+    save_payment_provider_with_fee_band = SavePaymentProviderWithFeeBandMutation.Field()
     create_payment_provider = CreatePaymentProviderMutation.Field()
     update_payment_provider = UpdatePaymentProviderMutation.Field()
     create_withdrawal_fee_band = CreateWithdrawalFeeBandMutation.Field()
