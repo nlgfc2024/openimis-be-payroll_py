@@ -96,16 +96,19 @@ class PrimaryRecipientFilterTests(SimpleTestCase):
         get_model.assert_called_once_with(
             "project_social_protection", "GroupBeneficiaryProjectEnrollment",
         )
-        get_model.return_value.objects.filter.assert_called_once_with(
+        get_model.return_value.objects.filter.assert_called_once()
+        call = get_model.return_value.objects.filter.call_args
+        self.assertEqual(call.kwargs, dict(
             group_beneficiary__benefit_plan_id="benefit-plan-id",
             group_beneficiary__status="ACTIVE",
             group_beneficiary__is_deleted=False,
             group_beneficiary__group__groupindividuals__recipient_type="PRIMARY",
             group_beneficiary__group__groupindividuals__is_deleted=False,
-            project__status="COMPLETED",
             project__is_deleted=False,
             is_deleted=False,
-        )
+        ))
+        # COMPLETED projects, or TRAINING projects when the project module has them.
+        self.assertIn(("project__status", "COMPLETED"), call.args[0].children)
 
     @patch("payroll.services.BenefitConsumption.objects.filter")
     def test_payment_details_are_snapshotted_once_on_generated_benefits(self, benefit_filter):

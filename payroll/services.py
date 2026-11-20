@@ -109,8 +109,9 @@ class PayrollService(BaseService):
                         )
                         if selected_projects and not enrollments_queryset.exists():
                             raise ValidationError(
-                                "No active household beneficiaries are assigned to the selected completed "
-                                "project. Ensure the household assignments were saved before creating the payroll."
+                                "No active household beneficiaries are assigned to the selected project, "
+                                "or the project is a work project that is not completed yet. Ensure the "
+                                "household assignments were saved before creating the payroll."
                             )
                         # The timesheet GROUP strategy creates one benefit per group
                         # enrollment. Passing the explicit enrollment queryset is
@@ -489,6 +490,16 @@ class PayrollService(BaseService):
     def _is_group_payment_plan(payment_plan):
         return payment_plan.benefit_plan.type == "GROUP"
 
+    @staticmethod
+    def _payable_project_filter(enrollment_model):
+        """WORK projects are paid once COMPLETED. A training is paid whatever its
+        status: its calculation rule decides which status counts."""
+        payable = Q(project__status="COMPLETED")
+        project_model = enrollment_model._meta.get_field("project").related_model
+        if any(field.name == "project_type" for field in project_model._meta.get_fields()):
+            payable |= Q(project__project_type="TRAINING")
+        return payable
+
     def _select_group_enrollments_based_on_criteria(self, obj_data, payment_plan):
         """Return the eligible household enrollments for a GROUP payroll.
 
@@ -502,12 +513,12 @@ class PayrollService(BaseService):
         json_ext = obj_data.get("json_ext", {})
         filter_criteria = json_ext.get("filter_criteria", {})
         enrollments_queryset = enrollment_model.objects.filter(
+            self._payable_project_filter(enrollment_model),
             group_beneficiary__benefit_plan_id=payment_plan.benefit_plan.id,
             group_beneficiary__status=BeneficiaryStatus.ACTIVE,
             group_beneficiary__is_deleted=False,
             group_beneficiary__group__groupindividuals__recipient_type="PRIMARY",
             group_beneficiary__group__groupindividuals__is_deleted=False,
-            project__status="COMPLETED",
             project__is_deleted=False,
             is_deleted=False,
         )
