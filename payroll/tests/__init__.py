@@ -7,3 +7,6 @@ from payroll.tests.reconciliation_audit_tests import (
     ReconciliationAuditPolicyTests,
     ReconciliationPayrollStatusTests,
 )
+from payroll.tests.training_payee_tests import (
+    IndividualPayeeSelectionTest,
+)

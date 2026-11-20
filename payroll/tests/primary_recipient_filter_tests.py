@@ -58,8 +58,9 @@ class PrimaryRecipientFilterTests(SimpleTestCase):
             enrollments_queryset=enrollments,
         )
 
+    @patch("payroll.services.apps.get_model")
     @patch("payroll.services.Beneficiary.objects.filter")
-    def test_project_payroll_requires_primary_recipient_and_project_enrollment(self, beneficiary_filter):
+    def test_project_payroll_requires_a_payable_individual_and_project_enrollment(self, beneficiary_filter, _get_model):
         initial_queryset = MagicMock()
         project_queryset = MagicMock()
         beneficiary_filter.return_value = initial_queryset
@@ -71,14 +72,10 @@ class PrimaryRecipientFilterTests(SimpleTestCase):
             "json_ext": {"filter_criteria": {"project_ids": ["project-id"]}},
         }, payment_plan)
 
+        # PRIMARY recipients, or individuals who belong to no household.
         initial_queryset.filter.assert_called_once()
-        self.assertEqual(
-            initial_queryset.filter.call_args.kwargs,
-            {
-                "individual__groupindividuals__recipient_type": "PRIMARY",
-                "individual__groupindividuals__is_deleted": False,
-            },
-        )
+        self.assertEqual(len(initial_queryset.filter.call_args.args), 1)
+        self.assertEqual(initial_queryset.filter.call_args.kwargs, {})
         project_queryset.filter.assert_called_once_with(
             project_enrollments__project__id__in=["project-id"],
             project_enrollments__is_deleted=False,

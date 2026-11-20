@@ -9,7 +9,7 @@ from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError
 from django.db import transaction
 from simple_history.utils import bulk_create_with_history
-from django.db.models import Count, Q, Sum
+from django.db.models import Count, Exists, OuterRef, Q, Sum
 from django.utils.translation import gettext as _
 
 from core import datetime
@@ -538,9 +538,22 @@ class PayrollService(BaseService):
 
         filter_criteria = json_ext.get("filter_criteria", {})
 
+        # A household member is paid only as its PRIMARY recipient, never as one
+        # of several members. An individual who belongs to no household (an
+        # INDIVIDUAL programme such as UMEP enrols only those) is paid directly.
+        group_individual_model = apps.get_model("individual", "GroupIndividual")
+        is_primary_recipient = Exists(group_individual_model.objects.filter(
+            individual_id=OuterRef("individual_id"),
+            recipient_type="PRIMARY",
+            is_deleted=False,
+        ))
+        belongs_to_a_household = Exists(group_individual_model.objects.filter(
+            individual_id=OuterRef("individual_id"),
+            is_deleted=False,
+            group__is_deleted=False,
+        ))
         beneficiaries_queryset = beneficiaries_queryset.filter(
-            individual__groupindividuals__recipient_type="PRIMARY",
-            individual__groupindividuals__is_deleted=False,
+            is_primary_recipient | ~belongs_to_a_household
         )
 
         project_ids = filter_criteria.get("project_ids", [])
