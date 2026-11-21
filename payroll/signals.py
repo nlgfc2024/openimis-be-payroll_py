@@ -1,5 +1,6 @@
 import logging
 
+from django.core.exceptions import PermissionDenied
 from core.models import User
 from core.service_signals import ServiceSignalBindType
 from core.signals import bind_service_signal
@@ -14,6 +15,7 @@ from payroll.consolidation import (
 from payroll.models import Payroll, BenefitConsumption, BenefitConsumptionStatus, CsvReconciliationUpload
 from payroll.payments_registry import PaymentMethodStorage
 from payroll.services import PayrollService, CsvReconciliationService
+from payroll.benefit_plan_access import get_authorized_payroll, require_benefit_access
 from payroll.strategies import StrategyOfPaymentInterface
 
 
@@ -57,12 +59,17 @@ def bind_service_signals():
                     and result['success'] \
                     and task['business_event'] == PayrollConfig.payroll_accept_event:
                 task_status = task['status']
-                payroll = Payroll.objects.get(id=task['entity_id'])
+                payroll = get_authorized_payroll(user, task['entity_id'])
                 strategy = PaymentMethodStorage.get_chosen_payment_method(payroll.payment_method)
                 if task_status == Task.Status.COMPLETED:
                     accept_payroll(payroll, strategy, user)
                 if task_status == Task.Status.FAILED:
                     reject_payroll(payroll, strategy, user)
+        except PermissionDenied as exc:
+            logger.warning(
+                "Benefit Plan access denied while completing payroll approval",
+                exc_info=exc,
+            )
         except Exception as exc:
             logger.error("Error while executing on_task_complete_accept_payroll", exc_info=exc)
 
@@ -84,7 +91,7 @@ def bind_service_signals():
                     and task['business_event'] == PayrollConfig.payroll_reconciliation_event:
                 task_status = task['status']
                 if task_status == Task.Status.COMPLETED:
-                    payroll = Payroll.objects.get(id=task['entity_id'])
+                    payroll = get_authorized_payroll(user, task['entity_id'])
                     upload_id = task.get('data', {}).get('upload_id')
                     if upload_id:
                         upload = CsvReconciliationUpload.objects.get(id=upload_id, payroll=payroll)
@@ -92,9 +99,15 @@ def bind_service_signals():
                     else:
                         reconcile_payroll(payroll, user)
                 elif task_status == Task.Status.FAILED:
+                    get_authorized_payroll(user, task['entity_id'])
                     upload_id = task.get('data', {}).get('upload_id')
                     if upload_id:
                         CsvReconciliationUpload.objects.filter(id=upload_id, status=CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION).update(status=CsvReconciliationUpload.Status.FAIL)
+        except PermissionDenied as exc:
+            logger.warning(
+                "Benefit Plan access denied while completing payroll reconciliation",
+                exc_info=exc,
+            )
         except Exception as exc:
             logger.error("Error while executing on_task_complete_payroll_reconciliation", exc_info=exc)
             # A completed checker task has already emitted its completion
@@ -137,7 +150,7 @@ def bind_service_signals():
                     and task['business_event'] == PayrollConfig.payroll_reject_event:
                 task_status = task['status']
                 if task_status == Task.Status.COMPLETED:
-                    payroll = Payroll.objects.get(id=task['entity_id'])
+                    payroll = get_authorized_payroll(user, task['entity_id'])
                     reject_approved_payroll(payroll, user)
         except Exception as exc:
             logger.error("Error while executing on_task_complete_reject_approved_payroll", exc_info=exc)
@@ -162,7 +175,7 @@ def bind_service_signals():
                     and task['business_event'] == PayrollConfig.payroll_delete_event:
                 task_status = task['status']
                 if task_status == Task.Status.COMPLETED:
-                    payroll = Payroll.objects.get(id=task['entity_id'])
+                    payroll = get_authorized_payroll(user, task['entity_id'])
                     delete_payroll(payroll, user)
         except Exception as exc:
             logger.error("Error while executing on_task_complete_delete_payroll", exc_info=exc)
@@ -185,9 +198,11 @@ def bind_service_signals():
                 task_status = task['status']
                 if task_status == Task.Status.COMPLETED:
                     benefit = BenefitConsumption.objects.get(id=task['entity_id'])
+                    require_benefit_access(user, benefit)
                     delete_benefit(benefit, user)
                 if task_status == Task.Status.FAILED:
                     benefit = BenefitConsumption.objects.get(id=task['entity_id'])
+                    require_benefit_access(user, benefit)
                     benefit.status = BenefitConsumptionStatus.ACCEPTED
                     benefit.save(username=user.username)
         except Exception as exc:
