@@ -9,7 +9,12 @@ from core.gql.gql_mutations.base_mutation import BaseHistoryModelCreateMutationM
 from core.schema import OpenIMISMutation
 from payroll.apps import PayrollConfig
 from payroll.models import PaymentPoint, Payroll, PayrollStatus, PayrollMutation
-from payroll.services import PaymentPointService, PayrollService, BenefitConsumptionService
+from payroll.services import (
+    PaymentPointService,
+    PayrollService,
+    BenefitConsumptionService,
+    WithdrawalFeeConfigService,
+)
 
 
 class CreatePaymentPointInputType(OpenIMISMutation.Input):
@@ -30,6 +35,164 @@ class UpdatePaymentGatewayConfigInputType(OpenIMISMutation.Input):
     base_url = graphene.String(required=True, max_length=255)
     api_key = graphene.String(required=True, max_length=255)
     timeout = graphene.Int(required=True)
+
+
+class CreatePaymentProviderInput(OpenIMISMutation.Input):
+    code = graphene.String(required=True, max_length=64)
+    name = graphene.String(required=True, max_length=255)
+    provider_type = graphene.String(required=True, max_length=32)
+    is_active = graphene.Boolean(required=False)
+
+
+class UpdatePaymentProviderInput(CreatePaymentProviderInput):
+    id = graphene.UUID(required=True)
+
+
+class CreateWithdrawalFeeBandInput(OpenIMISMutation.Input):
+    provider_id = graphene.UUID(required=True)
+    minimum_amount = graphene.Decimal(required=True)
+    maximum_amount = graphene.Decimal(required=False)
+    transfer_cost = graphene.Decimal(required=True)
+    effective_from = graphene.Date(required=True)
+    effective_to = graphene.Date(required=False)
+
+
+class UpdateWithdrawalFeeBandInput(CreateWithdrawalFeeBandInput):
+    id = graphene.UUID(required=True)
+    provider_id = graphene.UUID(required=False)
+    minimum_amount = graphene.Decimal(required=False)
+    transfer_cost = graphene.Decimal(required=False)
+    effective_from = graphene.Date(required=False)
+
+
+class DeleteWithdrawalFeeBandInput(OpenIMISMutation.Input):
+    id = graphene.UUID(required=True)
+
+
+class SavePaymentProviderWithFeeBandInput(OpenIMISMutation.Input):
+    provider_id = graphene.UUID(required=False)
+    fee_band_id = graphene.UUID(required=False)
+    code = graphene.String(required=True, max_length=64)
+    name = graphene.String(required=True, max_length=255)
+    provider_type = graphene.String(required=True, max_length=32)
+    is_active = graphene.Boolean(required=True)
+    minimum_amount = graphene.Decimal(required=True)
+    maximum_amount = graphene.Decimal(required=False)
+    transfer_cost = graphene.Decimal(required=True)
+    effective_from = graphene.Date(required=True)
+    effective_to = graphene.Date(required=False)
+
+
+class WithdrawalFeeConfigMutation(BaseMutation):
+    _mutation_module = PayrollConfig.name
+
+    class Meta:
+        abstract = True
+
+    @classmethod
+    def _validate_mutation(cls, user, **data):
+        if type(user) is AnonymousUser or not user.id or not user.has_perms(
+            PayrollConfig.gql_withdrawal_fee_manage_perms
+        ):
+            raise ValidationError(_("mutation.authentication_required"))
+
+
+class CreatePaymentProviderMutation(WithdrawalFeeConfigMutation):
+    _mutation_class = "CreatePaymentProviderMutation"
+
+    @classmethod
+    def _mutate(cls, user, **data):
+        data.pop("client_mutation_id", None)
+        data.pop("client_mutation_label", None)
+        WithdrawalFeeConfigService(user).create_provider(data)
+
+    class Input(CreatePaymentProviderInput):
+        pass
+
+
+class UpdatePaymentProviderMutation(WithdrawalFeeConfigMutation):
+    _mutation_class = "UpdatePaymentProviderMutation"
+
+    @classmethod
+    def _mutate(cls, user, **data):
+        provider_id = data.pop("id")
+        data.pop("client_mutation_id", None)
+        data.pop("client_mutation_label", None)
+        WithdrawalFeeConfigService(user).update_provider(provider_id, data)
+
+    class Input(UpdatePaymentProviderInput):
+        pass
+
+
+class CreateWithdrawalFeeBandMutation(WithdrawalFeeConfigMutation):
+    _mutation_class = "CreateWithdrawalFeeBandMutation"
+
+    @classmethod
+    def _mutate(cls, user, **data):
+        data.pop("client_mutation_id", None)
+        data.pop("client_mutation_label", None)
+        WithdrawalFeeConfigService(user).create_fee_band(data)
+
+    class Input(CreateWithdrawalFeeBandInput):
+        pass
+
+
+class UpdateWithdrawalFeeBandMutation(WithdrawalFeeConfigMutation):
+    _mutation_class = "UpdateWithdrawalFeeBandMutation"
+
+    @classmethod
+    def _mutate(cls, user, **data):
+        band_id = data.pop("id")
+        data.pop("client_mutation_id", None)
+        data.pop("client_mutation_label", None)
+        WithdrawalFeeConfigService(user).update_fee_band(band_id, data)
+
+    class Input(UpdateWithdrawalFeeBandInput):
+        pass
+
+
+class DeleteWithdrawalFeeBandMutation(WithdrawalFeeConfigMutation):
+    _mutation_class = "DeleteWithdrawalFeeBandMutation"
+
+    @classmethod
+    def _mutate(cls, user, **data):
+        band_id = data.pop("id")
+        data.pop("client_mutation_id", None)
+        data.pop("client_mutation_label", None)
+        WithdrawalFeeConfigService(user).delete_fee_band(band_id)
+
+    class Input(DeleteWithdrawalFeeBandInput):
+        pass
+
+
+class SavePaymentProviderWithFeeBandMutation(WithdrawalFeeConfigMutation):
+    _mutation_class = "SavePaymentProviderWithFeeBandMutation"
+
+    @classmethod
+    def _mutate(cls, user, **data):
+        data.pop("client_mutation_id", None)
+        data.pop("client_mutation_label", None)
+        provider_data = {
+            key: data.pop(key)
+            for key in ("provider_id", "code", "name", "provider_type", "is_active")
+            if key in data
+        }
+        if "provider_id" in provider_data:
+            provider_data["id"] = provider_data.pop("provider_id")
+        fee_band_data = {
+            key: data.pop(key)
+            for key in (
+                "fee_band_id", "minimum_amount", "maximum_amount",
+                "transfer_cost", "effective_from", "effective_to",
+            )
+            if key in data
+        }
+        if "fee_band_id" in fee_band_data:
+            fee_band_data["id"] = fee_band_data.pop("fee_band_id")
+        WithdrawalFeeConfigService(user).save_provider_with_fee_band(provider_data, fee_band_data)
+
+    class Input(SavePaymentProviderWithFeeBandInput):
+        pass
 
 
 class CreatePayrollInput(OpenIMISMutation.Input):
@@ -62,6 +225,10 @@ class CreateConsolidatedPayrollInput(OpenIMISMutation.Input):
 
 class DeletePayrollInputType(DeletePaymentPointInputType):
     pass
+
+
+class RefreshWithdrawalFeeSnapshotsInput(OpenIMISMutation.Input):
+    payroll_id = graphene.UUID(required=True)
 
 
 class ClosePayrollInputType(DeletePaymentPointInputType):
@@ -195,6 +362,35 @@ class CreateConsolidatedPayrollMutation(BaseMutation):
             )
 
     class Input(CreateConsolidatedPayrollInput):
+        pass
+
+
+class RefreshWithdrawalFeeSnapshotsMutation(BaseMutation):
+    _mutation_class = "RefreshWithdrawalFeeSnapshotsMutation"
+    _mutation_module = "payroll"
+
+    @classmethod
+    def _validate_mutation(cls, user, **data):
+        if type(user) is AnonymousUser or not user.has_perms(
+            PayrollConfig.gql_payroll_create_perms,
+        ):
+            raise ValidationError("mutation.authentication_required")
+
+    @classmethod
+    def _mutate(cls, user, **data):
+        client_mutation_id = data.pop("client_mutation_id", None)
+        data.pop("client_mutation_label", None)
+        payroll = PayrollService(user).refresh_withdrawal_fee_snapshots(
+            data["payroll_id"],
+        )
+        if client_mutation_id:
+            PayrollMutation.object_mutated(
+                user,
+                client_mutation_id=client_mutation_id,
+                payroll=payroll,
+            )
+
+    class Input(RefreshWithdrawalFeeSnapshotsInput):
         pass
 
 

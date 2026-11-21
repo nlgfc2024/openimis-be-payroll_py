@@ -355,13 +355,18 @@ When the `payment_method` of a Payroll is set to `StrategyOfflinePayment`, the c
 The following features are intentionally deferred and planned for follow-up work:
 
 1. **Two-stage approval workflow**: District-level approval (DPD/Director) followed by national-level approval (EPS/National) with reject-back capability.
-2. **Payment provider integration**: The separate KYC feature captures approved household bank/account details; integrating those details with payment-provider instructions remains follow-up work.
-3. **Cash-out fee handling**: Logic for calculating and applying cash-out fees in consolidated payrolls.
-4. **Consolidated wagesheet summary**: Summary reporting for consolidated payroll transactions.
-5. **Linking payments with grievances**: Flagging payment statuses as partially paid, fully paid, or not paid, and linking to grievance workflows.
+2. **Payment gateway integration**: Fee bands use the provider saved with the beneficiary's KYC details; sending bank/account details as payout instructions remains follow-up work.
+3. **Consolidated wagesheet summary**: Summary reporting for consolidated payroll transactions.
+4. **Linking payments with grievances**: Flagging payment statuses as partially paid, fully paid, or not paid, and linking to grievance workflows.
 
 After a consolidated payroll is reconciled, its source payrolls are marked
 reconciled while retaining their source membership and audit context. Any
 benefits still awaiting payment remain eligible for the existing unpaid-invoice
 recovery flow; already reconciled benefits are not moved into the recovery
 payroll.
+
+Withdrawal fees are calculated from the configured provider fee bands and
+snapshotted when payrolls are consolidated. The government pays this fee on top
+of the wage; it is not deducted from the beneficiary's benefit amount. If a
+provider or fee band is unavailable, the affected benefits are flagged for
+review and the payroll can still proceed with a zero-fee snapshot.

@@ -10,6 +10,7 @@ from django.core.exceptions import ValidationError
 from django.db import transaction
 from simple_history.utils import bulk_create_with_history
 from django.db.models import Count, Q, Sum
+from django.utils import timezone
 from django.utils.translation import gettext as _
 
 from core import datetime
@@ -34,6 +35,7 @@ from payroll.consolidation import (
 )
 from payroll.models import (
     PaymentPoint,
+    PaymentProvider,
     Payroll,
     PayrollBenefitConsumption,
     BenefitConsumption,
@@ -42,7 +44,8 @@ from payroll.models import (
     ConsolidatedPayrollMember,
     PayrollStatus,
     CsvReconciliationUpload,
-    ReconciliationUploadRow
+    ReconciliationUploadRow,
+    WithdrawalFeeBand,
 )
 from payroll.tasks import send_requests_to_gateway_payment
 from payroll.utils import PayrollNameGenerator
@@ -56,6 +59,245 @@ from tasks_management.models import Task
 from tasks_management.services import TaskService, _get_std_task_data_payload
 
 logger = logging.getLogger(__name__)
+
+
+class WithdrawalFeeConfigService:
+    def __init__(self, user):
+        self.user = user
+
+    @staticmethod
+    def build_fee_preview_catalog(as_of=None):
+        as_of = as_of or datetime.date.today()
+        providers = list(PaymentProvider.objects.filter(is_deleted=False, is_active=True))
+        provider_ids = [provider.id for provider in providers]
+        fee_bands = WithdrawalFeeBand.objects.filter(
+            provider_id__in=provider_ids,
+            is_deleted=False,
+            effective_from__lte=as_of,
+        ).filter(
+            Q(effective_to__isnull=True) | Q(effective_to__gte=as_of),
+        )
+        providers_by_code = {}
+        providers_by_name = {}
+        for provider in providers:
+            providers_by_code.setdefault(provider.code.strip().casefold(), []).append(provider)
+            providers_by_name.setdefault(provider.name.strip().casefold(), []).append(provider)
+        bands_by_provider = {}
+        for band in fee_bands:
+            bands_by_provider.setdefault(band.provider_id, []).append(band)
+        return {
+            "providers_by_code": providers_by_code,
+            "providers_by_name": providers_by_name,
+            "bands_by_provider": bands_by_provider,
+        }
+
+    @staticmethod
+    def preview_fee_for_benefit(benefit, catalog):
+        withdrawal_fee = getattr(benefit, "withdrawal_fee", None)
+        withdrawal_fee_error = getattr(benefit, "withdrawal_fee_error", None)
+        amount = getattr(benefit, "amount", None)
+        if withdrawal_fee_error:
+            return withdrawal_fee, withdrawal_fee_error
+        if withdrawal_fee is not None:
+            return withdrawal_fee, None
+        if getattr(benefit, "withdrawal_fee_prepared_at", None):
+            return None, "The saved withdrawal fee snapshot is incomplete."
+        if amount is None:
+            return None, "The benefit amount is missing."
+
+        details = ((getattr(benefit, "json_ext", None) or {}).get("kyc_payment_details") or {})
+        provider_code = details.get("payment_provider_code")
+        provider_name = details.get("bank")
+        if provider_code:
+            providers = catalog["providers_by_code"].get(
+                str(provider_code).strip().casefold(), []
+            )
+        elif provider_name:
+            providers = catalog["providers_by_name"].get(
+                str(provider_name).strip().casefold(), []
+            )
+        else:
+            return None, "The KYC payment provider is missing."
+        if len(providers) != 1:
+            return None, "The KYC payment provider is unavailable or ambiguous."
+
+        provider = providers[0]
+        fee_bands = [
+            band for band in catalog["bands_by_provider"].get(provider.id, [])
+            if band.minimum_amount <= amount
+            and (band.maximum_amount is None or amount <= band.maximum_amount)
+        ]
+        if len(fee_bands) != 1:
+            return None, (
+                f"Expected one effective fee band for {provider.name} and amount "
+                f"{amount}, found {len(fee_bands)}."
+            )
+        return fee_bands[0].transfer_cost, None
+
+    @transaction.atomic
+    def create_provider(self, data):
+        name = (data.get("name") or "").strip()
+        code = (data.get("code") or "").strip().upper()
+        provider_type = (data.get("provider_type") or "").strip().upper()
+        self._validate_provider(name, code, provider_type)
+        if PaymentProvider.objects.filter(code=code).exists():
+            raise ValidationError(_("A provider with this code already exists."))
+        if PaymentProvider.objects.filter(name__iexact=name, is_deleted=False).exists():
+            raise ValidationError(_("A provider with this name already exists."))
+        provider = PaymentProvider(
+            name=name,
+            code=code,
+            provider_type=provider_type,
+            is_active=data.get("is_active", True),
+        )
+        provider.save(username=self.user.username)
+        return provider
+
+    @transaction.atomic
+    def save_provider_with_fee_band(self, provider_data, fee_band_data):
+        provider_id = provider_data.pop("id", None)
+        if provider_id:
+            provider = self.update_provider(provider_id, provider_data)
+        else:
+            provider = self.create_provider(provider_data)
+
+        fee_band_data["provider_id"] = provider.id
+        fee_band_id = fee_band_data.pop("id", None)
+        if fee_band_id:
+            fee_band = self.update_fee_band(fee_band_id, fee_band_data)
+        else:
+            fee_band = self.create_fee_band(fee_band_data)
+        return provider, fee_band
+
+    @transaction.atomic
+    def update_provider(self, provider_id, data):
+        provider = PaymentProvider.objects.select_for_update().filter(
+            id=provider_id, is_deleted=False,
+        ).first()
+        if not provider:
+            raise ValidationError(_("Payment provider was not found."))
+        name = (data.get("name") or provider.name).strip()
+        code = (data.get("code") or provider.code).strip().upper()
+        provider_type = (data.get("provider_type") or provider.provider_type).strip().upper()
+        self._validate_provider(name, code, provider_type)
+        if PaymentProvider.objects.filter(code=code).exclude(id=provider.id).exists():
+            raise ValidationError(_("A provider with this code already exists."))
+        if PaymentProvider.objects.filter(
+            name__iexact=name, is_deleted=False,
+        ).exclude(id=provider.id).exists():
+            raise ValidationError(_("A provider with this name already exists."))
+        provider.name = name
+        provider.code = code
+        provider.provider_type = provider_type
+        if data.get("is_active") is not None:
+            provider.is_active = data["is_active"]
+        provider.save(username=self.user.username)
+        return provider
+
+    @staticmethod
+    def _validate_provider(name, code, provider_type):
+        if not name or not code:
+            raise ValidationError(_("Provider name and code are required."))
+        if name.strip().casefold() in {"n/a", "unknown"} or code.strip().casefold() in {"n/a", "unknown"}:
+            raise ValidationError(_("N/A and Unknown cannot be configured as payment providers."))
+        if provider_type not in PaymentProvider.ProviderType.values:
+            raise ValidationError(_("Provider type is invalid."))
+
+    @transaction.atomic
+    def create_fee_band(self, data):
+        provider = PaymentProvider.objects.select_for_update().filter(
+            id=data.get("provider_id"),
+            is_deleted=False,
+            is_active=True,
+        ).first()
+        if not provider:
+            raise ValidationError(_("An active payment provider is required."))
+        band = WithdrawalFeeBand(
+            provider=provider,
+            minimum_amount=data["minimum_amount"],
+            maximum_amount=data.get("maximum_amount"),
+            transfer_cost=data["transfer_cost"],
+            effective_from=data["effective_from"],
+            effective_to=data.get("effective_to"),
+        )
+        self._validate_fee_band(band)
+        band.save(username=self.user.username)
+        return band
+
+    @transaction.atomic
+    def update_fee_band(self, band_id, data):
+        band = WithdrawalFeeBand.objects.select_for_update().filter(
+            id=band_id, is_deleted=False,
+        ).first()
+        if not band:
+            raise ValidationError(_("Withdrawal fee band was not found."))
+        if band.prepared_benefits.filter(
+            is_deleted=False,
+            withdrawal_fee_prepared_at__isnull=False,
+        ).exists():
+            raise ValidationError(_("A fee band used by a prepared payment cannot be changed."))
+        provider_id = data.get("provider_id", band.provider_id)
+        provider = PaymentProvider.objects.select_for_update().filter(
+            id=provider_id, is_deleted=False,
+        ).first()
+        if not provider or (provider.id != band.provider_id and not provider.is_active):
+            raise ValidationError(_("An active payment provider is required."))
+        band.provider = provider
+        for field in (
+            "minimum_amount", "maximum_amount", "transfer_cost",
+            "effective_from", "effective_to",
+        ):
+            if field in data:
+                setattr(band, field, data[field])
+        self._validate_fee_band(band, exclude_id=band.id)
+        band.save(username=self.user.username)
+        return band
+
+    @staticmethod
+    def _validate_fee_band(band, exclude_id=None):
+        if band.minimum_amount < 0 or band.transfer_cost < 0:
+            raise ValidationError(_("Amounts and transfer costs cannot be negative."))
+        if band.maximum_amount is not None and band.maximum_amount < band.minimum_amount:
+            raise ValidationError(_("Maximum amount must be greater than or equal to minimum amount."))
+        if band.effective_to and band.effective_to < band.effective_from:
+            raise ValidationError(_("Effective end date must not precede the start date."))
+
+        candidates = WithdrawalFeeBand.objects.select_for_update().filter(
+            provider=band.provider,
+            is_deleted=False,
+        )
+        if exclude_id:
+            candidates = candidates.exclude(id=exclude_id)
+        for existing in candidates:
+            amount_ranges_overlap = (
+                existing.maximum_amount is None
+                or band.minimum_amount <= existing.maximum_amount
+            ) and (
+                band.maximum_amount is None
+                or existing.minimum_amount <= band.maximum_amount
+            )
+            effective_ranges_overlap = (
+                band.effective_to is None
+                or existing.effective_from <= band.effective_to
+            ) and (
+                existing.effective_to is None
+                or band.effective_from <= existing.effective_to
+            )
+            if amount_ranges_overlap and effective_ranges_overlap:
+                raise ValidationError(
+                    _("Fee bands for the same provider cannot overlap in amount and effective date.")
+                )
+
+    @transaction.atomic
+    def delete_fee_band(self, band_id):
+        band = WithdrawalFeeBand.objects.select_for_update().filter(
+            id=band_id, is_deleted=False,
+        ).first()
+        if not band:
+            raise ValidationError(_("Withdrawal fee band was not found."))
+        if band.prepared_benefits.filter(is_deleted=False).exists():
+            raise ValidationError(_("A fee band used by a prepared payment cannot be deleted."))
+        band.delete(username=self.user.username)
 
 
 class PaymentPointService(BaseService):
@@ -396,6 +638,7 @@ class PayrollService(BaseService):
                 default_user=self.user,
                 batch_size=1000,
             )
+        self._prepare_withdrawal_fee_snapshots(payroll)
         self.create_accept_payroll_task(payroll.id, {
             "id": payroll.id, "district": district.name, "phase": phase,
             "included_payrolls": [{"id": str(source.id), "name": source.name} for source in sources],
@@ -434,7 +677,139 @@ class PayrollService(BaseService):
     def make_payment_for_payroll(self, obj_data):
         payroll = Payroll.objects.get(id=obj_data['id'], is_deleted=False)
         ensure_payroll_is_not_consolidated_source(payroll, "pay")
-        send_requests_to_gateway_payment.delay(payroll.id, self.user.id)
+        self._prepare_withdrawal_fee_snapshots(payroll)
+        transaction.on_commit(
+            lambda: send_requests_to_gateway_payment.delay(payroll.id, self.user.id)
+        )
+
+    @transaction.atomic
+    def refresh_withdrawal_fee_snapshots(self, payroll_id):
+        payroll = Payroll.objects.select_for_update().get(
+            id=payroll_id,
+            is_deleted=False,
+        )
+        if (
+            payroll.payroll_type != Payroll.PayrollType.CONSOLIDATED
+            or payroll.status != PayrollStatus.PENDING_APPROVAL
+        ):
+            raise ValidationError(
+                "Withdrawal fees can only be refreshed for a consolidated payroll "
+                "awaiting approval."
+            )
+        if not LocationManager().is_allowed(self.user, [payroll.district_id]):
+            raise ValidationError(
+                "You are not allowed to refresh fees for this district."
+            )
+        self._prepare_withdrawal_fee_snapshots(payroll, retry_unresolved=True)
+        return payroll
+
+    @transaction.atomic
+    def _prepare_withdrawal_fee_snapshots(self, payroll, retry_unresolved=False):
+        benefit_ids = PayrollBenefitConsumption.objects.filter(
+            payroll_id=payroll.id,
+            is_deleted=False,
+        ).values("benefit_id").distinct()
+        snapshot_filter = (
+            Q(withdrawal_fee_prepared_at__isnull=True)
+            | Q(withdrawal_fee_error__isnull=False)
+            if retry_unresolved
+            else Q(withdrawal_fee_prepared_at__isnull=True)
+        )
+        benefits = list(
+            BenefitConsumption.objects.select_for_update(of=("self",)).filter(
+                id__in=benefit_ids,
+                is_deleted=False,
+                status__in=[
+                    BenefitConsumptionStatus.ACCEPTED,
+                    BenefitConsumptionStatus.APPROVE_FOR_PAYMENT,
+                ],
+            ).filter(snapshot_filter).select_related("individual")
+        )
+        as_of = datetime.date.today()
+        prepared = []
+        errors = []
+
+        def use_zero_fee_snapshot(benefit, reason):
+            logger.warning(
+                "No withdrawal fee snapshot available for benefit %s; using zero fee: %s",
+                benefit.code,
+                reason,
+            )
+            prepared.append((benefit, None, None, Decimal("0.00"), reason))
+
+        for benefit in benefits:
+            if benefit.amount is None:
+                errors.append(f"{benefit.code}: missing benefit amount")
+                continue
+            if benefit.withdrawal_fee_prepared_at:
+                if benefit.withdrawal_fee is None and not (
+                    retry_unresolved and benefit.withdrawal_fee_error
+                ):
+                    errors.append(f"{benefit.code}: incomplete withdrawal fee snapshot")
+                    continue
+                if not (retry_unresolved and benefit.withdrawal_fee_error):
+                    continue
+            details = ((benefit.json_ext or {}).get("kyc_payment_details") or {})
+            account_number = details.get("account_number")
+            account_name = details.get("account_name")
+            if not account_number or not account_name:
+                use_zero_fee_snapshot(benefit, "missing KYC account details")
+                continue
+
+            provider_code = details.get("payment_provider_code")
+            provider_name = details.get("bank")
+            provider_query = PaymentProvider.objects.select_for_update().filter(
+                is_deleted=False,
+                is_active=True,
+            )
+            if provider_code:
+                provider_query = provider_query.filter(code__iexact=str(provider_code).strip())
+            elif provider_name:
+                provider_query = provider_query.filter(name__iexact=str(provider_name).strip())
+            else:
+                use_zero_fee_snapshot(benefit, "missing KYC payment provider")
+                continue
+            providers = list(provider_query[:2])
+            if len(providers) != 1:
+                use_zero_fee_snapshot(benefit, "KYC payment provider is unavailable or ambiguous")
+                continue
+            provider = providers[0]
+
+            fee_bands = list(
+                WithdrawalFeeBand.objects.select_for_update().filter(
+                    provider=provider,
+                    is_deleted=False,
+                    effective_from__lte=as_of,
+                ).filter(
+                    Q(effective_to__isnull=True) | Q(effective_to__gte=as_of),
+                    minimum_amount__lte=benefit.amount,
+                ).filter(
+                    Q(maximum_amount__isnull=True) | Q(maximum_amount__gte=benefit.amount),
+                )[:2]
+            )
+            if len(fee_bands) != 1:
+                use_zero_fee_snapshot(
+                    benefit,
+                    f"expected one effective fee band for {provider.name} "
+                    f"and amount {benefit.amount}, found {len(fee_bands)}",
+                )
+                continue
+            prepared.append((benefit, provider, fee_bands[0], fee_bands[0].transfer_cost, None))
+
+        if errors:
+            raise ValidationError(
+                _("Payment preparation blocked: %(errors)s")
+                % {"errors": "; ".join(errors)}
+            )
+
+        now = timezone.now()
+        for benefit, provider, fee_band, withdrawal_fee, withdrawal_fee_error in prepared:
+            benefit.withdrawal_provider = provider
+            benefit.withdrawal_fee_band = fee_band
+            benefit.withdrawal_fee = withdrawal_fee
+            benefit.withdrawal_fee_prepared_at = now
+            benefit.withdrawal_fee_error = withdrawal_fee_error
+            benefit.save(username=self.user.username)
 
     def _save_payroll(self, obj_data, payment_plan, payment_cycle, project_names):
         obj_ = self.OBJECT_TYPE(**obj_data)
@@ -614,6 +989,7 @@ class PayrollService(BaseService):
             field.rsplit("__", 1)[-1]
             for field in KYC_PAYMENT_DETAILS_FIELD_MAPPING
         }
+        snapshot_fields.add("payment_provider_code")
         for benefit in benefits:
             benefit_json_ext = benefit.json_ext or {}
             if benefit_json_ext.get("kyc_payment_details") is not None:
@@ -781,7 +1157,6 @@ class BenefitConsumptionService(BaseService):
 
 
 class CsvReconciliationService:
-
     def __init__(self, user: InteractiveUser):
         self.user = user
 
@@ -793,7 +1168,25 @@ class CsvReconciliationService:
         return PayrollConfig.csv_reconciliation_micro_catchment_column or "Micro Catchment"
 
     @staticmethod
-    def _reconciliation_field_mapping():
+    def _currency_label():
+        import core
+        from django.core.exceptions import ImproperlyConfigured
+
+        currency = getattr(core, "currency", None)
+        if not currency:
+            raise ImproperlyConfigured("The core currency is not configured.")
+        return str(currency)
+
+    @classmethod
+    def _withdrawal_fee_header(cls):
+        return f"Withdrawal fee ({cls._currency_label()})"
+
+    @classmethod
+    def _amount_to_pay_header(cls):
+        return f"Amount to pay (gross + fee) ({cls._currency_label()})"
+
+    @classmethod
+    def _reconciliation_field_mapping(cls):
         """Return configured fields, adding KYC fields for older installations."""
         field_mapping = dict(PayrollConfig.csv_reconciliation_field_mapping or {})
         snapshot_field_by_legacy = {
@@ -811,7 +1204,21 @@ class CsvReconciliationService:
             if field not in mapped_fields and header not in mapped_headers:
                 mapped_fields[field] = header
                 mapped_headers.add(header)
+        mapped_fields["withdrawal_fee"] = cls._withdrawal_fee_header()
+        if not mapped_fields.get("type"):
+            mapped_fields["type"] = "Type"
+        code_field = PayrollConfig.csv_reconciliation_code_column or "code"
+        if code_field not in mapped_fields:
+            mapped_fields[code_field] = "Code"
         return mapped_fields
+
+    @classmethod
+    def _payment_reference_headers(cls):
+        return {
+            header
+            for field, header in cls._reconciliation_field_mapping().items()
+            if field.rsplit("__", 1)[-1].lower() == "receipt"
+        } | {"receipt", "provider transaction reference"}
 
     def download_reconciliation(self, payroll_id) -> BytesIO:
         payroll = self._resolve_payroll(payroll_id)
@@ -821,7 +1228,24 @@ class CsvReconciliationService:
         # fields at export time as well as defining them in DEFAULT_CONFIG so
         # existing installations do not need a manual configuration migration.
         field_mapping = self._reconciliation_field_mapping()
+        reference_headers = {
+            header.lower() for header in self._payment_reference_headers()
+        }
+        field_mapping = {
+            field: header
+            for field, header in field_mapping.items()
+            if (
+                field.rsplit("__", 1)[-1].lower() != "receipt"
+                and header.strip().lower() not in reference_headers
+            )
+        }
+        fee_header = self._withdrawal_fee_header()
+        amount_to_pay_header = self._amount_to_pay_header()
+        field_mapping["withdrawal_fee"] = fee_header
+        if not field_mapping.get("type"):
+            field_mapping["type"] = "Type"
         records = list(bc_qs.values(*field_mapping.keys()))
+        fee_preview_catalog = None
         benefits_by_code = {
             benefit.code: benefit
             for benefit in bc_qs.select_related(
@@ -831,7 +1255,14 @@ class CsvReconciliationService:
 
         extra_info_keys = set()
         extra_info_dicts = []
-        mapped_headers = set(field_mapping.values()) | {self.micro_catchment_column}
+        hidden_reference_headers = self._payment_reference_headers()
+        mapped_headers = (
+            set(field_mapping)
+            | set(field_mapping.values())
+            | {self.micro_catchment_column, amount_to_pay_header}
+            | hidden_reference_headers
+        )
+        hidden_reference_headers_lower = {header.lower() for header in hidden_reference_headers}
         source_payroll_by_benefit = self._get_source_payrolls_by_benefit(payroll)
         project_micro_catchments = {}
         for record in records:
@@ -847,8 +1278,34 @@ class CsvReconciliationService:
             record["micro_catchment"] = (
                 project_micro_catchments[source_payroll.id] or self._get_micro_catchment(benefit)
             )
+            if (
+                getattr(benefit, "withdrawal_fee", None) is None
+                and not getattr(benefit, "withdrawal_fee_prepared_at", None)
+                and fee_preview_catalog is None
+            ):
+                fee_preview_catalog = WithdrawalFeeConfigService.build_fee_preview_catalog()
+            withdrawal_fee, fee_error = WithdrawalFeeConfigService.preview_fee_for_benefit(
+                benefit,
+                fee_preview_catalog,
+            )
+            if fee_error:
+                logger.warning(
+                    "Withdrawal fee preview unavailable for benefit %s: %s",
+                    benefit.code,
+                    fee_error,
+                )
+            amount = getattr(benefit, "amount", None)
+            record["withdrawal_fee"] = withdrawal_fee
+            record[amount_to_pay_header] = (
+                amount + withdrawal_fee
+                if amount is not None and withdrawal_fee is not None
+                else None
+            )
             extra_info = benefit.json_ext.get("extra_info", {}) if benefit.json_ext else {}
-            extra_info_keys.update(key for key in extra_info if key not in mapped_headers)
+            extra_info_keys.update(
+                key for key in extra_info
+                if key not in mapped_headers and key.lower() not in hidden_reference_headers_lower
+            )
             extra_info_dicts.append(extra_info)
             if source_payroll_by_benefit:
                 record["Source Payroll"] = source_payroll.name
@@ -861,7 +1318,22 @@ class CsvReconciliationService:
             columns={**field_mapping, "micro_catchment": self.micro_catchment_column},
             inplace=True,
         )
-        export_columns = list(field_mapping.values())
+        export_columns = [
+            header
+            for field, header in field_mapping.items()
+            if field not in {"withdrawal_fee", "type"}
+        ]
+        amount_header = field_mapping.get("amount")
+        fee_insert_index = (
+            export_columns.index(amount_header) + 1
+            if amount_header in export_columns
+            else len(export_columns)
+        )
+        export_columns[fee_insert_index:fee_insert_index] = [
+            fee_header,
+            amount_to_pay_header,
+            field_mapping["type"],
+        ]
         if source_payroll_by_benefit:
             export_columns.insert(0, "Source Payroll")
         if self.micro_catchment_column not in export_columns:
@@ -1340,7 +1812,12 @@ class CsvReconciliationService:
                 is_deleted=False,
             )
         }
-        reconciliation_fields = set(self._reconciliation_field_mapping().values())
+        field_mapping = self._reconciliation_field_mapping()
+        reconciliation_fields = (
+            set(field_mapping)
+            | set(field_mapping.values())
+            | {self._amount_to_pay_header()}
+        )
         for row in paid_rows:
             benefit = locked_benefits.get(row.benefit_id)
             if benefit and benefit.status == BenefitConsumptionStatus.ACCEPTED:
@@ -1370,8 +1847,20 @@ class CsvReconciliationService:
         """Return the original CSV annotated with its saved validation result."""
         try:
             df = pd.read_csv(BytesIO(contents), dtype=str, keep_default_na=False)
-        except Exception:
-            return BytesIO(contents)
+        except Exception as exc:
+            raise ValueError(
+                "Unable to safely hide payment references from this reconciliation review."
+            ) from exc
+        hidden_headers = {
+            header.lower() for header in self._payment_reference_headers()
+        }
+        df.drop(
+            columns=[
+                column for column in df.columns if column.strip().lower() in hidden_headers
+            ],
+            inplace=True,
+            errors="ignore",
+        )
 
         row_results = {
             row.row_number: row
@@ -1459,8 +1948,6 @@ class CsvReconciliationService:
         paid = self._clean_value(row.get(PayrollConfig.csv_reconciliation_paid_extra_field))
         if paid not in [PayrollConfig.csv_reconciliation_paid_yes, PayrollConfig.csv_reconciliation_paid_no]:
             reasons.append("invalid_paid_value")
-        if not self._clean_value(row.get(PayrollConfig.csv_reconciliation_receipt_column)):
-            reasons.append("missing_payment_reference")
         return benefit, reasons
 
 
@@ -1559,7 +2046,14 @@ class CsvReconciliationService:
         required_columns = {
             header
             for field, header in (PayrollConfig.csv_reconciliation_field_mapping or {}).items()
-            if field not in kyc_fields and header not in kyc_headers
+            if (
+                field not in kyc_fields
+                and header not in kyc_headers
+                and field.rsplit("__", 1)[-1].lower() != "receipt"
+                and header.strip().lower() not in {
+                    item.lower() for item in self._payment_reference_headers()
+                }
+            )
         } | {PayrollConfig.csv_reconciliation_paid_extra_field}
         missing_columns = required_columns - set(df.columns)
         if missing_columns:
@@ -1589,9 +2083,16 @@ class CsvReconciliationService:
 
     def _reconcile_bc(self, row, bc, reconciliation_fields=None):
         bc.status = BenefitConsumptionStatus.RECONCILED
-        bc.receipt = row[PayrollConfig.csv_reconciliation_receipt_column]
+        receipt = self._clean_value(row.get(PayrollConfig.csv_reconciliation_receipt_column))
+        if receipt is not None:
+            bc.receipt = receipt
         if reconciliation_fields is None:
-            reconciliation_fields = set(self._reconciliation_field_mapping().values())
+            field_mapping = self._reconciliation_field_mapping()
+            reconciliation_fields = (
+                set(field_mapping)
+                | set(field_mapping.values())
+                | {self._amount_to_pay_header()}
+            )
         extra_info = {
             k: row[k] for k in row.index
             if k not in reconciliation_fields
@@ -1605,9 +2106,9 @@ class CsvReconciliationService:
         bc.save(username=self.user.login_name)
         bill = Bill.objects.filter(benefitattachment__benefit=bc, is_deleted=False).first()
         if bill:
-            self._reconcile_bill(row, bill)
+            self._reconcile_bill(row, bill, bc.withdrawal_fee or Decimal("0.00"))
 
-    def _reconcile_bill(self, row, bill):
+    def _reconcile_bill(self, row, bill, withdrawal_fee=Decimal("0.00")):
         current_date = datetime.date.today()
         bill.status = Bill.Status.RECONCILIATED
         bill.date_payed = current_date
@@ -1619,7 +2120,7 @@ class CsvReconciliationService:
             "code_receipt": bill.code,
             "label": bill.terms,
             'reconciliation_status': PaymentInvoice.ReconciliationStatus.RECONCILIATED,
-            "fees": 0.0,
+            "fees": withdrawal_fee,
             "amount_received": bill.amount_total,
             "date_payment": current_date,
             'payment_origin': "online payment",
@@ -1632,9 +2133,11 @@ class CsvReconciliationService:
             'subject_type': ContentType.objects.get_for_model(bill),
             'subject': bill,
             'status': DetailPaymentInvoice.DetailPaymentStatus.ACCEPTED,
-            'fees': 0.0,
+            'fees': withdrawal_fee,
             'amount': bill.amount_total,
-            'reconcilation_id': row[PayrollConfig.csv_reconciliation_receipt_column],
+            'reconcilation_id': self._clean_value(
+                row.get(PayrollConfig.csv_reconciliation_receipt_column)
+            ),
             'reconcilation_date': current_date,
         }
         bill_payment_details = DetailPaymentInvoice(**bill_payment_details)
