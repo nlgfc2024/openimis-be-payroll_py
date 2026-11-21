@@ -29,6 +29,12 @@ from payroll.models import PaymentPoint, Payroll, \
     CsvReconciliationUpload, ReconciliationUploadRow, PayrollBenefitConsumption, BenefitConsumptionStatus, \
     ConsolidatedPayrollMember, PayrollStatus
 from payroll.payments_registry import PaymentMethodStorage
+from payroll.benefit_plan_access import (
+    filter_benefit_queryset,
+    filter_payroll_queryset,
+    get_authorized_payroll,
+    require_benefit_plan_access,
+)
 from social_protection.models import BenefitPlan
 from tasks_management.models import Task
 
@@ -143,6 +149,7 @@ class Query(graphene.ObjectType):
 
     def resolve_bill_by_payroll(self, info, **kwargs):
         Query._check_permissions(info.context.user, PayrollConfig.gql_payroll_search_perms)
+        get_authorized_payroll(info.context.user, kwargs.get("payroll_uuid"))
         filters = [*append_validity_filter(**kwargs), Q(payrollbill__payroll_id=kwargs.get("payroll_uuid"),
                                                         is_deleted=False,
                                                         payrollbill__is_deleted=False,
@@ -165,6 +172,7 @@ class Query(graphene.ObjectType):
 
     def resolve_benefit_consumption_by_payroll(self, info, **kwargs):
         Query._check_permissions(info.context.user, PayrollConfig.gql_payroll_search_perms)
+        get_authorized_payroll(info.context.user, kwargs.get("payroll_uuid"))
         filters = [*append_validity_filter(**kwargs),
                    Q(payrollbenefitconsumption__payroll_id=kwargs.get("payroll_uuid"),
                      is_deleted=False,
@@ -185,11 +193,13 @@ class Query(graphene.ObjectType):
                 *filters,
                 individual__groupindividuals__recipient_type="PRIMARY",
                 individual__groupindividuals__is_deleted=False,
-            ).distinct()
+            ).distinct(),
+            info.context.user,
         ), info)
 
     def resolve_benefit_attachment_by_payroll(self, info, **kwargs):
         Query._check_permissions(info.context.user, PayrollConfig.gql_payroll_search_perms)
+        get_authorized_payroll(info.context.user, kwargs.get("payroll_uuid"))
         filters = [*append_validity_filter(**kwargs),
                    Q(benefit__payrollbenefitconsumption__payroll_id=kwargs.get("payroll_uuid"),
                      is_deleted=False,
@@ -203,7 +213,8 @@ class Query(graphene.ObjectType):
             wait_for_mutation(client_mutation_id)
             filters.append(Q(mutations__mutation__client_mutation_id=client_mutation_id))
 
-        return gql_optimizer.query(BenefitAttachment.objects.filter(*filters).distinct(), info)
+        query = BenefitAttachment.get_queryset(BenefitAttachment.objects.filter(*filters).distinct(), info)
+        return gql_optimizer.query(query, info)
 
     def resolve_payment_point(self, info, **kwargs):
         Query._check_permissions(info.context.user, PayrollConfig.gql_payment_point_search_perms)
@@ -230,7 +241,7 @@ class Query(graphene.ObjectType):
             wait_for_mutation(client_mutation_id)
             filters.append(Q(mutations__mutation__client_mutation_id=client_mutation_id))
 
-        query = Payroll.objects.filter(*filters)
+        query = filter_payroll_queryset(Payroll.objects.filter(*filters), info.context.user)
         return gql_optimizer.query(query, info)
 
     @staticmethod
@@ -282,7 +293,7 @@ class Query(graphene.ObjectType):
             status__in=[Task.Status.RECEIVED, Task.Status.ACCEPTED],
             is_deleted=False,
         )
-        payrolls = Payroll.objects.filter(**filters).filter(
+        payrolls = filter_payroll_queryset(Payroll.objects.filter(**filters), user).filter(
             ~Exists(active_memberships),
             Exists(active_benefit_links),
             ~Exists(ineligible_benefit_links),
@@ -342,6 +353,7 @@ class Query(graphene.ObjectType):
 
     def resolve_consolidation_candidates(self, info, district_id, benefit_plan_id):
         Query._check_permissions(info.context.user, PayrollConfig.gql_payroll_search_perms)
+        require_benefit_plan_access(info.context.user, benefit_plan_id)
         return Query._consolidation_candidates(
             district_id,
             benefit_plan_id,
@@ -382,11 +394,11 @@ class Query(graphene.ObjectType):
         if payment_cycle_uuid:
             filters.append(Q(payroll__payment_cycle_id=payment_cycle_uuid))
 
-        query = PayrollBenefitConsumption.objects.filter(
+        query = PayrollBenefitConsumption.get_queryset(PayrollBenefitConsumption.objects.filter(
             *filters,
             benefit__individual__groupindividuals__recipient_type="PRIMARY",
             benefit__individual__groupindividuals__is_deleted=False,
-        ).distinct()
+        ).distinct(), info)
         return gql_optimizer.query(query, info)
 
     def resolve_benefit_consumption(self, info, **kwargs):
@@ -398,7 +410,9 @@ class Query(graphene.ObjectType):
             wait_for_mutation(client_mutation_id)
             filters.append(Q(mutations__mutation__client_mutation_id=client_mutation_id))
 
-        query = benefit_consumption_queryset(BenefitConsumption.objects.filter(*filters))
+        query = benefit_consumption_queryset(
+            BenefitConsumption.objects.filter(*filters), info.context.user
+        )
         return gql_optimizer.query(query, info)
 
     def resolve_payment_methods(self, info, **kwargs):
@@ -421,13 +435,14 @@ class Query(graphene.ObjectType):
         Query._check_permissions(info.context.user, PayrollConfig.gql_csv_reconciliation_search_perms)
         filters = append_validity_filter(**kwargs)
 
-        query = CsvReconciliationUpload.objects.filter(*filters)
+        query = CsvReconciliationUpload.get_queryset(CsvReconciliationUpload.objects.filter(*filters), info)
         return gql_optimizer.query(query, info)
 
     def resolve_reconciliation_upload_row(self, info, **kwargs):
         Query._check_permissions(info.context.user, PayrollConfig.gql_csv_reconciliation_search_perms)
         filters = append_validity_filter(**kwargs)
-        return gql_optimizer.query(ReconciliationUploadRow.objects.filter(*filters), info)
+        query = ReconciliationUploadRow.get_queryset(ReconciliationUploadRow.objects.filter(*filters), info)
+        return gql_optimizer.query(query, info)
 
     def resolve_benefits_summary(self, info, **kwargs):
         Query._check_permissions(info.context.user,
@@ -446,19 +461,21 @@ class Query(graphene.ObjectType):
             filters.append(Q(individual__id=individual_id))
 
         if payroll_id:
+            get_authorized_payroll(info.context.user, payroll_id)
             filters.append(Q(payrollbenefitconsumption__payroll_id=payroll_id))
 
         if benefit_plan_uuid:
+            require_benefit_plan_access(info.context.user, benefit_plan_uuid)
             filters.append(Q(payrollbenefitconsumption__payroll__payment_plan__benefit_plan_id=benefit_plan_uuid))
 
         if payment_cycle_uuid:
             filters.append(Q(payrollbenefitconsumption__payroll__payment_cycle_id=payment_cycle_uuid))
 
-        benefits = BenefitConsumption.objects.filter(
+        benefits = filter_benefit_queryset(BenefitConsumption.objects.filter(
             *filters,
             is_deleted=False,
             payrollbenefitconsumption__is_deleted=False,
-        ).distinct()
+        ).distinct(), info.context.user)
 
         amount_received = benefits.filter(
             status=BenefitConsumptionStatus.RECONCILED,
