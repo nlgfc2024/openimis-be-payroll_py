@@ -1,5 +1,6 @@
 import logging
 
+from django.core.exceptions import PermissionDenied
 from django.db import transaction
 from rest_framework import status, views
 from rest_framework.decorators import api_view, permission_classes
@@ -11,6 +12,7 @@ from payroll.apps import PayrollConfig
 from payroll.models import Payroll, CsvReconciliationUpload
 from payroll.payments_registry import PaymentMethodStorage
 from payroll.services import CsvReconciliationService
+from payroll.benefit_plan_access import get_authorized_payroll
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +24,7 @@ def send_callback_to_openimis(request):
         user = request.user
         payroll_id, response_from_gateway, rejected_bills = \
             _resolve_send_callback_to_imis_args(request)
-        payroll = Payroll.objects.get(id=payroll_id)
+        payroll = get_authorized_payroll(user, payroll_id)
         strategy = PaymentMethodStorage.get_chosen_payment_method(payroll.payment_method)
         if strategy:
             # save the reponse from gateway in openIMIS
@@ -36,6 +38,8 @@ def send_callback_to_openimis(request):
     except ValueError as exc:
         logger.error("Error while sending callback to openIMIS", exc_info=exc)
         return Response({'success': False, 'error': str(exc)}, status=400)
+    except PermissionDenied as exc:
+        return Response({'success': False, 'error': str(exc)}, status=403)
     except Exception as exc:
         logger.error("Unexpected error while sending callback to openIMIS", exc_info=exc)
         return Response({'success': False, 'error': str(exc)}, status=500)
@@ -74,6 +78,7 @@ class CSVReconciliationAPIView(views.APIView):
             else:
                 upload_id = request.GET.get("upload_id")
                 file_name = request.GET.get("payroll_file_name")
+                get_authorized_payroll(request.user, payroll_id)
                 upload = CsvReconciliationUpload.objects.filter(
                     id=upload_id, payroll_id=payroll_id, is_deleted=False,
                 ).first() if upload_id else None
@@ -97,6 +102,8 @@ class CSVReconciliationAPIView(views.APIView):
         except ValueError as exc:
             logger.error("Error while generating CSV reconciliation", exc_info=exc)
             return Response({'success': False, 'error': str(exc)}, status=400)
+        except PermissionDenied as exc:
+            return Response({'success': False, 'error': str(exc)}, status=403)
         except FileNotFoundError as exc:
             logger.error("File not found", exc_info=exc)
             return Response({'success': False, 'error': str(exc)}, status=404)
@@ -112,6 +119,7 @@ class CSVReconciliationAPIView(views.APIView):
             file = request.FILES.get("file")
             if not file:
                 raise ValueError("No CSV file was provided")
+            authorized_payroll = get_authorized_payroll(request.user, payroll_id)
             upload.save(username=request.user.login_name)
             target_file_path = PayrollConfig.get_payroll_payment_file_path(
                 payroll_id, f"{upload.id}_{file.name}",
@@ -133,12 +141,16 @@ class CSVReconciliationAPIView(views.APIView):
                 "status": upload.status,
                 "summary": summary,
             }, status=201)
+        except PermissionDenied as exc:
+            return Response({
+                "success": False, "error": str(exc), "upload_id": None,
+            }, status=status.HTTP_403_FORBIDDEN)
         except ValueError as exc:
             logger.info("CSV reconciliation upload rejected: %s", exc)
             error = {"code": "validation_error", "message": str(exc)}
-            if upload:
+            if upload.id:
                 upload.error = error
-                upload.payroll = Payroll.objects.filter(id=payroll_id).first()
+                upload.payroll = locals().get("authorized_payroll")
                 upload.status = CsvReconciliationUpload.Status.FAIL
                 upload.json_ext = {"extra_info": CsvReconciliationService._upload_summary(upload)}
                 upload.save(username=request.user.login_name)
@@ -155,9 +167,9 @@ class CSVReconciliationAPIView(views.APIView):
                 "code": "upload_processing_failed",
                 "message": "The reconciliation file could not be processed. Please correct the file and upload it again.",
             }
-            if upload:
+            if upload.id:
                 upload.error = error
-                upload.payroll = Payroll.objects.filter(id=payroll_id).first()
+                upload.payroll = locals().get("authorized_payroll")
                 upload.status = CsvReconciliationUpload.Status.FAIL
                 upload.json_ext = {'extra_info': CsvReconciliationService._upload_summary(upload)}
                 upload.save(username=request.user.login_name)
