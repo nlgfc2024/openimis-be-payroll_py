@@ -4,23 +4,20 @@ from django.apps import AppConfig
 
 from core.custom_filters import CustomFilterRegistryPoint
 from payroll.payments_registry import PaymentsMethodRegistryPoint
+from individual.data_source import KYC_PAYMENT_RECONCILIATION_FIELDS
 
 MODULE_NAME = 'payroll'
 
 # Snapshot payment details onto each benefit at payroll generation so later
 # KYC edits cannot change a reconciliation export for an existing payroll.
 KYC_PAYMENT_DETAILS_FIELD_MAPPING = {
-    "json_ext__kyc_payment_details__gender": "Gender",
-    "json_ext__kyc_payment_details__account_number": "Account Number",
-    "json_ext__kyc_payment_details__account_name": "Account Name",
-    "json_ext__kyc_payment_details__bank": "Bank",
+    f"json_ext__kyc_payment_details__{field}": label
+    for field, label in KYC_PAYMENT_RECONCILIATION_FIELDS.items()
 }
 
 LEGACY_KYC_PAYMENT_DETAILS_FIELD_MAPPING = {
-    "individual__json_ext__gender": "Gender",
-    "individual__json_ext__account_number": "Account Number",
-    "individual__json_ext__account_name": "Account Name",
-    "individual__json_ext__bank": "Bank",
+    f"individual__json_ext__{field}": label
+    for field, label in KYC_PAYMENT_RECONCILIATION_FIELDS.items()
 }
 
 DEFAULT_CONFIG = {
