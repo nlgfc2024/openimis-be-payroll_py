@@ -225,7 +225,12 @@ class ReconciliationAuditPolicyTests(TestCase):
                 "status": "Status",
                 "receipt": "Receipt",
             }
+            mapping = CsvReconciliationService._reconciliation_field_mapping()
             dataframe = pd.DataFrame([{
+                header: "value"
+                for field, header in mapping.items()
+                if field != "receipt"
+            } | {
                 "Code": "BENEFIT-1",
                 "Amount": "10.00",
                 "Status": BenefitConsumptionStatus.ACCEPTED,
@@ -295,7 +300,7 @@ class ReconciliationAuditPolicyTests(TestCase):
         amount_to_pay_header = service._amount_to_pay_header()
         self.assertIn("Code", exported.columns)
         self.assertNotIn("Receipt", exported.columns)
-        self.assertNotIn("Payment type", exported.columns)
+        self.assertIn("Payment type", exported.columns)
         self.assertEqual(list(exported.columns), [
             "Source Payroll",
             "Payroll Name",
@@ -316,7 +321,7 @@ class ReconciliationAuditPolicyTests(TestCase):
             "Amount",
             fee_header,
             amount_to_pay_header,
-            "Type",
+            "Payment type",
             "Paid",
         ])
         self.assertTrue(pd.isna(exported.loc[0, "Source Payroll"]))
@@ -324,9 +329,47 @@ class ReconciliationAuditPolicyTests(TestCase):
         self.assertEqual(exported.loc[0, "Payroll Status"], payroll.status)
         self.assertEqual(exported.loc[0, fee_header], 2.5)
         self.assertEqual(exported.loc[0, amount_to_pay_header], 12.5)
-        self.assertEqual(exported.loc[0, "Type"], "CASH")
+        self.assertEqual(exported.loc[0, "Payment type"], "CASH")
         self.assertEqual(exported.loc[0, "Paid"], "Yes")
         build_fee_catalog.assert_called_once()
+
+    def test_custom_configured_headers_are_used_for_export_and_upload_validation(self):
+        original_mapping = PayrollConfig.csv_reconciliation_field_mapping
+        original_status = PayrollConfig.csv_reconciliation_status_column
+        original_paid = PayrollConfig.csv_reconciliation_paid_extra_field
+        original_micro_catchment = PayrollConfig.csv_reconciliation_micro_catchment_column
+        try:
+            configured_mapping = dict(DEFAULT_CONFIG["csv_reconciliation_field_mapping"])
+            configured_mapping.update({
+                "individual__first_name": "Beneficiary first name",
+                "amount": "Payout amount",
+                "type": "Payment type",
+            })
+            PayrollConfig.csv_reconciliation_field_mapping = configured_mapping
+            PayrollConfig.csv_reconciliation_status_column = "Benefit status"
+            PayrollConfig.csv_reconciliation_paid_extra_field = "Payment completed"
+            PayrollConfig.csv_reconciliation_micro_catchment_column = "Project catchment"
+
+            service = CsvReconciliationService(None)
+            columns = service._reconciliation_export_columns()
+            dataframe = pd.DataFrame([{column: "value" for column in columns}])
+
+            self.assertIn("Beneficiary first name", columns)
+            self.assertIn("Payout amount", columns)
+            self.assertIn("Payment completed", columns)
+            self.assertIn("Project catchment", columns)
+            service._validate_dataframe(dataframe)
+        finally:
+            PayrollConfig.csv_reconciliation_field_mapping = original_mapping
+            PayrollConfig.csv_reconciliation_status_column = original_status
+            PayrollConfig.csv_reconciliation_paid_extra_field = original_paid
+            PayrollConfig.csv_reconciliation_micro_catchment_column = original_micro_catchment
+
+    def test_upload_validation_rejects_a_code_and_paid_only_file(self):
+        dataframe = pd.DataFrame([{"Code": "BENEFIT-1", "Paid": "Yes"}])
+
+        with self.assertRaisesRegex(ValueError, "Missing required columns"):
+            CsvReconciliationService(None)._validate_dataframe(dataframe)
 
     def test_reconciliation_without_receipt_preserves_legacy_reference(self):
         service = CsvReconciliationService(SimpleNamespace(login_name="tester"))
