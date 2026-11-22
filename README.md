@@ -82,6 +82,22 @@ This section details the configuration settings required for integrating with a 
 - **csv_reconciliation_amount_tolerance**: Maximum permitted absolute difference between the submitted and expected amount. The default is `0`.
 - **csv_reconciliation_micro_catchment_column**: CSV header containing the micro-catchment value. The default is `Micro Catchment`.
 
+Payroll downloads use a fixed 21-column schema for standard and consolidated
+payrolls. `Source Payroll` is blank for standard payrolls and contains the
+originating payroll name for consolidated rows. Reviewed CSV downloads use the
+same schema; variable extra-info and review-audit columns are not included.
+The `Receipt` field is not part of the export schema and can be added to an
+upload when a payment reference is required.
+
+```text
+Source Payroll, Payroll Name, Payroll Status, District Name, Micro Catchment,
+Form Number, Phone Number, First Name, Last Name, National ID, Gender,
+Account Number, Account Name, Bank, Code, Status, Amount,
+Withdrawal fee (<currency>), Amount to pay (gross + fee) (<currency>), Type, Paid
+```
+
+`<currency>` is the configured core currency (MWK in Malawi deployments).
+
 ### Configuration Parameters
 
 - **gateway_base_url**: The base URL of the payment gateway's API.

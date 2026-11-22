@@ -60,6 +60,24 @@ from tasks_management.services import TaskService, _get_std_task_data_payload
 
 logger = logging.getLogger(__name__)
 
+RECONCILIATION_EXPORT_FIELD_MAPPING = {
+    "individual__location__parent__parent__parent__name": "District Name",
+    "individual__json_ext__form_number": "Form Number",
+    "individual__json_ext__household_mobile_number": "Phone Number",
+    "individual__first_name": "First Name",
+    "individual__last_name": "Last Name",
+    "individual__json_ext__national_id": "National ID",
+    "json_ext__kyc_payment_details__gender": "Gender",
+    "json_ext__kyc_payment_details__account_number": "Account Number",
+    "json_ext__kyc_payment_details__account_name": "Account Name",
+    "json_ext__kyc_payment_details__bank": "Bank",
+    "code": "Code",
+    "status": "Status",
+    "amount": "Amount",
+    "type": "Type",
+}
+RECONCILIATION_PAID_COLUMN = "Paid"
+
 
 class WithdrawalFeeConfigService:
     def __init__(self, user):
@@ -1186,6 +1204,32 @@ class CsvReconciliationService:
         return f"Amount to pay (gross + fee) ({cls._currency_label()})"
 
     @classmethod
+    def _reconciliation_export_columns(cls):
+        return [
+            "Source Payroll",
+            "Payroll Name",
+            "Payroll Status",
+            "District Name",
+            "Micro Catchment",
+            "Form Number",
+            "Phone Number",
+            "First Name",
+            "Last Name",
+            "National ID",
+            "Gender",
+            "Account Number",
+            "Account Name",
+            "Bank",
+            "Code",
+            "Status",
+            "Amount",
+            cls._withdrawal_fee_header(),
+            cls._amount_to_pay_header(),
+            "Type",
+            "Paid",
+        ]
+
+    @classmethod
     def _reconciliation_field_mapping(cls):
         """Return configured fields, adding KYC fields for older installations."""
         field_mapping = dict(PayrollConfig.csv_reconciliation_field_mapping or {})
@@ -1224,26 +1268,9 @@ class CsvReconciliationService:
         payroll = self._resolve_payroll(payroll_id)
         ensure_payroll_is_not_consolidated_source(payroll, "download a reconciliation file for")
         bc_qs = self._get_benefit_consumption_qs(payroll)
-        # Module configuration is persisted by deployment. Merge the KYC
-        # fields at export time as well as defining them in DEFAULT_CONFIG so
-        # existing installations do not need a manual configuration migration.
-        field_mapping = self._reconciliation_field_mapping()
-        reference_headers = {
-            header.lower() for header in self._payment_reference_headers()
-        }
-        field_mapping = {
-            field: header
-            for field, header in field_mapping.items()
-            if (
-                field.rsplit("__", 1)[-1].lower() != "receipt"
-                and header.strip().lower() not in reference_headers
-            )
-        }
+        field_mapping = RECONCILIATION_EXPORT_FIELD_MAPPING
         fee_header = self._withdrawal_fee_header()
         amount_to_pay_header = self._amount_to_pay_header()
-        field_mapping["withdrawal_fee"] = fee_header
-        if not field_mapping.get("type"):
-            field_mapping["type"] = "Type"
         records = list(bc_qs.values(*field_mapping.keys()))
         fee_preview_catalog = None
         benefits_by_code = {
@@ -1253,30 +1280,25 @@ class CsvReconciliationService:
             )
         }
 
-        extra_info_keys = set()
-        extra_info_dicts = []
-        hidden_reference_headers = self._payment_reference_headers()
-        mapped_headers = (
-            set(field_mapping)
-            | set(field_mapping.values())
-            | {self.micro_catchment_column, amount_to_pay_header}
-            | hidden_reference_headers
-        )
-        hidden_reference_headers_lower = {header.lower() for header in hidden_reference_headers}
         source_payroll_by_benefit = self._get_source_payrolls_by_benefit(payroll)
         project_micro_catchments = {}
         for record in records:
             benefit = benefits_by_code[record["code"]]
-            source_payroll = source_payroll_by_benefit.get(benefit.id, payroll)
-            if source_payroll.id not in project_micro_catchments:
-                project_micro_catchments[source_payroll.id] = self._get_payroll_micro_catchment(
-                    source_payroll
+            source_payroll = source_payroll_by_benefit.get(benefit.id)
+            payroll_for_context = source_payroll or payroll
+            record["Source Payroll"] = source_payroll.name if source_payroll else ""
+            record["Payroll Name"] = payroll.name
+            record["Payroll Status"] = payroll.status
+            if payroll_for_context.id not in project_micro_catchments:
+                project_micro_catchments[payroll_for_context.id] = self._get_payroll_micro_catchment(
+                    payroll_for_context
                 )
             # The payroll's project is the work location. A recipient may live
             # in a different catchment, but that must not make a one-project
             # payroll look as though it contains several project catchments.
-            record["micro_catchment"] = (
-                project_micro_catchments[source_payroll.id] or self._get_micro_catchment(benefit)
+            record["Micro Catchment"] = (
+                project_micro_catchments[payroll_for_context.id]
+                or self._get_micro_catchment(benefit)
             )
             if (
                 getattr(benefit, "withdrawal_fee", None) is None
@@ -1295,61 +1317,19 @@ class CsvReconciliationService:
                     fee_error,
                 )
             amount = getattr(benefit, "amount", None)
-            record["withdrawal_fee"] = withdrawal_fee
+            record[fee_header] = withdrawal_fee
             record[amount_to_pay_header] = (
                 amount + withdrawal_fee
                 if amount is not None and withdrawal_fee is not None
                 else None
             )
-            extra_info = benefit.json_ext.get("extra_info", {}) if benefit.json_ext else {}
-            extra_info_keys.update(
-                key for key in extra_info
-                if key not in mapped_headers and key.lower() not in hidden_reference_headers_lower
-            )
-            extra_info_dicts.append(extra_info)
-            if source_payroll_by_benefit:
-                record["Source Payroll"] = source_payroll.name
 
         df = pd.DataFrame.from_records(records)
-        df[PayrollConfig.csv_reconciliation_paid_extra_field] = df.apply(
+        df.rename(columns=field_mapping, inplace=True)
+        df[RECONCILIATION_PAID_COLUMN] = df.apply(
             lambda row: self._fill_paid_column(row), axis=1
         )
-        df.rename(
-            columns={**field_mapping, "micro_catchment": self.micro_catchment_column},
-            inplace=True,
-        )
-        export_columns = [
-            header
-            for field, header in field_mapping.items()
-            if field not in {"withdrawal_fee", "type"}
-        ]
-        amount_header = field_mapping.get("amount")
-        fee_insert_index = (
-            export_columns.index(amount_header) + 1
-            if amount_header in export_columns
-            else len(export_columns)
-        )
-        export_columns[fee_insert_index:fee_insert_index] = [
-            fee_header,
-            amount_to_pay_header,
-            field_mapping["type"],
-        ]
-        if source_payroll_by_benefit:
-            export_columns.insert(0, "Source Payroll")
-        if self.micro_catchment_column not in export_columns:
-            try:
-                export_columns.insert(
-                    export_columns.index("District Name") + 1,
-                    self.micro_catchment_column,
-                )
-            except ValueError:
-                export_columns.append(self.micro_catchment_column)
-        if PayrollConfig.csv_reconciliation_paid_extra_field not in export_columns:
-            export_columns.append(PayrollConfig.csv_reconciliation_paid_extra_field)
-        for key in extra_info_keys:
-            df[key] = [extra_info.get(key) for extra_info in extra_info_dicts]
-            export_columns.append(key)
-        df = df.reindex(columns=export_columns)
+        df = df.reindex(columns=self._reconciliation_export_columns())
 
         in_memory_file = BytesIO()
         df.to_csv(in_memory_file, index=False)
@@ -1524,7 +1504,7 @@ class CsvReconciliationService:
             else:
                 valid_indexes.append(index)
 
-        paid_column = PayrollConfig.csv_reconciliation_paid_extra_field
+        paid_column = RECONCILIATION_PAID_COLUMN
         valid_rows = df.loc[valid_indexes]
         upload.total_records = len(df)
         upload.unmatched_records = len(errors)
@@ -1802,7 +1782,7 @@ class CsvReconciliationService:
                 )
         paid_rows = [
             row for row in rows
-            if self._clean_value(row.submitted_data.get(PayrollConfig.csv_reconciliation_paid_extra_field))
+            if self._clean_value(row.submitted_data.get(RECONCILIATION_PAID_COLUMN))
             == PayrollConfig.csv_reconciliation_paid_yes
         ]
         locked_benefits = {
@@ -1816,7 +1796,7 @@ class CsvReconciliationService:
         reconciliation_fields = (
             set(field_mapping)
             | set(field_mapping.values())
-            | {self._amount_to_pay_header()}
+            | set(self._reconciliation_export_columns())
         )
         for row in paid_rows:
             benefit = locked_benefits.get(row.benefit_id)
@@ -1844,7 +1824,7 @@ class CsvReconciliationService:
         reconcile_consolidated_sources(payroll, self.user)
 
     def download_upload_review(self, upload, contents):
-        """Return the original CSV annotated with its saved validation result."""
+        """Return the uploaded CSV using the fixed payroll export schema."""
         try:
             df = pd.read_csv(BytesIO(contents), dtype=str, keep_default_na=False)
         except Exception as exc:
@@ -1861,37 +1841,7 @@ class CsvReconciliationService:
             inplace=True,
             errors="ignore",
         )
-
-        row_results = {
-            row.row_number: row
-            for row in ReconciliationUploadRow.objects.filter(upload=upload, is_deleted=False)
-        }
-        validation_status = []
-        mismatch_reasons = []
-        matched_records = []
-        paid_records = []
-        unpaid_records = []
-        unmatched_records = []
-        paid_column = PayrollConfig.csv_reconciliation_paid_extra_field
-
-        for index, row in df.iterrows():
-            result = row_results.get(index + 2)
-            reasons = result.mismatch_reasons if result else []
-            is_valid = result and result.status == ReconciliationUploadRow.Status.VALID
-            paid_value = self._clean_value(row.get(paid_column))
-            validation_status.append(result.status if result else "NOT_VALIDATED")
-            mismatch_reasons.append("; ".join(reasons) if reasons else "")
-            matched_records.append("Yes" if is_valid else "")
-            paid_records.append("Yes" if is_valid and paid_value == PayrollConfig.csv_reconciliation_paid_yes else "")
-            unpaid_records.append("Yes" if is_valid and paid_value == PayrollConfig.csv_reconciliation_paid_no else "")
-            unmatched_records.append("Yes" if result and not is_valid else "")
-
-        df["Validation Status"] = validation_status
-        df["Mismatch Reasons"] = mismatch_reasons
-        df["Matched Record"] = matched_records
-        df["Paid Record"] = paid_records
-        df["Unpaid Record"] = unpaid_records
-        df["Unmatched Record"] = unmatched_records
+        df = df.reindex(columns=self._reconciliation_export_columns())
         review_file = BytesIO()
         df.to_csv(review_file, index=False)
         review_file.seek(0)
@@ -1945,7 +1895,7 @@ class CsvReconciliationService:
                 row.get(self.micro_catchment_column), context.get("micro_catchment")):
             reasons.append("micro_catchment_mismatch")
 
-        paid = self._clean_value(row.get(PayrollConfig.csv_reconciliation_paid_extra_field))
+        paid = self._clean_value(row.get(RECONCILIATION_PAID_COLUMN))
         if paid not in [PayrollConfig.csv_reconciliation_paid_yes, PayrollConfig.csv_reconciliation_paid_no]:
             reasons.append("invalid_paid_value")
         return benefit, reasons
@@ -2043,18 +1993,20 @@ class CsvReconciliationService:
             | set(LEGACY_KYC_PAYMENT_DETAILS_FIELD_MAPPING)
         )
         kyc_headers = set(KYC_PAYMENT_DETAILS_FIELD_MAPPING.values())
+        export_headers = set(self._reconciliation_export_columns())
         required_columns = {
             header
             for field, header in (PayrollConfig.csv_reconciliation_field_mapping or {}).items()
             if (
-                field not in kyc_fields
+                header in export_headers
+                and field not in kyc_fields
                 and header not in kyc_headers
                 and field.rsplit("__", 1)[-1].lower() != "receipt"
                 and header.strip().lower() not in {
                     item.lower() for item in self._payment_reference_headers()
                 }
             )
-        } | {PayrollConfig.csv_reconciliation_paid_extra_field}
+        } | {RECONCILIATION_PAID_COLUMN}
         missing_columns = required_columns - set(df.columns)
         if missing_columns:
             raise ValueError(
@@ -2062,13 +2014,15 @@ class CsvReconciliationService:
                     "columns": ", ".join(sorted(missing_columns)),
                 }
             )
-        if 'Status' in df.columns:
-            if (df[PayrollConfig.csv_reconciliation_status_column] == BenefitConsumptionStatus.RECONCILED).all():
+        if "Status" in df.columns:
+            if (df["Status"] == BenefitConsumptionStatus.RECONCILED).all():
                 raise ValueError(_("All of the Benefit Consumptions have been already reconciled."))
 
     def _fill_paid_column(self, row):
-        if (PayrollConfig.csv_reconciliation_status_column in row
-                and row[PayrollConfig.csv_reconciliation_status_column] == BenefitConsumptionStatus.RECONCILED):
+        if (
+            "Status" in row
+            and row["Status"] == BenefitConsumptionStatus.RECONCILED
+        ):
             return PayrollConfig.csv_reconciliation_paid_yes
         else:
             return None
@@ -2091,7 +2045,7 @@ class CsvReconciliationService:
             reconciliation_fields = (
                 set(field_mapping)
                 | set(field_mapping.values())
-                | {self._amount_to_pay_header()}
+                | set(self._reconciliation_export_columns())
             )
         extra_info = {
             k: row[k] for k in row.index

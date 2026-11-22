@@ -1,5 +1,7 @@
+import csv
 from datetime import date
 from decimal import Decimal
+from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -385,8 +387,38 @@ class WithdrawalFeePreparationTests(TestCase):
 
 
 class PaymentReferenceAccessTests(SimpleTestCase):
-    @patch("payroll.services.ReconciliationUploadRow.objects.filter", return_value=[])
-    def test_non_admin_review_download_redacts_reference_column(self, _rows):
+    def test_review_download_uses_fixed_export_schema(self):
+        service = CsvReconciliationService(None)
+        expected_columns = service._reconciliation_export_columns()
+        input_columns = [*expected_columns, "Date of Birth", "receipt", "Extra field"]
+        input_file = StringIO()
+        writer = csv.writer(input_file)
+        writer.writerow(input_columns)
+        input_values = ["value"] * len(expected_columns)
+        input_values[expected_columns.index("Paid")] = "Yes"
+        writer.writerow([*input_values, "1990-01-01", "ref-1", "extra"])
+
+        review = service.download_upload_review(
+            SimpleNamespace(),
+            input_file.getvalue().encode(),
+        )
+        output = list(csv.reader(StringIO(review.getvalue().decode())))
+
+        self.assertEqual(output[0], expected_columns)
+        self.assertEqual(output[1][expected_columns.index("Paid")], "Yes")
+        self.assertNotIn("Date of Birth", output[0])
+        self.assertNotIn("receipt", output[0])
+        self.assertNotIn("Extra field", output[0])
+        self.assertFalse({
+            "Validation Status",
+            "Mismatch Reasons",
+            "Matched Record",
+            "Paid Record",
+            "Unpaid Record",
+            "Unmatched Record",
+        } & set(output[0]))
+
+    def test_non_admin_review_download_redacts_reference_column(self):
         user = SimpleNamespace(
             is_authenticated=True,
             has_perms=lambda _perms: False,
@@ -399,8 +431,7 @@ class PaymentReferenceAccessTests(SimpleTestCase):
         self.assertNotIn(b"receipt", review.getvalue().lower())
         self.assertNotIn(b"provider-ref-1", review.getvalue())
 
-    @patch("payroll.services.ReconciliationUploadRow.objects.filter", return_value=[])
-    def test_admin_review_download_also_hides_reference_column(self, _rows):
+    def test_admin_review_download_also_hides_reference_column(self):
         user = SimpleNamespace(
             is_authenticated=True,
             has_perms=lambda _perms: True,

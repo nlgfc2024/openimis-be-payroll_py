@@ -46,7 +46,6 @@ DEFAULT_CONFIG = {
         "individual__first_name": "First Name",
         "individual__last_name": "Last Name",
         "individual__json_ext__national_id": "National ID",
-        "individual__dob": "Date of Birth",
         **KYC_PAYMENT_DETAILS_FIELD_MAPPING,
         "code": "Code",
         "status": "Status",

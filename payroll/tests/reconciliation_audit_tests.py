@@ -246,6 +246,8 @@ class ReconciliationAuditPolicyTests(TestCase):
         }
         payroll = SimpleNamespace(
             id="standard-id",
+            name="Standard payroll",
+            status=PayrollStatus.APPROVE_FOR_PAYMENT,
             payroll_type=Payroll.PayrollType.STANDARD,
         )
         benefit = SimpleNamespace(
@@ -261,6 +263,7 @@ class ReconciliationAuditPolicyTests(TestCase):
             "code": benefit.code,
             "amount": "10.00",
             "type": "CASH",
+            "status": BenefitConsumptionStatus.RECONCILED,
         }]
         benefits.select_related.return_value = [benefit]
         service = CsvReconciliationService(None)
@@ -292,10 +295,37 @@ class ReconciliationAuditPolicyTests(TestCase):
         amount_to_pay_header = service._amount_to_pay_header()
         self.assertIn("Code", exported.columns)
         self.assertNotIn("Receipt", exported.columns)
-        self.assertIn("Payment type", exported.columns)
+        self.assertNotIn("Payment type", exported.columns)
+        self.assertEqual(list(exported.columns), [
+            "Source Payroll",
+            "Payroll Name",
+            "Payroll Status",
+            "District Name",
+            "Micro Catchment",
+            "Form Number",
+            "Phone Number",
+            "First Name",
+            "Last Name",
+            "National ID",
+            "Gender",
+            "Account Number",
+            "Account Name",
+            "Bank",
+            "Code",
+            "Status",
+            "Amount",
+            fee_header,
+            amount_to_pay_header,
+            "Type",
+            "Paid",
+        ])
+        self.assertTrue(pd.isna(exported.loc[0, "Source Payroll"]))
+        self.assertEqual(exported.loc[0, "Payroll Name"], payroll.name)
+        self.assertEqual(exported.loc[0, "Payroll Status"], payroll.status)
         self.assertEqual(exported.loc[0, fee_header], 2.5)
         self.assertEqual(exported.loc[0, amount_to_pay_header], 12.5)
-        self.assertEqual(exported.loc[0, "Payment type"], "CASH")
+        self.assertEqual(exported.loc[0, "Type"], "CASH")
+        self.assertEqual(exported.loc[0, "Paid"], "Yes")
         build_fee_catalog.assert_called_once()
 
     def test_reconciliation_without_receipt_preserves_legacy_reference(self):
@@ -369,12 +399,21 @@ class ReconciliationAuditPolicyTests(TestCase):
         )
 
     def test_consolidated_export_uses_source_payroll_micro_catchment(self):
-        source_payroll = SimpleNamespace(id="source-id", name="Source payroll")
+        source_payroll = SimpleNamespace(
+            id="source-id",
+            name="Source payroll",
+        )
         consolidated_payroll = SimpleNamespace(
             id="consolidated-id",
+            name="Consolidated payroll",
+            status=PayrollStatus.APPROVE_FOR_PAYMENT,
             payroll_type=Payroll.PayrollType.CONSOLIDATED,
         )
-        benefit = SimpleNamespace(id="benefit-id", code="CODE-1", json_ext={})
+        benefit = SimpleNamespace(
+            id="benefit-id",
+            code="CODE-1",
+            json_ext={"extra_info": {"Dynamic field": "not exported"}},
+        )
         record = {
             key: "value" for key in PayrollConfig.csv_reconciliation_field_mapping
         }
@@ -401,16 +440,28 @@ class ReconciliationAuditPolicyTests(TestCase):
             ))
 
         self.assertEqual(exported.loc[0, "Micro Catchment"], "Source catchment")
+        self.assertEqual(exported.loc[0, "Source Payroll"], source_payroll.name)
+        self.assertEqual(exported.loc[0, "Payroll Name"], consolidated_payroll.name)
+        self.assertEqual(exported.loc[0, "Payroll Status"], consolidated_payroll.status)
         self.assertTrue({
             "Gender", "Account Number", "Account Name", "Bank",
         }.issubset(exported.columns))
+        self.assertNotIn("Date of Birth", exported.columns)
+        self.assertNotIn("Dynamic field", exported.columns)
+        self.assertEqual(len(exported.columns), 21)
 
     def test_standard_export_includes_approved_kyc_payment_details(self):
         payroll = SimpleNamespace(
             id="standard-id",
+            name="Standard payroll",
+            status=PayrollStatus.APPROVE_FOR_PAYMENT,
             payroll_type=Payroll.PayrollType.STANDARD,
         )
-        benefit = SimpleNamespace(id="benefit-id", code="CODE-1", json_ext={})
+        benefit = SimpleNamespace(
+            id="benefit-id",
+            code="CODE-1",
+            json_ext={"extra_info": {"Dynamic field": "not exported"}},
+        )
         record = {
             key: "value" for key in PayrollConfig.csv_reconciliation_field_mapping
         }
@@ -442,8 +493,14 @@ class ReconciliationAuditPolicyTests(TestCase):
         self.assertEqual(exported.loc[0, "Account Number"], "00123456")
         self.assertEqual(exported.loc[0, "Account Name"], "Jane Banda")
         self.assertEqual(exported.loc[0, "Bank"], "Mpamba")
+        self.assertTrue(pd.isna(exported.loc[0, "Source Payroll"]))
+        self.assertEqual(exported.loc[0, "Payroll Name"], payroll.name)
+        self.assertEqual(exported.loc[0, "Payroll Status"], payroll.status)
+        self.assertNotIn("Date of Birth", exported.columns)
+        self.assertNotIn("Dynamic field", exported.columns)
+        self.assertEqual(len(exported.columns), 21)
 
-    def test_reconciliation_export_preserves_configured_column_order(self):
+    def test_reconciliation_export_uses_fixed_columns_with_custom_mapping(self):
         original_mapping = PayrollConfig.csv_reconciliation_field_mapping
         PayrollConfig.csv_reconciliation_field_mapping = {
             "code": "Code",
@@ -455,6 +512,8 @@ class ReconciliationAuditPolicyTests(TestCase):
         }
         payroll = SimpleNamespace(
             id="standard-id",
+            name="Standard payroll",
+            status=PayrollStatus.APPROVE_FOR_PAYMENT,
             payroll_type=Payroll.PayrollType.STANDARD,
         )
         benefit = SimpleNamespace(id="benefit-id", code="CODE-1", json_ext={})
@@ -483,19 +542,11 @@ class ReconciliationAuditPolicyTests(TestCase):
         finally:
             PayrollConfig.csv_reconciliation_field_mapping = original_mapping
 
-        self.assertEqual(list(exported.columns), [
-            "Code",
-            "Account Number",
-            "Gender",
-            "Account Name",
-            "Bank",
-            "First Name",
-            service._withdrawal_fee_header(),
-            service._amount_to_pay_header(),
-            "Type",
-            "Micro Catchment",
-            "Paid",
-        ])
+        self.assertEqual(len(exported.columns), 21)
+        self.assertEqual(
+            list(exported.columns),
+            service._reconciliation_export_columns(),
+        )
 
     def test_source_cannot_download_reconciliation_file_during_consolidation(self):
         service = CsvReconciliationService(None)
@@ -594,10 +645,11 @@ class ReconciliationAuditPolicyTests(TestCase):
             file_name="payments.csv",
             save=MagicMock(),
         )
-        headers = list(PayrollConfig.csv_reconciliation_field_mapping.values()) + ["Paid"]
-        contents = ",".join(headers) + "\n" + ",".join(["value"] * len(headers))
-        file = BytesIO(contents.encode())
         user = SimpleNamespace(login_name="reconciliation-test-user")
+        headers = CsvReconciliationService(user)._reconciliation_export_columns()
+        values = ["Yes" if header == "Paid" else "value" for header in headers]
+        contents = ",".join(headers) + "\n" + ",".join(values)
+        file = BytesIO(contents.encode())
 
         with (
             patch("payroll.services.Payroll.objects.filter") as find_payroll,
