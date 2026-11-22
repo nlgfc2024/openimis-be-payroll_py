@@ -387,7 +387,7 @@ class WithdrawalFeePreparationTests(TestCase):
 
 
 class PaymentReferenceAccessTests(SimpleTestCase):
-    def test_review_download_uses_fixed_export_schema(self):
+    def test_review_download_uses_configured_export_schema_and_audit_columns(self):
         service = CsvReconciliationService(None)
         expected_columns = service._reconciliation_export_columns()
         input_columns = [*expected_columns, "Date of Birth", "receipt", "Extra field"]
@@ -404,19 +404,41 @@ class PaymentReferenceAccessTests(SimpleTestCase):
         )
         output = list(csv.reader(StringIO(review.getvalue().decode())))
 
-        self.assertEqual(output[0], expected_columns)
+        self.assertEqual(output[0], [*expected_columns, "Validation Status", "Mismatch Reasons"])
         self.assertEqual(output[1][expected_columns.index("Paid")], "Yes")
+        self.assertEqual(output[1][-2:], ["", ""])
         self.assertNotIn("Date of Birth", output[0])
         self.assertNotIn("receipt", output[0])
         self.assertNotIn("Extra field", output[0])
         self.assertFalse({
-            "Validation Status",
-            "Mismatch Reasons",
             "Matched Record",
             "Paid Record",
             "Unpaid Record",
             "Unmatched Record",
         } & set(output[0]))
+
+    def test_review_download_includes_persisted_row_validation_outcomes(self):
+        service = CsvReconciliationService(None)
+        expected_columns = service._reconciliation_export_columns()
+        input_file = StringIO()
+        writer = csv.writer(input_file)
+        writer.writerow(expected_columns)
+        writer.writerow(["value"] * len(expected_columns))
+
+        with patch("payroll.services.ReconciliationUploadRow.objects.filter") as rows:
+            rows.return_value.values_list.return_value = [
+                (2, "INVALID", ["amount_mismatch", "national_id_mismatch"]),
+            ]
+            review = service.download_upload_review(
+                SimpleNamespace(id="upload-id"),
+                input_file.getvalue().encode(),
+            )
+
+        output = list(csv.reader(StringIO(review.getvalue().decode())))
+        self.assertEqual(output[1][-2:], [
+            "INVALID",
+            "amount_mismatch, national_id_mismatch",
+        ])
 
     def test_non_admin_review_download_redacts_reference_column(self):
         user = SimpleNamespace(

@@ -83,12 +83,14 @@ This section details the configuration settings required for integrating with a 
 - **csv_reconciliation_micro_catchment_column**: CSV header containing the micro-catchment value. The default is `Micro Catchment`.
 - **enable_maker_checker_for_reconciliation_upload**: Controls the reconciliation approval workflow. The default is `true`, which creates a `payroll_reconciliation` task for a second user to approve. Set it to `false` only where a valid upload should be applied immediately. Changing this setting does not alter existing waiting uploads or their tasks; a later valid upload supersedes the waiting upload and fails its open task as usual.
 
-Payroll downloads use a fixed 21-column schema for standard and consolidated
-payrolls. `Source Payroll` is blank for standard payrolls and contains the
-originating payroll name for consolidated rows. Reviewed CSV downloads use the
-same schema; variable extra-info and review-audit columns are not included.
-The `Receipt` field is not part of the export schema and can be added to an
-upload when a payment reference is required.
+Payroll downloads use a fixed 21-column field set and order for standard and
+consolidated payrolls. The displayed column headings come from the
+reconciliation module configuration, so an exported CSV can always be uploaded
+back to the same instance. `Source Payroll` is blank for standard payrolls and
+contains the originating payroll name for consolidated rows. Reviewed CSV
+downloads add `Validation Status` and `Mismatch Reasons` per row; variable
+extra-info is not included. The `Receipt` field is not part of the export
+schema and can be added to an upload when a payment reference is required.
 
 ```text
 Source Payroll, Payroll Name, Payroll Status, District Name, Micro Catchment,
