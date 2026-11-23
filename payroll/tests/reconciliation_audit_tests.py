@@ -155,6 +155,31 @@ class ReconciliationAuditPolicyTests(TestCase):
         finally:
             PayrollConfig.csv_reconciliation_field_mapping = original_mapping
 
+    def test_code_mapping_is_retained_when_omitted_from_configuration(self):
+        original_mapping = PayrollConfig.csv_reconciliation_field_mapping
+        try:
+            PayrollConfig.csv_reconciliation_field_mapping = {"amount": "Amount"}
+
+            mapping = CsvReconciliationService._reconciliation_field_mapping()
+
+            self.assertEqual(mapping["code"], "Code")
+        finally:
+            PayrollConfig.csv_reconciliation_field_mapping = original_mapping
+
+    def test_configured_type_header_is_preserved(self):
+        original_mapping = PayrollConfig.csv_reconciliation_field_mapping
+        try:
+            PayrollConfig.csv_reconciliation_field_mapping = {
+                "code": "Code",
+                "type": "Payment type",
+            }
+
+            mapping = CsvReconciliationService._reconciliation_field_mapping()
+
+            self.assertEqual(mapping["type"], "Payment type")
+        finally:
+            PayrollConfig.csv_reconciliation_field_mapping = original_mapping
+
     def test_existing_kyc_mapping_reads_the_benefit_snapshot(self):
         original_mapping = PayrollConfig.csv_reconciliation_field_mapping
         try:
@@ -190,6 +215,124 @@ class ReconciliationAuditPolicyTests(TestCase):
             CsvReconciliationService(None)._validate_dataframe(dataframe)
         finally:
             PayrollConfig.csv_reconciliation_field_mapping = original_mapping
+
+    def test_receipt_is_optional_even_when_legacy_mapping_contains_it(self):
+        original_mapping = PayrollConfig.csv_reconciliation_field_mapping
+        try:
+            PayrollConfig.csv_reconciliation_field_mapping = {
+                "code": "Code",
+                "amount": "Amount",
+                "status": "Status",
+                "receipt": "Receipt",
+            }
+            dataframe = pd.DataFrame([{
+                "Code": "BENEFIT-1",
+                "Amount": "10.00",
+                "Status": BenefitConsumptionStatus.ACCEPTED,
+                "Paid": "Yes",
+            }])
+
+            CsvReconciliationService(None)._validate_dataframe(dataframe)
+        finally:
+            PayrollConfig.csv_reconciliation_field_mapping = original_mapping
+
+    def test_reconciliation_export_hides_receipt_but_keeps_code(self):
+        original_mapping = PayrollConfig.csv_reconciliation_field_mapping
+        PayrollConfig.csv_reconciliation_field_mapping = {
+            "code": "Code",
+            "amount": "Amount",
+            "receipt": "Receipt",
+            "type": "Payment type",
+        }
+        payroll = SimpleNamespace(
+            id="standard-id",
+            payroll_type=Payroll.PayrollType.STANDARD,
+        )
+        benefit = SimpleNamespace(
+            id="benefit-id",
+            code="CODE-1",
+            amount=Decimal("10.00"),
+            withdrawal_fee=None,
+            withdrawal_fee_prepared_at=None,
+            json_ext={},
+        )
+        benefits = MagicMock()
+        benefits.values.return_value = [{
+            "code": benefit.code,
+            "amount": "10.00",
+            "type": "CASH",
+        }]
+        benefits.select_related.return_value = [benefit]
+        service = CsvReconciliationService(None)
+
+        try:
+            with (
+                patch.object(service, "_resolve_payroll", return_value=payroll),
+                patch("payroll.services.ensure_payroll_is_not_consolidated_source"),
+                patch.object(service, "_get_benefit_consumption_qs", return_value=benefits),
+                patch.object(service, "_get_source_payrolls_by_benefit", return_value={}),
+                patch.object(service, "_get_payroll_micro_catchment", return_value=None),
+                patch.object(service, "_get_micro_catchment", return_value=None),
+                patch(
+                    "payroll.services.WithdrawalFeeConfigService.build_fee_preview_catalog",
+                    return_value={},
+                ) as build_fee_catalog,
+                patch(
+                    "payroll.services.WithdrawalFeeConfigService.preview_fee_for_benefit",
+                    return_value=(Decimal("2.50"), None),
+                ),
+            ):
+                exported = pd.read_csv(BytesIO(
+                    service.download_reconciliation("standard-id").getvalue()
+                ))
+        finally:
+            PayrollConfig.csv_reconciliation_field_mapping = original_mapping
+
+        fee_header = service._withdrawal_fee_header()
+        amount_to_pay_header = service._amount_to_pay_header()
+        self.assertIn("Code", exported.columns)
+        self.assertNotIn("Receipt", exported.columns)
+        self.assertIn("Payment type", exported.columns)
+        self.assertEqual(exported.loc[0, fee_header], 2.5)
+        self.assertEqual(exported.loc[0, amount_to_pay_header], 12.5)
+        self.assertEqual(exported.loc[0, "Payment type"], "CASH")
+        build_fee_catalog.assert_called_once()
+
+    def test_reconciliation_without_receipt_preserves_legacy_reference(self):
+        service = CsvReconciliationService(SimpleNamespace(login_name="tester"))
+        benefit = SimpleNamespace(
+            status=BenefitConsumptionStatus.ACCEPTED,
+            receipt="old-reference",
+            json_ext={},
+            withdrawal_fee=None,
+            save=MagicMock(),
+        )
+        with patch("payroll.services.Bill.objects.filter") as bill_filter:
+            bill_filter.return_value.first.return_value = None
+
+            service._reconcile_bc(pd.Series({"code": "BENEFIT-1"}), benefit, {"code"})
+
+        self.assertEqual(benefit.receipt, "old-reference")
+
+    def test_reconciliation_updates_receipt_when_supplied(self):
+        service = CsvReconciliationService(SimpleNamespace(login_name="tester"))
+        benefit = SimpleNamespace(
+            status=BenefitConsumptionStatus.ACCEPTED,
+            receipt="old-reference",
+            json_ext={},
+            withdrawal_fee=None,
+            save=MagicMock(),
+        )
+        with patch("payroll.services.Bill.objects.filter") as bill_filter:
+            bill_filter.return_value.first.return_value = None
+
+            service._reconcile_bc(
+                pd.Series({"code": "BENEFIT-1", "receipt": "new-reference"}),
+                benefit,
+                {"code", "receipt"},
+            )
+
+        self.assertEqual(benefit.receipt, "new-reference")
 
     def test_project_name_uses_source_payroll_not_consolidated_link(self):
         project = SimpleNamespace(id="project-id", name="Source project")
@@ -347,6 +490,9 @@ class ReconciliationAuditPolicyTests(TestCase):
             "Account Name",
             "Bank",
             "First Name",
+            service._withdrawal_fee_header(),
+            service._amount_to_pay_header(),
+            "Type",
             "Micro Catchment",
             "Paid",
         ])
@@ -509,8 +655,9 @@ class ReconciliationAuditPolicyTests(TestCase):
             file_name="payments.csv",
             save=MagicMock(),
         )
-        headers = list(PayrollConfig.csv_reconciliation_field_mapping.values()) + ["Paid"]
-        contents = ",".join(headers) + "\n" + ",".join(["value"] * len(headers))
+        headers = list(PayrollConfig.csv_reconciliation_field_mapping.values()) + ["Paid", "receipt"]
+        row_values = ["value"] * (len(headers) - 1) + ["provider-ref-1"]
+        contents = ",".join(headers) + "\n" + ",".join(row_values)
         file = BytesIO(contents.encode())
         user = SimpleNamespace(login_name="reconciliation-test-user")
 
@@ -518,8 +665,8 @@ class ReconciliationAuditPolicyTests(TestCase):
             patch("payroll.services.Payroll.objects.filter") as find_payroll,
             patch("payroll.services.Payroll.objects.select_for_update") as lock_payroll,
             patch("payroll.services.CsvReconciliationUpload.objects.filter") as find_uploads,
-            patch("payroll.services.ReconciliationUploadRow"),
-            patch("payroll.services.bulk_create_with_history"),
+            patch("payroll.services.ReconciliationUploadRow") as upload_row_constructor,
+            patch("payroll.services.bulk_create_with_history") as bulk_create,
             patch("payroll.services.ensure_payroll_is_not_consolidated_source"),
             patch("payroll.services.TaskService") as task_service,
             patch.object(
@@ -552,6 +699,10 @@ class ReconciliationAuditPolicyTests(TestCase):
         self.assertEqual(summary["unmatched_records"], 1)
         self.assertEqual(upload.status, CsvReconciliationUpload.Status.FAIL)
         task_service.return_value.create.assert_not_called()
+        self.assertEqual(
+            upload_row_constructor.call_args.kwargs["submitted_data"]["receipt"],
+            "provider-ref-1",
+        )
 
     def test_consolidated_task_district_falls_back_to_source_beneficiary_locations(self):
         source_payrolls = [

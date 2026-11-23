@@ -68,7 +68,6 @@ if 'opensearch_reports' in apps.app_configs and not is_unit_test_env:
         code = opensearch_fields.KeywordField()
         date_due = opensearch_fields.DateField()
         date_created = opensearch_fields.DateField()
-        receipt = opensearch_fields.KeywordField()
         amount = opensearch_fields.KeywordField()
         type = opensearch_fields.KeywordField()
         status = opensearch_fields.KeywordField()
@@ -123,7 +122,6 @@ if 'opensearch_reports' in apps.app_configs and not is_unit_test_env:
             'code': opensearch_fields.KeywordField(),
             'status': opensearch_fields.KeywordField(),
             'type': opensearch_fields.KeywordField(),
-            'receipt': opensearch_fields.KeywordField(),
             'amount': opensearch_fields.KeywordField(),
             'photo': opensearch_fields.KeywordField(),
             'date_due': opensearch_fields.DateField(),
@@ -179,7 +177,6 @@ if 'opensearch_reports' in apps.app_configs and not is_unit_test_env:
             'code': opensearch_fields.KeywordField(),
             'status': opensearch_fields.KeywordField(),
             'type': opensearch_fields.KeywordField(),
-            'receipt': opensearch_fields.KeywordField(),
             'amount': opensearch_fields.KeywordField(),
             'photo': opensearch_fields.KeywordField(),
             'date_due': opensearch_fields.DateField(),

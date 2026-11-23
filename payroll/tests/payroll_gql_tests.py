@@ -558,6 +558,9 @@ class PayrollGQLTestCase(openIMISGraphQLTestCase):
         )
         self.assertEqual(consolidated_link.user_created_id, self.user.id)
         self.assertEqual(consolidated_link.user_updated_id, self.user.id)
+        self.assertEqual(consolidated_link.benefit.withdrawal_fee, Decimal("0.00"))
+        self.assertIsNotNone(consolidated_link.benefit.withdrawal_fee_prepared_at)
+        self.assertTrue(consolidated_link.benefit.withdrawal_fee_error)
         task_service.return_value.create.assert_called_once()
 
         second_source = self._create_consolidation_source("Duplicate membership source")

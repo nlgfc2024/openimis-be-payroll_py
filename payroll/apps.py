@@ -38,6 +38,7 @@ DEFAULT_CONFIG = {
     "gql_payroll_search_perms": ["202001"],
     "gql_payroll_create_perms": ["202002"],
     "gql_payroll_delete_perms": ["202004"],
+    "gql_withdrawal_fee_manage_perms": ["202005"],
     "gql_csv_reconciliation_search_perms": ["206001"],
     "gql_csv_reconciliation_create_perms": ["206002"],
     "payroll_accept_event": "payroll.accept_payroll",
@@ -58,7 +59,6 @@ DEFAULT_CONFIG = {
         "status": "Status",
         "amount": "Amount",
         "type": "Type",
-        "receipt": "Receipt",
     },
     "csv_reconciliation_status_column": "Status",
     "csv_reconciliation_paid_extra_field": "Paid",
@@ -108,6 +108,7 @@ class PayrollConfig(AppConfig):
     gql_payroll_search_perms = None
     gql_payroll_create_perms = None
     gql_payroll_delete_perms = None
+    gql_withdrawal_fee_manage_perms = None
     gql_csv_reconciliation_search_perms = None
     gql_csv_reconciliation_create_perms = None
     payroll_accept_event = None

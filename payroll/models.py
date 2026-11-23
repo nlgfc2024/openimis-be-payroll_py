@@ -33,6 +33,67 @@ class PaymentPoint(HistoryModel):
     ppm = models.ForeignKey(User, models.DO_NOTHING, blank=True, null=True)
 
 
+class PaymentProvider(HistoryModel):
+    class ProviderType(models.TextChoices):
+        BANK = "BANK", _("Bank")
+        MOBILE_MONEY = "MOBILE_MONEY", _("Mobile money")
+        OTHER = "OTHER", _("Other")
+
+    code = models.CharField(max_length=64, unique=True)
+    name = models.CharField(max_length=255)
+    provider_type = models.CharField(
+        max_length=32,
+        choices=ProviderType.choices,
+        default=ProviderType.BANK,
+    )
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ("name",)
+
+
+class WithdrawalFeeBand(HistoryModel):
+    provider = models.ForeignKey(
+        PaymentProvider,
+        on_delete=models.DO_NOTHING,
+        related_name="withdrawal_fee_bands",
+    )
+    minimum_amount = models.DecimalField(max_digits=18, decimal_places=2)
+    maximum_amount = models.DecimalField(
+        max_digits=18, decimal_places=2, blank=True, null=True,
+    )
+    transfer_cost = models.DecimalField(max_digits=18, decimal_places=2)
+    effective_from = models.DateField()
+    effective_to = models.DateField(blank=True, null=True)
+
+    class Meta:
+        ordering = ("provider__name", "minimum_amount", "effective_from")
+        constraints = [
+            models.CheckConstraint(
+                check=models.Q(minimum_amount__gte=0),
+                name="payroll_fee_minimum_nonnegative",
+            ),
+            models.CheckConstraint(
+                check=models.Q(transfer_cost__gte=0),
+                name="payroll_fee_transfer_cost_nonnegative",
+            ),
+            models.CheckConstraint(
+                check=(
+                    models.Q(maximum_amount__isnull=True)
+                    | models.Q(maximum_amount__gte=models.F("minimum_amount"))
+                ),
+                name="payroll_fee_amount_range_valid",
+            ),
+            models.CheckConstraint(
+                check=(
+                    models.Q(effective_to__isnull=True)
+                    | models.Q(effective_to__gte=models.F("effective_from"))
+                ),
+                name="payroll_fee_effective_range_valid",
+            ),
+        ]
+
+
 class Payroll(HistoryBusinessModel):
     class PayrollType(models.TextChoices):
         STANDARD = "STANDARD", _("STANDARD")
@@ -75,6 +136,25 @@ class BenefitConsumption(HistoryBusinessModel):
     receipt = models.CharField(db_column='Receipt', max_length=255, null=True, blank=True)
     amount = models.DecimalField(db_column='Amount', max_digits=18, decimal_places=2, null=True)
     type = models.CharField(db_column='Type', max_length=255, null=True)
+    withdrawal_provider = models.ForeignKey(
+        PaymentProvider,
+        models.DO_NOTHING,
+        blank=True,
+        null=True,
+        related_name="prepared_benefits",
+    )
+    withdrawal_fee_band = models.ForeignKey(
+        WithdrawalFeeBand,
+        models.DO_NOTHING,
+        blank=True,
+        null=True,
+        related_name="prepared_benefits",
+    )
+    withdrawal_fee = models.DecimalField(
+        max_digits=18, decimal_places=2, blank=True, null=True,
+    )
+    withdrawal_fee_prepared_at = models.DateTimeField(blank=True, null=True)
+    withdrawal_fee_error = models.TextField(blank=True, null=True)
     status = models.CharField(
         max_length=100, choices=BenefitConsumptionStatus.choices, default=BenefitConsumptionStatus.ACCEPTED, null=False
     )
