@@ -583,6 +583,14 @@ class ReconciliationAuditPolicyTests(TestCase):
                 )
 
     def test_standard_upload_treats_national_id_mismatch_as_warning(self):
+        original_setting = PayrollConfig.enable_maker_checker_for_reconciliation_upload
+        PayrollConfig.enable_maker_checker_for_reconciliation_upload = True
+        self.addCleanup(
+            setattr,
+            PayrollConfig,
+            "enable_maker_checker_for_reconciliation_upload",
+            original_setting,
+        )
         payroll = SimpleNamespace(
             id="payroll-id",
             payroll_type=Payroll.PayrollType.STANDARD,
@@ -626,18 +634,6 @@ class ReconciliationAuditPolicyTests(TestCase):
             with (
                 patch.object(service, "_load_upload_context", return_value=({}, {})),
                 patch.object(
-                    service,
-                    "apply_upload",
-                    side_effect=lambda reconciliation_upload: (
-                        setattr(
-                            reconciliation_upload,
-                            "status",
-                            CsvReconciliationUpload.Status.SUCCESS,
-                        )
-                        or reconciliation_upload
-                    ),
-                ) as apply_upload,
-                patch.object(
                     service, "_validate_upload_row",
                     return_value=(None, ["national_id_mismatch"]),
                 ),
@@ -647,13 +643,12 @@ class ReconciliationAuditPolicyTests(TestCase):
 
         self.assertEqual(
             upload.status,
-            CsvReconciliationUpload.Status.SUCCESS,
+            CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION,
         )
         self.assertIsNone(errors)
         self.assertEqual(summary["unmatched_records"], 0)
         self.assertEqual(summary["matched_records"], 1)
-        apply_upload.assert_called_once_with(upload)
-        task_service.return_value.create.assert_not_called()
+        task_service.return_value.create.assert_called_once()
         upload_row_model.assert_called_once()
 
     def test_standard_upload_fails_as_a_batch_on_blocking_rows(self):
@@ -901,6 +896,62 @@ class ReconciliationPayrollStatusTests(TestCase):
             username='recon-status-user',
             password='PayrollTestPassword1!',
         )
+
+    def test_upload_applies_immediately_when_maker_checker_is_disabled(self):
+        original_setting = PayrollConfig.enable_maker_checker_for_reconciliation_upload
+        PayrollConfig.enable_maker_checker_for_reconciliation_upload = False
+        self.addCleanup(
+            setattr,
+            PayrollConfig,
+            "enable_maker_checker_for_reconciliation_upload",
+            original_setting,
+        )
+        individual = Individual(**service_add_individual_payload)
+        individual.save(username=self.user.login_name)
+        payroll = Payroll(
+            name="Immediate reconciliation test",
+            status=PayrollStatus.APPROVE_FOR_PAYMENT,
+        )
+        payroll.save(username=self.user.login_name)
+        benefit = BenefitConsumption(
+            individual=individual,
+            code="immediate-reconciliation-code",
+            date_due=date(2026, 1, 1),
+            amount=Decimal("100"),
+            type="Cash Transfer",
+            status=BenefitConsumptionStatus.ACCEPTED,
+        )
+        benefit.save(username=self.user.login_name)
+        PayrollBenefitConsumption(payroll=payroll, benefit=benefit).save(
+            username=self.user.login_name,
+        )
+        service = CsvReconciliationService(self.user)
+        exported = service.download_reconciliation(payroll.id)
+        exported.seek(0)
+        dataframe = pd.read_csv(exported, dtype=str, keep_default_na=False)
+        dataframe[PayrollConfig.csv_reconciliation_paid_extra_field] = (
+            PayrollConfig.csv_reconciliation_paid_yes
+        )
+        submitted = BytesIO()
+        dataframe.to_csv(submitted, index=False)
+        submitted.seek(0)
+        upload = CsvReconciliationUpload(file_name="immediate-reconciliation.csv")
+
+        _, errors, summary = service.upload_reconciliation(payroll.id, submitted, upload)
+
+        upload.refresh_from_db()
+        benefit.refresh_from_db()
+        payroll.refresh_from_db()
+        self.assertIsNone(errors)
+        self.assertEqual(summary["status"], CsvReconciliationUpload.Status.SUCCESS)
+        self.assertEqual(upload.status, CsvReconciliationUpload.Status.SUCCESS)
+        self.assertEqual(benefit.status, BenefitConsumptionStatus.RECONCILED)
+        self.assertEqual(payroll.status, PayrollStatus.RECONCILED)
+        self.assertFalse(Task.objects.filter(
+            entity_id=str(payroll.id),
+            business_event=PayrollConfig.payroll_reconciliation_event,
+            data__upload_id=str(upload.id),
+        ).exists())
 
     def test_standard_upload_rejects_all_rows_when_any_blocking_row_exists(self):
         individual = Individual(**service_add_individual_payload)

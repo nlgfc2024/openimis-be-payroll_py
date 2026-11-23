@@ -1404,7 +1404,7 @@ class CsvReconciliationService:
 
     @transaction.atomic
     def upload_reconciliation(self, payroll_id, file, upload):
-        """Validate, audit, and immediately apply a reconciliation upload."""
+        """Validate and audit a reconciliation upload before review or application."""
         payroll = self._resolve_payroll(payroll_id)
         # Serialise uploads for a payroll.  This makes superseding a pending
         # review deterministic even when corrected files arrive concurrently.
@@ -1569,13 +1569,35 @@ class CsvReconciliationService:
         upload.status = CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION
         upload.json_ext = {"extra_info": self._upload_summary(upload)}
         upload.save(username=self.user.login_name)
-        applied_upload = self.apply_upload(upload)
-        # The caller retains this instance and saves it after this method;
-        # mirror the locked instance updated by apply_upload to avoid restoring
-        # the transient verification status.
-        upload.status = applied_upload.status
-        upload.error = applied_upload.error
-        upload.json_ext = applied_upload.json_ext
+        if not PayrollConfig.enable_maker_checker_for_reconciliation_upload:
+            applied_upload = self.apply_upload(upload)
+            # The caller retains this instance and saves it after this method;
+            # mirror the locked instance updated by apply_upload to avoid restoring
+            # the transient verification status.
+            upload.status = applied_upload.status
+            upload.error = applied_upload.error
+            upload.json_ext = applied_upload.json_ext
+            return BytesIO(contents), errors or None, self._upload_summary(upload)
+
+        task_context = self._reconciliation_task_context(payroll)
+        task = TaskService(self.user).create({
+            "source": "payroll_reconciliation", "entity": payroll,
+            "status": Task.Status.RECEIVED,
+            "executor_action_event": TasksManagementConfig.default_executor_event,
+            "business_event": PayrollConfig.payroll_reconciliation_event,
+            "data": _get_std_task_data_payload({
+                "id": payroll.id,
+                "upload_id": upload.id,
+                "payroll_name": payroll.name,
+                "included_payrolls": task_context["included_payrolls"],
+                "consolidated": task_context["consolidated"],
+                "district": task_context["district"],
+                "phase": task_context["phase"],
+                "summary": self._upload_summary(upload),
+            }),
+        })
+        if not task.get("success", False):
+            raise ValueError(task.get("error") or "Unable to create reconciliation review task")
         return BytesIO(contents), errors or None, self._upload_summary(upload)
 
     @staticmethod

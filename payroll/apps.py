@@ -71,6 +71,9 @@ DEFAULT_CONFIG = {
     "csv_reconciliation_warning_mismatch_reasons": [],
     "csv_reconciliation_amount_tolerance": "0",
     "csv_reconciliation_micro_catchment_column": "Micro Catchment",
+    # Keep the existing two-person reconciliation review as the safe default.
+    # Deployments that do not require it may set this to False.
+    "enable_maker_checker_for_reconciliation_upload": True,
     "payroll_delete_event": "payroll.payroll_delete",
     "benefit_delete_event": "payroll.benefit_delete",
 
@@ -116,6 +119,7 @@ class PayrollConfig(AppConfig):
     csv_reconciliation_warning_mismatch_reasons = None
     csv_reconciliation_amount_tolerance = None
     csv_reconciliation_micro_catchment_column = None
+    enable_maker_checker_for_reconciliation_upload = None
     payroll_delete_event = None
     benefit_delete_event = None
 
