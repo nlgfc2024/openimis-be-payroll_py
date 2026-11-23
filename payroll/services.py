@@ -1573,11 +1573,9 @@ class CsvReconciliationService:
             inplace=True,
         )
         code_column = PayrollConfig.csv_reconciliation_code_column
-        national_id_column = next(
-            (field for field, header in field_mapping.items()
-             if header == "National ID"),
-            None,
-        )
+        # Columns are renamed to their field keys above, so this must not rely
+        # on the default display heading (which deployments may customize).
+        national_id_column = "individual__json_ext__national_id"
         codes = df[code_column].map(self._clean_value)
         national_ids = (
             df[national_id_column].map(self._clean_value)
@@ -2170,6 +2168,11 @@ class CsvReconciliationService:
             for field in validation_fields
             if field in field_mapping
         } | {self._paid_column()}
+        # A configured micro-catchment heading is part of the exported schema
+        # and must be present on upload; otherwise its row validation would be
+        # skipped silently.
+        if PayrollConfig.csv_reconciliation_micro_catchment_column:
+            required_columns.add(self._micro_catchment_column())
         missing_columns = required_columns - set(df.columns)
         if missing_columns:
             raise ValueError(
