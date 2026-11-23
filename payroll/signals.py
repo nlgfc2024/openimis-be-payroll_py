@@ -23,6 +23,32 @@ logger = logging.getLogger(__name__)
 imis_modules = openimis_apps()
 
 
+def _authorize_payroll_task_completion(**kwargs):
+    """Validate live Payroll ownership before TaskService changes task state."""
+    service = kwargs.get("cls_")
+    signal_data = kwargs.get("data") or []
+    positional = signal_data[0] if signal_data else ()
+    obj_data = positional[0] if positional else None
+    if not isinstance(obj_data, dict) or not obj_data.get("id"):
+        return
+
+    task = Task.objects.filter(id=obj_data["id"]).first()
+    if task is None:
+        return
+    user = getattr(service, "user", None)
+    payroll_events = {
+        PayrollConfig.payroll_accept_event,
+        PayrollConfig.payroll_reconciliation_event,
+        PayrollConfig.payroll_reject_event,
+        PayrollConfig.payroll_delete_event,
+    }
+    if task.business_event in payroll_events:
+        get_authorized_payroll(user, task.entity_id)
+    elif task.business_event == PayrollConfig.benefit_delete_event:
+        benefit = BenefitConsumption.objects.get(id=task.entity_id)
+        require_benefit_access(user, benefit)
+
+
 def _mark_completed_task_failed(task, user):
     if not task or not user or task.get("status") != Task.Status.COMPLETED:
         return
@@ -42,6 +68,12 @@ def _mark_completed_task_failed(task, user):
 
 
 def bind_service_signals():
+    bind_service_signal(
+        'task_service.complete_task',
+        _authorize_payroll_task_completion,
+        bind_type=ServiceSignalBindType.BEFORE,
+    )
+
     def on_task_complete_accept_payroll(**kwargs):
         def accept_payroll(payroll, strategy, user):
             if strategy:

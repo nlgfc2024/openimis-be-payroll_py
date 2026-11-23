@@ -75,7 +75,9 @@ class StrategyOfPaymentInterface(object, metaclass=abc.ABCMeta):
         if payroll.payroll_type == Payroll.PayrollType.CONSOLIDATED:
             from payroll.services import CsvReconciliationService
 
-            task_data.update(CsvReconciliationService._reconciliation_task_context(payroll))
+            task_data.update(
+                CsvReconciliationService(user)._reconciliation_task_context(payroll)
+            )
         PayrollService(user).create_accept_payroll_task(payroll.id, task_data)
 
     @classmethod

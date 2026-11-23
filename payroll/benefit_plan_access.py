@@ -5,24 +5,41 @@ using a social-protection release from before the service was introduced.
 """
 from django.apps import apps
 from django.contrib.contenttypes.models import ContentType
-from django.core.exceptions import PermissionDenied
-from django.db.models import Q
-
-try:
-    from social_protection.benefit_plan_access import (
-        get_accessible_benefit_plan_ids,
-        require_benefit_plan_access,
-    )
-except ImportError:  # pragma: no cover - compatibility with older module releases
-    def get_accessible_benefit_plan_ids(user):
-        return None
-
-    def require_benefit_plan_access(user, benefit_plan_id, include_deleted=False):
-        return None
+from django.core.exceptions import ImproperlyConfigured, PermissionDenied
+from django.db.models import Exists, OuterRef, Q
 
 
 def _user(user_or_info):
     return getattr(getattr(user_or_info, "context", None), "user", user_or_info)
+
+
+def _configured_benefit_plan_access_control_enabled():
+    if not apps.is_installed("social_protection"):
+        return False
+    app_config = apps.get_app_config("social_protection")
+    return bool(
+        getattr(app_config, "enable_benefit_plan_access_control", False)
+    )
+
+
+def _shared_benefit_plan_access_helpers():
+    try:
+        from social_protection.benefit_plan_access import (
+            benefit_plan_access_control_enabled,
+            get_accessible_benefit_plan_ids,
+            require_benefit_plan_access,
+        )
+    except ImportError as exc:
+        if _configured_benefit_plan_access_control_enabled():
+            raise ImproperlyConfigured(
+                "Benefit Plan access control is enabled, but the shared Social "
+                "Protection authorization service is unavailable."
+            ) from exc
+        return None, None
+    # Resolve feature state through the shared service. This keeps Payroll from
+    # growing a second authorization-policy implementation.
+    benefit_plan_access_control_enabled()
+    return get_accessible_benefit_plan_ids, require_benefit_plan_access
 
 
 def _benefit_plan_content_type():
@@ -31,10 +48,24 @@ def _benefit_plan_content_type():
 
 
 def _accessible_ids(user):
+    get_accessible_benefit_plan_ids, _ = _shared_benefit_plan_access_helpers()
+    if get_accessible_benefit_plan_ids is None:
+        return None
     ids = get_accessible_benefit_plan_ids(_user(user))
     if ids is None:
         return None
     return [str(value) for value in ids]
+
+
+def require_benefit_plan_access(user, benefit_plan_id, include_deleted=False):
+    _, require_access = _shared_benefit_plan_access_helpers()
+    if require_access is None:
+        return
+    return require_access(
+        _user(user),
+        benefit_plan_id,
+        include_deleted=include_deleted,
+    )
 
 
 def filter_payroll_queryset(queryset, user, payroll_prefix=""):
@@ -52,9 +83,12 @@ def filter_payroll_queryset(queryset, user, payroll_prefix=""):
 
 
 def require_payment_plan_access(user, payment_plan):
-    if not payment_plan or payment_plan.benefit_plan_type_id != _benefit_plan_content_type().id:
+    _, require_access = _shared_benefit_plan_access_helpers()
+    if require_access is None or not payment_plan:
         return
-    require_benefit_plan_access(_user(user), str(payment_plan.benefit_plan_id))
+    if payment_plan.benefit_plan_type_id != _benefit_plan_content_type().id:
+        return
+    require_access(_user(user), str(payment_plan.benefit_plan_id))
 
 
 def require_payroll_access(user, payroll):
@@ -78,10 +112,17 @@ def filter_benefit_queryset(queryset, user, benefit_prefix=""):
     ids = _accessible_ids(user)
     if ids is None:
         return queryset
-    prefix = f"{benefit_prefix}__" if benefit_prefix else ""
-    return filter_payroll_queryset(
-        queryset, user, f"{prefix}payrollbenefitconsumption__payroll"
-    ).filter(**{f"{prefix}payrollbenefitconsumption__is_deleted": False}).distinct()
+    content_type = _benefit_plan_content_type()
+    payroll_benefit = apps.get_model("payroll", "PayrollBenefitConsumption")
+    outer_benefit_id = f"{benefit_prefix}_id" if benefit_prefix else "pk"
+    authorized_membership = payroll_benefit.objects.filter(
+        Q(benefit_id=OuterRef(outer_benefit_id), is_deleted=False)
+        & (
+            ~Q(payroll__payment_plan__benefit_plan_type_id=content_type.id)
+            | Q(payroll__payment_plan__benefit_plan_id__in=ids)
+        )
+    )
+    return queryset.filter(Exists(authorized_membership))
 
 
 def require_benefit_access(user, benefit):

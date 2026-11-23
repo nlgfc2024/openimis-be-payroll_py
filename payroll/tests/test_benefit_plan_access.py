@@ -1,11 +1,12 @@
+import sys
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 from graphene import Schema
 from graphene.test import Client
 from django.contrib.contenttypes.models import ContentType
-from django.core.exceptions import PermissionDenied
+from django.core.exceptions import ImproperlyConfigured, PermissionDenied
 from django.test import TestCase, override_settings
 
 from contribution_plan.models import PaymentPlan
@@ -13,7 +14,14 @@ from core.test_helpers import create_test_technical_user
 from individual.models import Individual
 from individual.tests.data import service_add_individual_payload
 from invoice.models import Bill
-from payroll.benefit_plan_access import filter_payroll_queryset, get_authorized_payroll
+from payroll.benefit_plan_access import (
+    _shared_benefit_plan_access_helpers,
+    filter_benefit_queryset,
+    filter_payroll_queryset,
+    get_authorized_payroll,
+    require_payment_plan_access,
+)
+from payroll.apps import PayrollConfig
 from payroll.gql_queries import (
     BenefitAttachmentGQLType,
     BenefitConsumptionGQLType,
@@ -32,6 +40,8 @@ from payroll.schema import Query
 from payroll.services import CsvReconciliationService, PayrollService
 from social_protection.apps import SocialProtectionConfig
 from social_protection.models import BenefitPlan, UserBenefitPlanAccess
+from tasks_management.models import Task, TaskExecutor, TaskGroup
+from tasks_management.services import TaskService
 
 
 @override_settings(ROW_SECURITY=False)
@@ -116,6 +126,27 @@ class PayrollBenefitPlanAccessTest(TestCase):
             user or self.user,
         ).values_list("id", flat=True))
 
+    def approval_task(self, entity, event, benefit_plan_id):
+        group = TaskGroup(
+            code=f"T07-{str(uuid4())[:8]}",
+            completion_policy=TaskGroup.TaskGroupCompletionPolicy.ALL,
+        )
+        group.save(user=self.user)
+        TaskExecutor(user=self.user, task_group=group).save(user=self.user)
+        task = Task(
+            source="track07-before-signal-test",
+            entity=entity,
+            benefit_plan_id=str(benefit_plan_id),
+            benefit_plan_is_shared=False,
+            status=Task.Status.ACCEPTED,
+            task_group=group,
+            business_event=event,
+            business_status={},
+            data={},
+        )
+        task.save(user=self.user)
+        return task
+
     def test_upg_only_and_rmep_only_access(self):
         self.assign(self.upg)
         self.assertEqual(self.visible_payrolls(), {self.upg_payroll.id})
@@ -153,6 +184,55 @@ class PayrollBenefitPlanAccessTest(TestCase):
         self.assertEqual(
             self.visible_payrolls(), {self.upg_payroll.id, self.rmep_payroll.id}
         )
+
+    def test_deleted_authorized_link_cannot_expose_active_unauthorized_benefit(self):
+        self.assign(self.upg)
+        upg_link = PayrollBenefitConsumption.objects.get(
+            payroll=self.upg_payroll,
+            benefit=self.upg_benefit,
+            is_deleted=False,
+        )
+        upg_link.delete(user=self.user)
+        PayrollBenefitConsumption(
+            payroll=self.rmep_payroll,
+            benefit=self.upg_benefit,
+        ).save(user=self.user)
+
+        visible = filter_benefit_queryset(
+            BenefitConsumption.objects.filter(id=self.upg_benefit.id),
+            self.user,
+        )
+
+        self.assertFalse(visible.exists())
+
+    def test_enabled_mode_fails_closed_without_shared_authorization_helpers(self):
+        with patch.dict(
+            sys.modules,
+            {"social_protection.benefit_plan_access": None},
+        ):
+            with self.assertRaises(ImproperlyConfigured):
+                _shared_benefit_plan_access_helpers()
+
+            SocialProtectionConfig.enable_benefit_plan_access_control = False
+            self.assertEqual(
+                _shared_benefit_plan_access_helpers(),
+                (None, None),
+            )
+            with patch(
+                "payroll.benefit_plan_access.apps.is_installed",
+                return_value=False,
+            ):
+                require_payment_plan_access(
+                    self.user,
+                    self.upg_payment_plan,
+                )
+
+        queryset = Payroll.objects.all()
+        with patch(
+            "payroll.benefit_plan_access._shared_benefit_plan_access_helpers",
+            return_value=(None, None),
+        ):
+            self.assertIs(filter_payroll_queryset(queryset, self.user), queryset)
 
     def test_all_plan_permission_and_superuser_are_unrestricted(self):
         with patch.object(self.user, "has_perms", return_value=True):
@@ -193,6 +273,112 @@ class PayrollBenefitPlanAccessTest(TestCase):
             CsvReconciliationService(self.user).download_upload_review(
                 self.rmep_upload, b"code\n"
             )
+
+    def test_before_signal_denies_payroll_approval_without_state_changes(self):
+        self.assign(self.upg)
+        task = self.approval_task(
+            self.rmep_payroll,
+            PayrollConfig.payroll_accept_event,
+            self.upg.id,
+        )
+        task_status = task.status
+        payroll_status = self.rmep_payroll.status
+        task_history_count = Task.history.filter(id=task.id).count()
+        payroll_history_count = Payroll.history.filter(
+            id=self.rmep_payroll.id,
+        ).count()
+
+        with self.assertRaises(PermissionDenied):
+            TaskService(self.user).complete_task({"id": task.id})
+
+        task.refresh_from_db()
+        self.rmep_payroll.refresh_from_db()
+        self.assertEqual(task.status, task_status)
+        self.assertEqual(self.rmep_payroll.status, payroll_status)
+        self.assertEqual(
+            Task.history.filter(id=task.id).count(),
+            task_history_count,
+        )
+        self.assertEqual(
+            Payroll.history.filter(id=self.rmep_payroll.id).count(),
+            payroll_history_count,
+        )
+
+    def test_before_signal_allows_authorized_payroll_approval(self):
+        self.assign(self.upg)
+        task = self.approval_task(
+            self.upg_payroll,
+            PayrollConfig.payroll_accept_event,
+            self.upg.id,
+        )
+        strategy = SimpleNamespace(accept_payroll=MagicMock())
+
+        with patch(
+            "payroll.signals.PaymentMethodStorage.get_chosen_payment_method",
+            return_value=strategy,
+        ):
+            result = TaskService(self.user).complete_task({"id": task.id})
+
+        self.assertTrue(result["success"], result)
+        task.refresh_from_db()
+        self.assertEqual(task.status, Task.Status.COMPLETED)
+        strategy.accept_payroll.assert_called_once_with(
+            self.upg_payroll,
+            self.user,
+        )
+
+    def test_before_signal_protects_benefit_deletion(self):
+        self.assign(self.upg)
+        task = self.approval_task(
+            self.rmep_benefit,
+            PayrollConfig.benefit_delete_event,
+            self.upg.id,
+        )
+        task_status = task.status
+        benefit_status = self.rmep_benefit.status
+        task_history_count = Task.history.filter(id=task.id).count()
+        benefit_history_count = BenefitConsumption.history.filter(
+            id=self.rmep_benefit.id,
+        ).count()
+
+        with self.assertRaises(PermissionDenied):
+            TaskService(self.user).complete_task({"id": task.id})
+
+        task.refresh_from_db()
+        self.rmep_benefit.refresh_from_db()
+        self.assertEqual(task.status, task_status)
+        self.assertEqual(self.rmep_benefit.status, benefit_status)
+        self.assertEqual(
+            Task.history.filter(id=task.id).count(),
+            task_history_count,
+        )
+        self.assertEqual(
+            BenefitConsumption.history.filter(id=self.rmep_benefit.id).count(),
+            benefit_history_count,
+        )
+
+    def test_before_signal_preserves_feature_off_completion(self):
+        SocialProtectionConfig.enable_benefit_plan_access_control = False
+        task = self.approval_task(
+            self.rmep_payroll,
+            PayrollConfig.payroll_accept_event,
+            self.upg.id,
+        )
+        strategy = SimpleNamespace(accept_payroll=MagicMock())
+
+        with patch(
+            "payroll.signals.PaymentMethodStorage.get_chosen_payment_method",
+            return_value=strategy,
+        ):
+            result = TaskService(self.user).complete_task({"id": task.id})
+
+        self.assertTrue(result["success"], result)
+        task.refresh_from_db()
+        self.assertEqual(task.status, Task.Status.COMPLETED)
+        strategy.accept_payroll.assert_called_once_with(
+            self.rmep_payroll,
+            self.user,
+        )
 
     def test_feature_disabled_preserves_existing_behaviour(self):
         SocialProtectionConfig.enable_benefit_plan_access_control = False
