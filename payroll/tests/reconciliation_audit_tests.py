@@ -342,6 +342,7 @@ class ReconciliationAuditPolicyTests(TestCase):
             configured_mapping = dict(DEFAULT_CONFIG["csv_reconciliation_field_mapping"])
             configured_mapping.update({
                 "individual__first_name": "Beneficiary first name",
+                "individual__json_ext__national_id": "Beneficiary national ID",
                 "amount": "Payout amount",
                 "type": "Payment type",
             })
@@ -355,10 +356,14 @@ class ReconciliationAuditPolicyTests(TestCase):
             dataframe = pd.DataFrame([{column: "value" for column in columns}])
 
             self.assertIn("Beneficiary first name", columns)
+            self.assertIn("Beneficiary national ID", columns)
             self.assertIn("Payout amount", columns)
             self.assertIn("Payment completed", columns)
             self.assertIn("Project catchment", columns)
             service._validate_dataframe(dataframe)
+
+            with self.assertRaisesRegex(ValueError, "Project catchment"):
+                service._validate_dataframe(dataframe.drop(columns=["Project catchment"]))
         finally:
             PayrollConfig.csv_reconciliation_field_mapping = original_mapping
             PayrollConfig.csv_reconciliation_status_column = original_status
@@ -750,7 +755,7 @@ class ReconciliationAuditPolicyTests(TestCase):
             file_name="payments.csv",
             save=MagicMock(),
         )
-        headers = list(PayrollConfig.csv_reconciliation_field_mapping.values()) + ["Paid", "receipt"]
+        headers = CsvReconciliationService(None)._reconciliation_export_columns() + ["receipt"]
         row_values = ["value"] * (len(headers) - 1) + ["provider-ref-1"]
         contents = ",".join(headers) + "\n" + ",".join(row_values)
         file = BytesIO(contents.encode())
