@@ -149,9 +149,11 @@ class ReconciliationAuditPolicyTests(TestCase):
             }
 
             mapping = CsvReconciliationService._reconciliation_field_mapping()
+            columns = CsvReconciliationService._reconciliation_export_columns()
 
             self.assertEqual(mapping["individual__json_ext__sex"], "Gender")
             self.assertEqual(list(mapping.values()).count("Gender"), 1)
+            self.assertEqual(columns.count("Gender"), 1)
         finally:
             PayrollConfig.csv_reconciliation_field_mapping = original_mapping
 
@@ -375,6 +377,54 @@ class ReconciliationAuditPolicyTests(TestCase):
 
         with self.assertRaisesRegex(ValueError, "Missing required columns"):
             CsvReconciliationService(None)._validate_dataframe(dataframe)
+
+    def test_review_download_preserves_uploaded_columns_and_audit_defaults(self):
+        upload = SimpleNamespace(id="upload-id")
+        contents = (
+            b"Code,Date of Birth,receipt,Custom field,Paid\n"
+            b"BENEFIT-1,1990-01-01,private-reference,shown,Yes\n"
+            b"BENEFIT-2,1991-01-01,other-reference,also shown,No\n"
+        )
+        rows = MagicMock()
+        rows.values_list.return_value = [
+            (2, ReconciliationUploadRow.Status.INVALID, ["amount_mismatch", "type_mismatch"]),
+        ]
+        service = CsvReconciliationService(None)
+
+        with patch("payroll.services.ReconciliationUploadRow.objects.filter", return_value=rows):
+            review = pd.read_csv(service.download_upload_review(upload, contents), dtype=str)
+
+        self.assertIn("Date of Birth", review.columns)
+        self.assertIn("Custom field", review.columns)
+        self.assertNotIn("receipt", review.columns)
+        self.assertEqual(review.loc[0, "Validation Status"], ReconciliationUploadRow.Status.INVALID)
+        self.assertEqual(review.loc[0, "Mismatch Reasons"], "amount_mismatch; type_mismatch")
+        self.assertEqual(review.loc[1, "Validation Status"], "NOT_VALIDATED")
+        self.assertTrue(pd.isna(review.loc[1, "Mismatch Reasons"]))
+
+    def test_reconciliation_does_not_store_review_columns_as_extra_info(self):
+        service = CsvReconciliationService(SimpleNamespace(login_name="tester"))
+        benefit = SimpleNamespace(
+            status=BenefitConsumptionStatus.ACCEPTED,
+            receipt=None,
+            json_ext={},
+            withdrawal_fee=None,
+            save=MagicMock(),
+        )
+        row = pd.Series({
+            "Validation Status": "INVALID",
+            "Mismatch Reasons": "amount_mismatch; type_mismatch",
+            "Field officer note": "Keep this",
+        })
+
+        with patch("payroll.services.Bill.objects.filter") as bill_filter:
+            bill_filter.return_value.first.return_value = None
+            service._reconcile_bc(row, benefit, set())
+
+        self.assertEqual(
+            benefit.json_ext["extra_info"],
+            {"Field officer note": "Keep this"},
+        )
 
     def test_reconciliation_without_receipt_preserves_legacy_reference(self):
         service = CsvReconciliationService(SimpleNamespace(login_name="tester"))
