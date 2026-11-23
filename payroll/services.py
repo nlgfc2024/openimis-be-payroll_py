@@ -82,6 +82,10 @@ RECONCILIATION_EXPORT_FIELD_MAPPING = {
     "type": "Type",
 }
 RECONCILIATION_PAID_COLUMN = "Paid"
+RECONCILIATION_REVIEW_COLUMNS = {
+    "Validation Status",
+    "Mismatch Reasons",
+}
 
 
 class WithdrawalFeeConfigService:
@@ -1330,36 +1334,51 @@ class CsvReconciliationService:
         """Map the fixed reconciliation fields to this instance's configured headers."""
         configured_mapping = cls._reconciliation_field_mapping()
         return {
-            field: configured_mapping.get(field, header)
+            field: configured_mapping[field]
             for field, header in RECONCILIATION_EXPORT_FIELD_MAPPING.items()
+            if field in configured_mapping
         }
 
     @classmethod
     def _reconciliation_export_columns(cls):
         field_mapping = cls._reconciliation_export_field_mapping()
-        return [
-            "Source Payroll",
-            field_mapping["payrollbenefitconsumption__payroll__name"],
-            field_mapping["payrollbenefitconsumption__payroll__status"],
-            field_mapping["individual__location__parent__parent__parent__name"],
-            cls._micro_catchment_column(),
-            field_mapping["individual__json_ext__form_number"],
-            field_mapping["individual__json_ext__household_mobile_number"],
-            field_mapping["individual__first_name"],
-            field_mapping["individual__last_name"],
-            field_mapping["individual__json_ext__national_id"],
-            field_mapping["json_ext__kyc_payment_details__gender"],
-            field_mapping["json_ext__kyc_payment_details__account_number"],
-            field_mapping["json_ext__kyc_payment_details__account_name"],
-            field_mapping["json_ext__kyc_payment_details__bank"],
-            field_mapping["code"],
-            cls._status_column(),
-            field_mapping["amount"],
-            cls._withdrawal_fee_header(),
-            cls._amount_to_pay_header(),
-            field_mapping["type"],
-            cls._paid_column(),
-        ]
+        columns = []
+
+        def add(header):
+            # A legacy mapping may intentionally use a default heading for a
+            # different field. Keep the first configured occurrence instead
+            # of emitting ambiguous duplicate CSV headers.
+            if header and header not in columns:
+                columns.append(header)
+
+        add("Source Payroll")
+        for field in (
+            "payrollbenefitconsumption__payroll__name",
+            "payrollbenefitconsumption__payroll__status",
+            "individual__location__parent__parent__parent__name",
+        ):
+            add(field_mapping.get(field))
+        add(cls._micro_catchment_column())
+        for field in (
+            "individual__json_ext__form_number",
+            "individual__json_ext__household_mobile_number",
+            "individual__first_name",
+            "individual__last_name",
+            "individual__json_ext__national_id",
+            "json_ext__kyc_payment_details__gender",
+            "json_ext__kyc_payment_details__account_number",
+            "json_ext__kyc_payment_details__account_name",
+            "json_ext__kyc_payment_details__bank",
+            "code",
+        ):
+            add(field_mapping.get(field))
+        add(cls._status_column())
+        add(field_mapping.get("amount"))
+        add(cls._withdrawal_fee_header())
+        add(cls._amount_to_pay_header())
+        add(field_mapping.get("type"))
+        add(cls._paid_column())
+        return columns
 
     @classmethod
     def _reconciliation_field_mapping(cls):
@@ -1383,7 +1402,9 @@ class CsvReconciliationService:
         # The exported file must always be accepted by the uploader.  Retain
         # custom headings, but add defaults for omitted reconciliation fields.
         for field, header in RECONCILIATION_EXPORT_FIELD_MAPPING.items():
-            mapped_fields.setdefault(field, header)
+            if field not in mapped_fields and header not in mapped_headers:
+                mapped_fields[field] = header
+                mapped_headers.add(header)
         mapped_fields["withdrawal_fee"] = cls._withdrawal_fee_header()
         if not mapped_fields.get("type"):
             mapped_fields["type"] = "Type"
@@ -1993,13 +2014,12 @@ class CsvReconciliationService:
                     is_deleted=False,
                 ).values_list("row_number", "status", "mismatch_reasons")
             }
-        df = df.reindex(columns=self._reconciliation_export_columns())
         df["Validation Status"] = [
-            audit_by_row.get(index + 2, ("", []))[0]
+            audit_by_row.get(index + 2, ("NOT_VALIDATED", []))[0]
             for index in df.index
         ]
         df["Mismatch Reasons"] = [
-            ", ".join(audit_by_row.get(index + 2, ("", []))[1] or [])
+            "; ".join(audit_by_row.get(index + 2, ("NOT_VALIDATED", []))[1] or [])
             for index in df.index
         ]
         review_file = BytesIO()
@@ -2168,10 +2188,12 @@ class CsvReconciliationService:
             for field in validation_fields
             if field in field_mapping
         } | {self._paid_column()}
-        # A configured micro-catchment heading is part of the exported schema
-        # and must be present on upload; otherwise its row validation would be
-        # skipped silently.
-        if PayrollConfig.csv_reconciliation_micro_catchment_column:
+        # Current exports always include this header. Legacy uploads predate
+        # the standardized layout, so require it only when the rest of that
+        # layout is present rather than rejecting old files outright.
+        standardized_columns = set(self._reconciliation_export_columns())
+        standardized_columns.discard(self._micro_catchment_column())
+        if standardized_columns.issubset(df.columns):
             required_columns.add(self._micro_catchment_column())
         missing_columns = required_columns - set(df.columns)
         if missing_columns:
@@ -2217,6 +2239,7 @@ class CsvReconciliationService:
         extra_info = {
             k: row[k] for k in row.index
             if k not in reconciliation_fields
+            and k not in RECONCILIATION_REVIEW_COLUMNS
             and k != self.micro_catchment_column
             and not pd.isna(row[k])
         }
