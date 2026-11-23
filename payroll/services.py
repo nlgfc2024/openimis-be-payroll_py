@@ -21,6 +21,7 @@ from core.signals import register_service_signal
 from invoice.models import Bill, BillItem, PaymentInvoice, DetailPaymentInvoice
 from location.models import Location, LocationManager
 from invoice.services import PaymentInvoiceService
+from individual.data_source import KYC_PAYMENT_DETAILS_FIELDS
 from payment_cycle.models import PaymentCycle
 from payroll.apps import (
     LEGACY_KYC_PAYMENT_DETAILS_FIELD_MAPPING,
@@ -985,11 +986,7 @@ class PayrollService(BaseService):
             payrollbenefitconsumption__is_deleted=False,
             is_deleted=False,
         ).select_related("individual")
-        snapshot_fields = {
-            field.rsplit("__", 1)[-1]
-            for field in KYC_PAYMENT_DETAILS_FIELD_MAPPING
-        }
-        snapshot_fields.add("payment_provider_code")
+        snapshot_fields = set(KYC_PAYMENT_DETAILS_FIELDS) | {"gender"}
         for benefit in benefits:
             benefit_json_ext = benefit.json_ext or {}
             if benefit_json_ext.get("kyc_payment_details") is not None:
