@@ -1404,12 +1404,7 @@ class CsvReconciliationService:
 
     @transaction.atomic
     def upload_reconciliation(self, payroll_id, file, upload):
-        """Validate and audit an upload without changing payment records.
-
-        Stage 2 will explicitly apply reviewed rows.  Keeping this operation
-        validation-only ensures a file can be inspected before finance data is
-        changed.
-        """
+        """Validate, audit, and immediately apply a reconciliation upload."""
         payroll = self._resolve_payroll(payroll_id)
         # Serialise uploads for a payroll.  This makes superseding a pending
         # review deterministic even when corrected files arrive concurrently.
@@ -1574,25 +1569,13 @@ class CsvReconciliationService:
         upload.status = CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION
         upload.json_ext = {"extra_info": self._upload_summary(upload)}
         upload.save(username=self.user.login_name)
-        task_context = self._reconciliation_task_context(payroll)
-        task = TaskService(self.user).create({
-            "source": "payroll_reconciliation", "entity": payroll,
-            "status": Task.Status.RECEIVED,
-            "executor_action_event": TasksManagementConfig.default_executor_event,
-            "business_event": PayrollConfig.payroll_reconciliation_event,
-            "data": _get_std_task_data_payload({
-                "id": payroll.id,
-                "upload_id": upload.id,
-                "payroll_name": payroll.name,
-                "included_payrolls": task_context["included_payrolls"],
-                "consolidated": task_context["consolidated"],
-                "district": task_context["district"],
-                "phase": task_context["phase"],
-                "summary": self._upload_summary(upload),
-            }),
-        })
-        if not task.get("success", False):
-            raise ValueError(task.get("error") or "Unable to create reconciliation review task")
+        applied_upload = self.apply_upload(upload)
+        # The caller retains this instance and saves it after this method;
+        # mirror the locked instance updated by apply_upload to avoid restoring
+        # the transient verification status.
+        upload.status = applied_upload.status
+        upload.error = applied_upload.error
+        upload.json_ext = applied_upload.json_ext
         return BytesIO(contents), errors or None, self._upload_summary(upload)
 
     @staticmethod
@@ -1839,6 +1822,7 @@ class CsvReconciliationService:
             payroll.status = PayrollStatus.RECONCILED
             payroll.save(username=self.user.login_name)
         reconcile_consolidated_sources(payroll, self.user)
+        return upload
 
     def download_upload_review(self, upload, contents):
         """Return the original CSV annotated with its saved validation result."""

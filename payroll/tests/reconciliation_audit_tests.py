@@ -626,6 +626,18 @@ class ReconciliationAuditPolicyTests(TestCase):
             with (
                 patch.object(service, "_load_upload_context", return_value=({}, {})),
                 patch.object(
+                    service,
+                    "apply_upload",
+                    side_effect=lambda reconciliation_upload: (
+                        setattr(
+                            reconciliation_upload,
+                            "status",
+                            CsvReconciliationUpload.Status.SUCCESS,
+                        )
+                        or reconciliation_upload
+                    ),
+                ) as apply_upload,
+                patch.object(
                     service, "_validate_upload_row",
                     return_value=(None, ["national_id_mismatch"]),
                 ),
@@ -635,12 +647,13 @@ class ReconciliationAuditPolicyTests(TestCase):
 
         self.assertEqual(
             upload.status,
-            CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION,
+            CsvReconciliationUpload.Status.SUCCESS,
         )
         self.assertIsNone(errors)
         self.assertEqual(summary["unmatched_records"], 0)
         self.assertEqual(summary["matched_records"], 1)
-        task_service.return_value.create.assert_called_once()
+        apply_upload.assert_called_once_with(upload)
+        task_service.return_value.create.assert_not_called()
         upload_row_model.assert_called_once()
 
     def test_standard_upload_fails_as_a_batch_on_blocking_rows(self):
