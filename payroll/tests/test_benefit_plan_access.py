@@ -1,4 +1,3 @@
-import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
@@ -6,20 +5,24 @@ from uuid import uuid4
 from graphene import Schema
 from graphene.test import Client
 from django.contrib.contenttypes.models import ContentType
-from django.core.exceptions import ImproperlyConfigured, PermissionDenied
+from django.core.exceptions import PermissionDenied
 from django.test import TestCase, override_settings
 
 from contribution_plan.models import PaymentPlan
-from core.test_helpers import create_test_technical_user
+from core.test_helpers import (
+    create_test_interactive_user,
+    create_test_role,
+    create_test_technical_user,
+)
 from individual.models import Individual
 from individual.tests.data import service_add_individual_payload
 from invoice.models import Bill
 from payroll.benefit_plan_access import (
-    _shared_benefit_plan_access_helpers,
     filter_benefit_queryset,
     filter_payroll_queryset,
     get_authorized_payroll,
     require_payment_plan_access,
+    task_ownership_for_payment_plan,
 )
 from payroll.apps import PayrollConfig
 from payroll.gql_queries import (
@@ -48,7 +51,11 @@ from tasks_management.services import TaskService
 class PayrollBenefitPlanAccessTest(TestCase):
     @classmethod
     def setUpTestData(cls):
-        cls.user = create_test_technical_user(username="track07-payroll-user")
+        role = create_test_role([], name="Track 07 payroll access test role")
+        cls.user = create_test_interactive_user(
+            username="track07-payroll-user",
+            roles=[role.id],
+        )
         cls.superuser = create_test_technical_user(
             username="track07-payroll-superuser", super_user=True,
         )
@@ -205,34 +212,18 @@ class PayrollBenefitPlanAccessTest(TestCase):
 
         self.assertFalse(visible.exists())
 
-    def test_enabled_mode_fails_closed_without_shared_authorization_helpers(self):
-        with patch.dict(
-            sys.modules,
-            {"social_protection.benefit_plan_access": None},
-        ):
-            with self.assertRaises(ImproperlyConfigured):
-                _shared_benefit_plan_access_helpers()
-
-            SocialProtectionConfig.enable_benefit_plan_access_control = False
-            self.assertEqual(
-                _shared_benefit_plan_access_helpers(),
-                (None, None),
-            )
-            with patch(
-                "payroll.benefit_plan_access.apps.is_installed",
-                return_value=False,
-            ):
-                require_payment_plan_access(
-                    self.user,
-                    self.upg_payment_plan,
-                )
-
+    def test_shared_authorization_failures_are_not_bypassed(self):
         queryset = Payroll.objects.all()
         with patch(
-            "payroll.benefit_plan_access._shared_benefit_plan_access_helpers",
-            return_value=(None, None),
-        ):
-            self.assertIs(filter_payroll_queryset(queryset, self.user), queryset)
+            "payroll.benefit_plan_access.get_accessible_benefit_plan_ids",
+            side_effect=PermissionDenied("denied"),
+        ), self.assertRaises(PermissionDenied):
+            filter_payroll_queryset(queryset, self.user)
+        with patch(
+            "payroll.benefit_plan_access.require_shared_benefit_plan_access",
+            side_effect=PermissionDenied("denied"),
+        ), self.assertRaises(PermissionDenied):
+            require_payment_plan_access(self.user, self.upg_payment_plan)
 
     def test_all_plan_permission_and_superuser_are_unrestricted(self):
         with patch.object(self.user, "has_perms", return_value=True):
@@ -243,6 +234,31 @@ class PayrollBenefitPlanAccessTest(TestCase):
             self.visible_payrolls(self.superuser),
             {self.upg_payroll.id, self.rmep_payroll.id},
         )
+
+    def test_task_ownership_preserves_plan_and_legacy_product_scope(self):
+        self.assertEqual(
+            task_ownership_for_payment_plan(self.upg_payment_plan),
+            {"benefit_plan_id": str(self.upg.id)},
+        )
+        legacy = SimpleNamespace(
+            benefit_plan_type_id=ContentType.objects.get_for_model(Individual).id,
+            benefit_plan_id=str(self.individual.id),
+        )
+        self.assertEqual(
+            task_ownership_for_payment_plan(legacy),
+            {"benefit_plan_is_shared": True},
+        )
+
+    def test_payroll_approval_producer_sets_explicit_task_ownership(self):
+        self.assign(self.upg)
+        result = PayrollService(self.user).create_accept_payroll_task(
+            self.upg_payroll.id,
+            {"phase": "test"},
+        )
+        self.assertTrue(result["success"], result)
+        task = Task.objects.get(id=result["data"]["id"])
+        self.assertEqual(task.benefit_plan_id, str(self.upg.id))
+        self.assertFalse(task.benefit_plan_is_shared)
 
     def test_direct_id_relay_service_and_reconciliation_are_denied(self):
         self.assign(self.upg)

@@ -177,10 +177,12 @@ class StrategyOnlinePayment(StrategyOfPaymentInterface):
         from tasks_management.services import TaskService
         from tasks_management.apps import TasksManagementConfig
         from tasks_management.models import Task
-        TaskService(user).create({
+        from payroll.benefit_plan_access import task_ownership_for_payroll
+        TaskService(user, trusted_internal=True).create({
             'source': 'payroll_reconciliation',
             'entity': payroll,
             'status': Task.Status.RECEIVED,
             'executor_action_event': TasksManagementConfig.default_executor_event,
             'business_event': PayrollConfig.payroll_reconciliation_event,
+            **task_ownership_for_payroll(payroll),
         })

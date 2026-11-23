@@ -52,6 +52,8 @@ from payroll.benefit_plan_access import (
     require_benefit_access,
     require_payment_plan_access,
     require_payroll_access,
+    task_ownership_for_benefit,
+    task_ownership_for_payroll,
 )
 from payroll.validation import PaymentPointValidation, PayrollValidation, BenefitConsumptionValidation
 from calculation.services import get_calculation_object
@@ -177,13 +179,14 @@ class PayrollService(BaseService):
         payroll_to_delete = get_authorized_payroll(self.user, obj_data['id'])
         ensure_payroll_is_not_consolidated_source(payroll_to_delete, "delete")
         data = {'id': payroll_to_delete.id}
-        TaskService(self.user).create({
+        TaskService(self.user, trusted_internal=True).create({
             'source': 'payroll_delete',
             'entity': payroll_to_delete,
             'status': Task.Status.RECEIVED,
             'executor_action_event': TasksManagementConfig.default_executor_event,
             'business_event': PayrollConfig.payroll_delete_event,
-            'data': _get_std_task_data_payload(data)
+            'data': _get_std_task_data_payload(data),
+            **task_ownership_for_payroll(payroll_to_delete),
         })
 
     @check_authentication
@@ -208,13 +211,14 @@ class PayrollService(BaseService):
     def create_accept_payroll_task(self, payroll_id, obj_data):
         payroll_to_accept = get_authorized_payroll(self.user, payroll_id)
         data = {**obj_data, 'id': payroll_id}
-        task = TaskService(self.user).create({
+        task = TaskService(self.user, trusted_internal=True).create({
             'source': 'payroll',
             'entity': payroll_to_accept,
             'status': Task.Status.RECEIVED,
             'executor_action_event': TasksManagementConfig.default_executor_event,
             'business_event': PayrollConfig.payroll_accept_event,
-            'data': _get_std_task_data_payload(data)
+            'data': _get_std_task_data_payload(data),
+            **task_ownership_for_payroll(payroll_to_accept),
         })
         if not task.get("success", False):
             raise ValueError(task.get("error") or "Unable to create payroll approval task")
@@ -417,13 +421,14 @@ class PayrollService(BaseService):
         payroll_to_close = get_authorized_payroll(self.user, obj_data['id'])
         ensure_payroll_is_not_consolidated_source(payroll_to_close, "reconcile")
         data = {'id': payroll_to_close.id}
-        TaskService(self.user).create({
+        TaskService(self.user, trusted_internal=True).create({
             'source': 'payroll_reconciliation',
             'entity': payroll_to_close,
             'status': Task.Status.RECEIVED,
             'executor_action_event': TasksManagementConfig.default_executor_event,
             'business_event': PayrollConfig.payroll_reconciliation_event,
-            'data': _get_std_task_data_payload(data)
+            'data': _get_std_task_data_payload(data),
+            **task_ownership_for_payroll(payroll_to_close),
         })
 
     @register_service_signal('payroll_service.reject_approve_payroll')
@@ -431,13 +436,14 @@ class PayrollService(BaseService):
         payroll_to_reject = get_authorized_payroll(self.user, obj_data['id'])
         ensure_payroll_is_not_consolidated_source(payroll_to_reject, "reject")
         data = {'id': payroll_to_reject.id}
-        TaskService(self.user).create({
+        TaskService(self.user, trusted_internal=True).create({
             'source': 'payroll_reject',
             'entity': payroll_to_reject,
             'status': Task.Status.RECEIVED,
             'executor_action_event': TasksManagementConfig.default_executor_event,
             'business_event': PayrollConfig.payroll_reject_event,
-            'data': _get_std_task_data_payload(data)
+            'data': _get_std_task_data_payload(data),
+            **task_ownership_for_payroll(payroll_to_reject),
         })
 
     def make_payment_for_payroll(self, obj_data):
@@ -771,13 +777,14 @@ class BenefitConsumptionService(BaseService):
         benefit_to_delete.status = BenefitConsumptionStatus.PENDING_DELETION
         benefit_to_delete.save(user=self.user)
         data = {'id': benefit_to_delete.id}
-        TaskService(self.user).create({
+        TaskService(self.user, trusted_internal=True).create({
             'source': 'benefit_delete',
             'entity': benefit_to_delete,
             'status': Task.Status.RECEIVED,
             'executor_action_event': TasksManagementConfig.default_executor_event,
             'business_event': PayrollConfig.benefit_delete_event,
-            'data': _get_std_task_data_payload(data)
+            'data': _get_std_task_data_payload(data),
+            **task_ownership_for_benefit(benefit_to_delete),
         })
 
     @check_authentication
@@ -1119,7 +1126,7 @@ class CsvReconciliationService:
         upload.json_ext = {"extra_info": self._upload_summary(upload)}
         upload.save(username=self.user.login_name)
         task_context = self._reconciliation_task_context(payroll)
-        task = TaskService(self.user).create({
+        task = TaskService(self.user, trusted_internal=True).create({
             "source": "payroll_reconciliation", "entity": payroll,
             "status": Task.Status.RECEIVED,
             "executor_action_event": TasksManagementConfig.default_executor_event,
@@ -1134,6 +1141,7 @@ class CsvReconciliationService:
                 "phase": task_context["phase"],
                 "summary": self._upload_summary(upload),
             }),
+            **task_ownership_for_payroll(payroll),
         })
         if not task.get("success", False):
             raise ValueError(task.get("error") or "Unable to create reconciliation review task")

@@ -1,45 +1,18 @@
-"""Benefit Plan authorization helpers for payroll-owned data.
-
-The shared service is optional so payroll remains compatible with installations
-using a social-protection release from before the service was introduced.
-"""
+"""Benefit Plan authorization helpers for payroll-owned data."""
 from django.apps import apps
 from django.contrib.contenttypes.models import ContentType
-from django.core.exceptions import ImproperlyConfigured, PermissionDenied
+from django.core.exceptions import PermissionDenied, ValidationError
 from django.db.models import Exists, OuterRef, Q
+from uuid import UUID
+
+from social_protection.benefit_plan_access import (
+    get_accessible_benefit_plan_ids,
+    require_benefit_plan_access as require_shared_benefit_plan_access,
+)
 
 
 def _user(user_or_info):
     return getattr(getattr(user_or_info, "context", None), "user", user_or_info)
-
-
-def _configured_benefit_plan_access_control_enabled():
-    if not apps.is_installed("social_protection"):
-        return False
-    app_config = apps.get_app_config("social_protection")
-    return bool(
-        getattr(app_config, "enable_benefit_plan_access_control", False)
-    )
-
-
-def _shared_benefit_plan_access_helpers():
-    try:
-        from social_protection.benefit_plan_access import (
-            benefit_plan_access_control_enabled,
-            get_accessible_benefit_plan_ids,
-            require_benefit_plan_access,
-        )
-    except ImportError as exc:
-        if _configured_benefit_plan_access_control_enabled():
-            raise ImproperlyConfigured(
-                "Benefit Plan access control is enabled, but the shared Social "
-                "Protection authorization service is unavailable."
-            ) from exc
-        return None, None
-    # Resolve feature state through the shared service. This keeps Payroll from
-    # growing a second authorization-policy implementation.
-    benefit_plan_access_control_enabled()
-    return get_accessible_benefit_plan_ids, require_benefit_plan_access
 
 
 def _benefit_plan_content_type():
@@ -48,9 +21,6 @@ def _benefit_plan_content_type():
 
 
 def _accessible_ids(user):
-    get_accessible_benefit_plan_ids, _ = _shared_benefit_plan_access_helpers()
-    if get_accessible_benefit_plan_ids is None:
-        return None
     ids = get_accessible_benefit_plan_ids(_user(user))
     if ids is None:
         return None
@@ -58,10 +28,7 @@ def _accessible_ids(user):
 
 
 def require_benefit_plan_access(user, benefit_plan_id, include_deleted=False):
-    _, require_access = _shared_benefit_plan_access_helpers()
-    if require_access is None:
-        return
-    return require_access(
+    return require_shared_benefit_plan_access(
         _user(user),
         benefit_plan_id,
         include_deleted=include_deleted,
@@ -83,12 +50,53 @@ def filter_payroll_queryset(queryset, user, payroll_prefix=""):
 
 
 def require_payment_plan_access(user, payment_plan):
-    _, require_access = _shared_benefit_plan_access_helpers()
-    if require_access is None or not payment_plan:
+    if not payment_plan:
         return
     if payment_plan.benefit_plan_type_id != _benefit_plan_content_type().id:
         return
-    require_access(_user(user), str(payment_plan.benefit_plan_id))
+    require_shared_benefit_plan_access(
+        _user(user), str(payment_plan.benefit_plan_id)
+    )
+
+
+def task_ownership_for_payment_plan(payment_plan):
+    """Return the explicit Task ownership for one Payment Plan."""
+    if payment_plan is None or payment_plan.benefit_plan_type_id is None:
+        raise ValidationError("Payroll Task ownership cannot be resolved.")
+    if payment_plan.benefit_plan_type_id != _benefit_plan_content_type().id:
+        return {"benefit_plan_is_shared": True}
+    try:
+        benefit_plan_id = str(UUID(str(payment_plan.benefit_plan_id)))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ValidationError("Payroll Task Benefit Plan ID is invalid.") from exc
+    return {"benefit_plan_id": benefit_plan_id}
+
+
+def task_ownership_for_payroll(payroll):
+    return task_ownership_for_payment_plan(payroll.payment_plan)
+
+
+def task_ownership_for_benefit(benefit):
+    links = benefit.payrollbenefitconsumption_set.filter(
+        is_deleted=False,
+    ).select_related("payroll__payment_plan__benefit_plan_type")
+    ownerships = [task_ownership_for_payroll(link.payroll) for link in links]
+    if not ownerships:
+        raise ValidationError("Benefit Task ownership cannot be resolved.")
+    plan_ids = {
+        ownership["benefit_plan_id"]
+        for ownership in ownerships
+        if ownership.get("benefit_plan_id")
+    }
+    has_shared = any(
+        ownership.get("benefit_plan_is_shared", False)
+        for ownership in ownerships
+    )
+    if len(plan_ids) == 1 and not has_shared:
+        return {"benefit_plan_id": plan_ids.pop()}
+    if not plan_ids and has_shared:
+        return {"benefit_plan_is_shared": True}
+    raise ValidationError("Benefit Task refers to multiple programme owners.")
 
 
 def require_payroll_access(user, payroll):
