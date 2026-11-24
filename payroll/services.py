@@ -1089,14 +1089,16 @@ class PayrollService(BaseService):
         if self._pays_group_benefits_to_primary_workers():
             primary_recipient_by_group = self._primary_worker_by_group(group_ids_by_beneficiary)
             if expected_workers is not None:
-                changed = sorted(
-                    str(beneficiary_id) for beneficiary_id, group_id in group_ids_by_beneficiary.items()
+                changed = {
+                    group_id for group_id in group_ids_by_beneficiary.values()
                     if primary_recipient_by_group.get(group_id) != expected_workers.get(group_id)
-                )
+                }
                 if changed:
+                    codes = apps.get_model("individual", "Group").objects.filter(
+                        id__in=changed).values_list("code", flat=True)
                     raise ValidationError(
                         "The primary worker of these households changed while the payroll was being "
-                        "calculated: %s. Create the payroll again." % ", ".join(changed)
+                        "calculated: %s. Create the payroll again." % ", ".join(sorted(map(str, codes)))
                     )
         else:
             group_individual_model = apps.get_model("individual", "GroupIndividual")

@@ -137,7 +137,7 @@ class GroupPayeeSelectionTest(TestCase):
         GroupIndividual.objects.filter(id=members[1].id).update(json_ext={})
         GroupIndividual.objects.filter(id=members[2].id).update(json_ext={"primary_worker": True})
         with self.assertRaisesMessage(
-                ValidationError, f"changed while the payroll was being calculated: {changed.id}."):
+                ValidationError, "changed while the payroll was being calculated: PRTP-O."):
             service._assign_group_benefits_to_primary_recipients(None, enrollments, expected)
 
     @patch.object(PayrollConfig, "group_benefit_payee", "PRIMARY_WORKER")
@@ -149,7 +149,7 @@ class GroupPayeeSelectionTest(TestCase):
         expected = service._lock_primary_workers(enrollments)
 
         GroupIndividual.objects.filter(id=members[2].id).update(json_ext={"primary_worker": True})
-        with self.assertRaisesMessage(ValidationError, "changed while the payroll was being calculated"):
+        with self.assertRaisesMessage(ValidationError, "changed while the payroll was being calculated: PRTP-P."):
             service._assign_group_benefits_to_primary_recipients(None, enrollments, expected)
 
     @unittest.skipUnless(HAS_PROJECT_TYPE, "needs Project.project_type from the project module")
