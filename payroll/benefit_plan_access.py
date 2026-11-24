@@ -116,7 +116,7 @@ def get_authorized_payroll(user, payroll_id, *, for_update=False):
 
     queryset = Payroll.objects.filter(id=payroll_id, is_deleted=False).select_related("payment_plan")
     if for_update:
-        queryset = queryset.select_for_update()
+        queryset = queryset.select_for_update(of=("self",))
     payroll = filter_payroll_queryset(queryset, user).first()
     if payroll is None:
         raise PermissionDenied("unauthorized")

@@ -1,13 +1,38 @@
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from django.test import SimpleTestCase
 
+from payroll.apps import PayrollConfig
 from payroll.gql_queries import BenefitConsumptionGQLType
+from payroll.models import BenefitConsumptionStatus
 from payroll.utils import get_micro_catchment_name
 
 
 class BeneficiaryDisplayResolverTests(SimpleTestCase):
+    def test_receipt_filter_remains_exposed(self):
+        self.assertIn("receipt", BenefitConsumptionGQLType._meta.filter_fields)
+
+    def test_unresolved_fee_error_is_filterable_and_survives_zero_snapshot(self):
+        benefit = SimpleNamespace(
+            withdrawal_fee=Decimal("0.00"),
+            withdrawal_fee_error="No effective fee band.",
+        )
+
+        self.assertIn(
+            "withdrawal_fee_error",
+            BenefitConsumptionGQLType._meta.filter_fields,
+        )
+        self.assertEqual(
+            BenefitConsumptionGQLType.resolve_withdrawal_fee(benefit, None),
+            Decimal("0.00"),
+        )
+        self.assertEqual(
+            BenefitConsumptionGQLType.resolve_withdrawal_fee_error(benefit, None),
+            "No effective fee band.",
+        )
+
     def test_kyc_resolvers_support_json_strings_and_legacy_aliases(self):
         benefit = SimpleNamespace(individual=SimpleNamespace(json_ext=(
             '{"sex":"Female","payment_account_number":"00012345",'
@@ -18,6 +43,96 @@ class BeneficiaryDisplayResolverTests(SimpleTestCase):
         self.assertEqual(BenefitConsumptionGQLType.resolve_account_number(benefit, None), "00012345")
         self.assertEqual(BenefitConsumptionGQLType.resolve_account_name(benefit, None), "Jane Banda")
         self.assertEqual(BenefitConsumptionGQLType.resolve_bank(benefit, None), "Mpamba")
+
+    def test_receipt_is_visible_to_payroll_users_without_fee_admin_right(self):
+        benefit = SimpleNamespace(receipt="provider-reference-1")
+        user = SimpleNamespace(is_authenticated=True, has_perms=lambda _perms: False)
+        info = SimpleNamespace(context=SimpleNamespace(user=user))
+
+        self.assertEqual(
+            BenefitConsumptionGQLType.resolve_receipt(benefit, info),
+            "provider-reference-1",
+        )
+        self.assertTrue(BenefitConsumptionGQLType.resolve_has_receipt(benefit, info))
+
+    def test_receiptless_reconciled_benefit_still_has_paid_state(self):
+        benefit = SimpleNamespace(receipt=None, status=BenefitConsumptionStatus.RECONCILED)
+
+        self.assertTrue(BenefitConsumptionGQLType.resolve_has_receipt(benefit, None))
+
+    def test_withdrawal_fee_manager_can_read_receipt(self):
+        benefit = SimpleNamespace(receipt="provider-reference-1")
+        user = SimpleNamespace(is_authenticated=True, has_perms=lambda _perms: True)
+        info = SimpleNamespace(context=SimpleNamespace(user=user))
+
+        with patch.object(PayrollConfig, "gql_withdrawal_fee_manage_perms", ["202005"]):
+            self.assertEqual(
+                BenefitConsumptionGQLType.resolve_receipt(benefit, info),
+                "provider-reference-1",
+            )
+
+    def test_amount_to_pay_adds_the_programme_paid_fee(self):
+        benefit = SimpleNamespace(
+            amount=Decimal("100.00"),
+            withdrawal_fee=Decimal("5.50"),
+        )
+
+        self.assertEqual(
+            BenefitConsumptionGQLType.resolve_amount_to_pay(benefit, None),
+            Decimal("105.50"),
+        )
+
+    def test_amount_to_pay_is_unavailable_before_fee_snapshot(self):
+        benefit = SimpleNamespace(
+            amount=Decimal("100.00"),
+            withdrawal_fee=None,
+            withdrawal_fee_prepared_at=None,
+            json_ext={},
+        )
+        info = SimpleNamespace(context=SimpleNamespace())
+
+        with (
+            patch(
+                "payroll.services.WithdrawalFeeConfigService.build_fee_preview_catalog",
+                return_value={},
+            ),
+            patch(
+                "payroll.services.WithdrawalFeeConfigService.preview_fee_for_benefit",
+                return_value=(None, "No effective fee band."),
+            ),
+        ):
+            self.assertIsNone(BenefitConsumptionGQLType.resolve_amount_to_pay(benefit, info))
+
+    def test_amount_to_pay_uses_a_live_fee_preview_before_snapshot(self):
+        benefit = SimpleNamespace(
+            amount=Decimal("100.00"),
+            withdrawal_fee=None,
+            withdrawal_fee_prepared_at=None,
+            json_ext={},
+        )
+        info = SimpleNamespace(context=SimpleNamespace())
+
+        with (
+            patch(
+                "payroll.services.WithdrawalFeeConfigService.build_fee_preview_catalog",
+                return_value={},
+            ),
+            patch(
+                "payroll.services.WithdrawalFeeConfigService.preview_fee_for_benefit",
+                return_value=(Decimal("5.50"), None),
+            ),
+        ):
+            self.assertEqual(
+                BenefitConsumptionGQLType.resolve_withdrawal_fee(benefit, info),
+                Decimal("5.50"),
+            )
+            self.assertEqual(
+                BenefitConsumptionGQLType.resolve_amount_to_pay(benefit, info),
+                Decimal("105.50"),
+            )
+            self.assertIsNone(
+                BenefitConsumptionGQLType.resolve_withdrawal_fee_error(benefit, info)
+            )
 
     def test_project_name_intersects_selected_projects_with_active_enrollments(self):
         project_a = SimpleNamespace(id="project-a", name="Project A")

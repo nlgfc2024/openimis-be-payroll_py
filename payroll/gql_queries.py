@@ -1,4 +1,5 @@
 import json
+from decimal import Decimal
 
 import graphene
 from graphene_django import DjangoObjectType
@@ -10,14 +11,52 @@ from core.gql_queries import UserGQLType
 from invoice.gql.gql_types.bill_types import BillGQLType
 from location.gql_queries import LocationGQLType
 from individual.gql_queries import IndividualGQLType
-from payroll.models import PaymentPoint, Payroll, BenefitConsumption, \
-    PayrollBenefitConsumption, BenefitAttachment, CsvReconciliationUpload, ReconciliationUploadRow, ConsolidatedPayrollMember
+from payroll.models import (
+    PaymentPoint,
+    PaymentProvider,
+    Payroll,
+    WithdrawalFeeBand,
+    BenefitConsumption,
+    BenefitConsumptionStatus,
+    PayrollBenefitConsumption,
+    BenefitAttachment,
+    CsvReconciliationUpload,
+    ReconciliationUploadRow,
+    ConsolidatedPayrollMember,
+)
 from contribution_plan.gql import PaymentPlanGQLType
 from payment_cycle.gql_queries import PaymentCycleGQLType
 from social_protection.models import BenefitPlan
 from tasks_management.models import Task
 from payroll.utils import get_micro_catchment_name
 from payroll.benefit_plan_access import filter_payroll_queryset, filter_benefit_queryset
+
+
+def _get_withdrawal_fee_preview(benefit, info):
+    cached_preview = getattr(benefit, "_withdrawal_fee_preview", None)
+    if cached_preview is not None:
+        return cached_preview
+
+    saved_error = getattr(benefit, "withdrawal_fee_error", None)
+    if saved_error:
+        preview = (getattr(benefit, "withdrawal_fee", None), saved_error)
+    elif getattr(benefit, "withdrawal_fee", None) is not None:
+        preview = (benefit.withdrawal_fee, None)
+    elif getattr(benefit, "withdrawal_fee_prepared_at", None):
+        preview = (None, "The saved withdrawal fee snapshot is incomplete.")
+    else:
+        from payroll.services import WithdrawalFeeConfigService
+
+        context = getattr(info, "context", None) if info else None
+        catalog = getattr(context, "_payroll_withdrawal_fee_catalog", None)
+        if catalog is None:
+            catalog = WithdrawalFeeConfigService.build_fee_preview_catalog()
+            if context is not None and hasattr(context, "__dict__"):
+                context._payroll_withdrawal_fee_catalog = catalog
+        preview = WithdrawalFeeConfigService.preview_fee_for_benefit(benefit, catalog)
+
+    benefit._withdrawal_fee_preview = preview
+    return preview
 
 
 def _malawi_locations(individual):
@@ -102,6 +141,40 @@ class PaymentPointGQLType(DjangoObjectType):
         connection_class = ExtendedConnection
 
 
+class PaymentProviderGQLType(DjangoObjectType):
+    uuid = graphene.String(source="uuid")
+
+    class Meta:
+        model = PaymentProvider
+        interfaces = (graphene.relay.Node,)
+        fields = (
+            "id", "code", "name", "provider_type", "is_active",
+            "is_deleted", "date_created", "date_updated",
+        )
+
+
+class WithdrawalFeeBandGQLType(DjangoObjectType):
+    uuid = graphene.String(source="uuid")
+
+    class Meta:
+        model = WithdrawalFeeBand
+        interfaces = (graphene.relay.Node,)
+        filter_fields = {
+            "provider__code": ["exact", "icontains"],
+            "provider__name": ["icontains"],
+            "minimum_amount": ["exact", "gte", "lte"],
+            "maximum_amount": ["exact", "gte", "lte"],
+            "transfer_cost": ["exact", "gte", "lte"],
+            "effective_from": ["exact", "gte", "lte"],
+            "effective_to": ["exact", "gte", "lte"],
+        }
+        fields = (
+            "id", "provider", "minimum_amount", "maximum_amount",
+            "transfer_cost", "effective_from", "effective_to", "is_deleted",
+        )
+        connection_class = ExtendedConnection
+
+
 class BenefitAttachmentGQLType(DjangoObjectType):
     uuid = graphene.String(source='uuid')
 
@@ -128,6 +201,11 @@ class BenefitAttachmentGQLType(DjangoObjectType):
 
 class BenefitConsumptionGQLType(DjangoObjectType):
     uuid = graphene.String(source='uuid')
+    receipt = graphene.String()
+    has_receipt = graphene.Boolean()
+    withdrawal_fee = graphene.Decimal()
+    withdrawal_fee_error = graphene.String()
+    amount_to_pay = graphene.Decimal()
     benefit_attachment = graphene.List(BenefitAttachmentGQLType)
     national_id = graphene.String()
     form_number = graphene.String()
@@ -149,8 +227,9 @@ class BenefitConsumptionGQLType(DjangoObjectType):
             "id": ["exact"],
             "photo": ["iexact", "istartswith", "icontains"],
             "code": ["iexact", "istartswith", "icontains"],
+            "receipt": ["iexact", "istartswith", "icontains"],
+            "withdrawal_fee_error": ["isnull", "icontains"],
             "status": ["exact", "startswith", "icontains", "contains"],
-            "receipt": ["exact", "startswith", "icontains"],
             "type": ["exact", "startswith", "icontains"],
             "amount": ["exact", "lt", "lte", "gt", "gte"],
             "date_due": ["exact", "lt", "lte", "gt", "gte"],
@@ -210,6 +289,28 @@ class BenefitConsumptionGQLType(DjangoObjectType):
             self.individual,
             "bank", "bank_name", "bankName", "provider", "payment_provider", "paymentProvider",
         )
+
+    def resolve_receipt(self, info):
+        return self.receipt
+
+    def resolve_has_receipt(self, info):
+        return bool(self.receipt) or getattr(
+            self, "status", None
+        ) == BenefitConsumptionStatus.RECONCILED
+
+    def resolve_withdrawal_fee(self, info):
+        fee, _error = _get_withdrawal_fee_preview(self, info)
+        return fee
+
+    def resolve_withdrawal_fee_error(self, info):
+        _fee, error = _get_withdrawal_fee_preview(self, info)
+        return error
+
+    def resolve_amount_to_pay(self, info):
+        fee, _error = _get_withdrawal_fee_preview(self, info)
+        if getattr(self, "amount", None) is None or fee is None:
+            return None
+        return Decimal(self.amount) + Decimal(fee)
 
     def resolve_district_name(self, info):
         location = _malawi_locations(self.individual).get("R")

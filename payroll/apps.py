@@ -4,23 +4,20 @@ from django.apps import AppConfig
 
 from core.custom_filters import CustomFilterRegistryPoint
 from payroll.payments_registry import PaymentsMethodRegistryPoint
+from individual.data_source import KYC_PAYMENT_RECONCILIATION_FIELDS
 
 MODULE_NAME = 'payroll'
 
 # Snapshot payment details onto each benefit at payroll generation so later
 # KYC edits cannot change a reconciliation export for an existing payroll.
 KYC_PAYMENT_DETAILS_FIELD_MAPPING = {
-    "json_ext__kyc_payment_details__gender": "Gender",
-    "json_ext__kyc_payment_details__account_number": "Account Number",
-    "json_ext__kyc_payment_details__account_name": "Account Name",
-    "json_ext__kyc_payment_details__bank": "Bank",
+    f"json_ext__kyc_payment_details__{field}": label
+    for field, label in KYC_PAYMENT_RECONCILIATION_FIELDS.items()
 }
 
 LEGACY_KYC_PAYMENT_DETAILS_FIELD_MAPPING = {
-    "individual__json_ext__gender": "Gender",
-    "individual__json_ext__account_number": "Account Number",
-    "individual__json_ext__account_name": "Account Name",
-    "individual__json_ext__bank": "Bank",
+    f"individual__json_ext__{field}": label
+    for field, label in KYC_PAYMENT_RECONCILIATION_FIELDS.items()
 }
 
 DEFAULT_CONFIG = {
@@ -31,6 +28,7 @@ DEFAULT_CONFIG = {
     "gql_payroll_search_perms": ["202001"],
     "gql_payroll_create_perms": ["202002"],
     "gql_payroll_delete_perms": ["202004"],
+    "gql_withdrawal_fee_manage_perms": ["202005"],
     "gql_csv_reconciliation_search_perms": ["206001"],
     "gql_csv_reconciliation_create_perms": ["206002"],
     "payroll_accept_event": "payroll.accept_payroll",
@@ -51,7 +49,6 @@ DEFAULT_CONFIG = {
         "status": "Status",
         "amount": "Amount",
         "type": "Type",
-        "receipt": "Receipt",
     },
     "csv_reconciliation_status_column": "Status",
     "csv_reconciliation_paid_extra_field": "Paid",
@@ -74,6 +71,9 @@ DEFAULT_CONFIG = {
     "csv_reconciliation_warning_mismatch_reasons": [],
     "csv_reconciliation_amount_tolerance": "0",
     "csv_reconciliation_micro_catchment_column": "Micro Catchment",
+    # Keep the existing two-person reconciliation review as the safe default.
+    # Deployments that do not require it may set this to False.
+    "enable_maker_checker_for_reconciliation_upload": True,
     "payroll_delete_event": "payroll.payroll_delete",
     "benefit_delete_event": "payroll.benefit_delete",
 
@@ -101,6 +101,7 @@ class PayrollConfig(AppConfig):
     gql_payroll_search_perms = None
     gql_payroll_create_perms = None
     gql_payroll_delete_perms = None
+    gql_withdrawal_fee_manage_perms = None
     gql_csv_reconciliation_search_perms = None
     gql_csv_reconciliation_create_perms = None
     payroll_accept_event = None
@@ -118,6 +119,7 @@ class PayrollConfig(AppConfig):
     csv_reconciliation_warning_mismatch_reasons = None
     csv_reconciliation_amount_tolerance = None
     csv_reconciliation_micro_catchment_column = None
+    enable_maker_checker_for_reconciliation_upload = None
     payroll_delete_event = None
     benefit_delete_event = None
 

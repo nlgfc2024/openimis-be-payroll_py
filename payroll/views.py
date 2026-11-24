@@ -1,6 +1,6 @@
 import logging
 
-from django.core.exceptions import PermissionDenied
+from django.core.exceptions import PermissionDenied, ValidationError
 from django.db import transaction
 from rest_framework import status, views
 from rest_framework.decorators import api_view, permission_classes
@@ -99,7 +99,7 @@ class CSVReconciliationAPIView(views.APIView):
                     response.content = review_file.getvalue()
                     return response
                 return file_handler.get_file_response_csv(file_name)
-        except ValueError as exc:
+        except (ValueError, ValidationError) as exc:
             logger.error("Error while generating CSV reconciliation", exc_info=exc)
             return Response({'success': False, 'error': str(exc)}, status=400)
         except PermissionDenied as exc:
@@ -145,7 +145,7 @@ class CSVReconciliationAPIView(views.APIView):
             return Response({
                 "success": False, "error": str(exc), "upload_id": None,
             }, status=status.HTTP_403_FORBIDDEN)
-        except ValueError as exc:
+        except (ValueError, ValidationError) as exc:
             logger.info("CSV reconciliation upload rejected: %s", exc)
             error = {"code": "validation_error", "message": str(exc)}
             if upload.id:

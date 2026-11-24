@@ -18,16 +18,21 @@ from payroll.apps import PayrollConfig
 from payroll.consolidation import payrolls_in_district
 from payroll.gql_mutations import CreatePaymentPointMutation, UpdatePaymentPointMutation, DeletePaymentPointMutation, \
     CreatePayrollMutation, DeletePayrollMutation, ClosePayrollMutation, \
-    RejectPayrollMutation, MakePaymentForPayrollMutation, DeleteBenefitConsumptionMutation, CreateConsolidatedPayrollMutation
+    RejectPayrollMutation, MakePaymentForPayrollMutation, DeleteBenefitConsumptionMutation, CreateConsolidatedPayrollMutation, \
+    RefreshWithdrawalFeeSnapshotsMutation, \
+    CreatePaymentProviderMutation, UpdatePaymentProviderMutation, \
+    CreateWithdrawalFeeBandMutation, UpdateWithdrawalFeeBandMutation, DeleteWithdrawalFeeBandMutation, \
+    SavePaymentProviderWithFeeBandMutation
 from payroll.gql_queries import BenefitConsumptionGQLType, PaymentPointGQLType, benefit_consumption_queryset, \
     PayrollGQLType, PaymentMethodGQLType, \
     PaymentMethodListGQLType, BenefitAttachmentListGQLType, \
     CsvReconciliationUploadGQLType, ReconciliationUploadRowGQLType, PayrollBenefitConsumptionGQLType, \
-    PaymentGatewayConfigGQLType, BenefitsSummaryGQLType
+    PaymentGatewayConfigGQLType, BenefitsSummaryGQLType, PaymentProviderGQLType, \
+    WithdrawalFeeBandGQLType
 from payroll.models import PaymentPoint, Payroll, \
     BenefitConsumption, BenefitAttachment, \
     CsvReconciliationUpload, ReconciliationUploadRow, PayrollBenefitConsumption, BenefitConsumptionStatus, \
-    ConsolidatedPayrollMember, PayrollStatus
+    ConsolidatedPayrollMember, PayrollStatus, PaymentProvider, WithdrawalFeeBand
 from payroll.payments_registry import PaymentMethodStorage
 from payroll.benefit_plan_access import (
     filter_benefit_queryset,
@@ -46,6 +51,17 @@ class ConsolidationPhaseGQLType(graphene.ObjectType):
 
 
 class Query(graphene.ObjectType):
+    payment_providers = graphene.List(
+        PaymentProviderGQLType,
+        active_only=graphene.Boolean(default_value=True),
+    )
+    withdrawal_fee_bands = OrderedDjangoFilterConnectionField(
+        WithdrawalFeeBandGQLType,
+        orderBy=graphene.List(of_type=graphene.String),
+        provider_id=graphene.UUID(),
+        provider_name=graphene.String(),
+        provider_code=graphene.String(),
+    )
     payment_point = OrderedDjangoFilterConnectionField(
         PaymentPointGQLType,
         orderBy=graphene.List(of_type=graphene.String),
@@ -424,6 +440,39 @@ class Query(graphene.ObjectType):
         gql_payment_methods = Query._build_payment_method_options(payment_methods)
         return PaymentMethodListGQLType(gql_payment_methods)
 
+    def resolve_payment_providers(self, info, active_only=True):
+        user = info.context.user
+        if type(user) is AnonymousUser or not user.id:
+            raise PermissionError("Unauthorized")
+        providers = PaymentProvider.objects.filter(is_deleted=False)
+        if active_only:
+            providers = providers.filter(is_active=True)
+        else:
+            Query._check_permissions(
+                user,
+                PayrollConfig.gql_withdrawal_fee_manage_perms,
+            )
+        return providers.order_by("name")
+
+    def resolve_withdrawal_fee_bands(
+        self, info, provider_id=None, provider_name=None, provider_code=None, **kwargs,
+    ):
+        Query._check_permissions(
+            info.context.user,
+            PayrollConfig.gql_withdrawal_fee_manage_perms,
+        )
+        bands = WithdrawalFeeBand.objects.filter(
+            is_deleted=False,
+            provider__is_deleted=False,
+        )
+        if provider_id:
+            bands = bands.filter(provider_id=provider_id)
+        if provider_name:
+            bands = bands.filter(provider__name__icontains=provider_name.strip())
+        if provider_code:
+            bands = bands.filter(provider__code__icontains=provider_code.strip())
+        return gql_optimizer.query(bands.select_related("provider"), info)
+
     def resolve_payment_gateway_config(self, info):
         return PaymentGatewayConfigGQLType(
             base_url=PayrollConfig.payment_gateway_base_url,
@@ -508,12 +557,19 @@ class Query(graphene.ObjectType):
 
 
 class Mutation(graphene.ObjectType):
+    save_payment_provider_with_fee_band = SavePaymentProviderWithFeeBandMutation.Field()
+    create_payment_provider = CreatePaymentProviderMutation.Field()
+    update_payment_provider = UpdatePaymentProviderMutation.Field()
+    create_withdrawal_fee_band = CreateWithdrawalFeeBandMutation.Field()
+    update_withdrawal_fee_band = UpdateWithdrawalFeeBandMutation.Field()
+    delete_withdrawal_fee_band = DeleteWithdrawalFeeBandMutation.Field()
     create_payment_point = CreatePaymentPointMutation.Field()
     update_payment_point = UpdatePaymentPointMutation.Field()
     delete_payment_point = DeletePaymentPointMutation.Field()
 
     create_payroll = CreatePayrollMutation.Field()
     create_consolidated_payroll = CreateConsolidatedPayrollMutation.Field()
+    refresh_withdrawal_fee_snapshots = RefreshWithdrawalFeeSnapshotsMutation.Field()
     delete_payroll = DeletePayrollMutation.Field()
     close_payroll = ClosePayrollMutation.Field()
     reject_payroll = RejectPayrollMutation.Field()
