@@ -81,6 +81,7 @@ This section details the configuration settings required for integrating with a 
 - **csv_reconciliation_warning_mismatch_reasons**: Safe data mismatches configured to remain valid. Structural and payment-integrity failures cannot be configured as warnings.
 - **csv_reconciliation_amount_tolerance**: Maximum permitted absolute difference between the submitted and expected amount. The default is `0`.
 - **csv_reconciliation_micro_catchment_column**: CSV header containing the micro-catchment value. The default is `Micro Catchment`.
+- **enable_maker_checker_for_reconciliation_upload**: Controls the reconciliation approval workflow. The default is `true`, which creates a `payroll_reconciliation` task for a second user to approve. Set it to `false` only where a valid upload should be applied immediately. Changing this setting does not alter existing waiting uploads or their tasks; a later valid upload supersedes the waiting upload and fails its open task as usual.
 
 ### Configuration Parameters
 
@@ -118,6 +119,7 @@ This section details the configuration settings required for integrating with a 
     "gateway_base_url": "http://41.175.18.170:8070/api/mobile/v1/",
     "endpoint_payment": "mock/payment",
     "endpoint_reconciliation": "mock/reconciliation",
+    "enable_maker_checker_for_reconciliation_upload": True,
     "payment_gateway_api_key": os.getenv('PAYMENT_GATEWAY_API_KEY'),
     "payment_gateway_basic_auth_username": os.getenv('PAYMENT_GATEWAY_BASIC_AUTH_USERNAME'),
     "payment_gateway_basic_auth_password": os.getenv('PAYMENT_GATEWAY_BASIC_AUTH_PASSWORD'),
