@@ -2198,13 +2198,9 @@ class CsvReconciliationService:
             for field in validation_fields
             if field in field_mapping
         } | {self._paid_column()}
-        # Current exports always include this header. Legacy uploads predate
-        # the standardized layout, so require it only when the rest of that
-        # layout is present rather than rejecting old files outright.
-        standardized_columns = set(self._reconciliation_export_columns())
-        standardized_columns.discard(self._micro_catchment_column())
-        if standardized_columns.issubset(df.columns):
-            required_columns.add(self._micro_catchment_column())
+        # A missing micro-catchment would silently skip the row-level
+        # comparison, so it is required for every reconciliation upload.
+        required_columns.add(self._micro_catchment_column())
         missing_columns = required_columns - set(df.columns)
         if missing_columns:
             raise ValueError(
