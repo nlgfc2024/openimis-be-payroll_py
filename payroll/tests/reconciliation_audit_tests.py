@@ -88,6 +88,12 @@ class ReconciliationAuditPolicyTests(TestCase):
         service._ensure_payroll_ready_for_reconciliation(SimpleNamespace(
             status=PayrollStatus.APPROVE_FOR_PAYMENT,
         ))
+        # Consolidated payrolls follow the same approval lifecycle as standard
+        # payrolls, so their approved status must also be accepted.
+        service._ensure_payroll_ready_for_reconciliation(SimpleNamespace(
+            status=PayrollStatus.APPROVE_FOR_PAYMENT,
+            payroll_type=Payroll.PayrollType.CONSOLIDATED,
+        ))
 
     def test_upload_summary_uses_audited_record_keys(self):
         upload = SimpleNamespace(
@@ -223,6 +229,7 @@ class ReconciliationAuditPolicyTests(TestCase):
                     for field, header in default_mapping.items()
                     if field not in KYC_PAYMENT_DETAILS_FIELD_MAPPING
                 },
+                CsvReconciliationService._micro_catchment_column(): "Catchment A",
                 PayrollConfig.csv_reconciliation_paid_extra_field: "No",
             }])
 
@@ -248,6 +255,7 @@ class ReconciliationAuditPolicyTests(TestCase):
                 "Code": "BENEFIT-1",
                 "Amount": "10.00",
                 "Status": BenefitConsumptionStatus.ACCEPTED,
+                CsvReconciliationService._micro_catchment_column(): "Catchment A",
                 "Paid": "Yes",
             }])
 
@@ -389,6 +397,18 @@ class ReconciliationAuditPolicyTests(TestCase):
 
         with self.assertRaisesRegex(ValueError, "Missing required columns"):
             CsvReconciliationService(None)._validate_dataframe(dataframe)
+
+    def test_micro_catchment_is_required_for_every_upload(self):
+        service = CsvReconciliationService(None)
+        columns = service._reconciliation_export_columns()
+        dataframe = pd.DataFrame([{
+            column: "Yes" if column == service._paid_column() else "value"
+            for column in columns
+            if column != service._micro_catchment_column()
+        }])
+
+        with self.assertRaisesRegex(ValueError, service._micro_catchment_column()):
+            service._validate_dataframe(dataframe)
 
     def test_review_download_preserves_uploaded_columns_and_audit_defaults(self):
         upload = SimpleNamespace(id="upload-id")
