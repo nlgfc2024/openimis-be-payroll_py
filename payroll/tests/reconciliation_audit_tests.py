@@ -167,10 +167,12 @@ class ReconciliationAuditPolicyTests(TestCase):
             }
 
             mapping = CsvReconciliationService._reconciliation_field_mapping()
+            export_mapping = CsvReconciliationService._reconciliation_export_field_mapping()
             columns = CsvReconciliationService._reconciliation_export_columns()
 
             self.assertEqual(mapping["individual__json_ext__sex"], "Gender")
             self.assertEqual(list(mapping.values()).count("Gender"), 1)
+            self.assertEqual(export_mapping["individual__json_ext__sex"], "Gender")
             self.assertEqual(columns.count("Gender"), 1)
         finally:
             PayrollConfig.csv_reconciliation_field_mapping = original_mapping
@@ -753,6 +755,7 @@ class ReconciliationAuditPolicyTests(TestCase):
                 ):
                     lock_payroll.return_value.get.return_value = SimpleNamespace(
                         payroll_type=payroll_type,
+                        status=PayrollStatus.APPROVE_FOR_PAYMENT,
                     )
                     lock_upload.return_value.get.return_value = upload
                     with self.assertRaises(ValidationError):
@@ -767,6 +770,7 @@ class ReconciliationAuditPolicyTests(TestCase):
         payroll = SimpleNamespace(
             id="payroll-id",
             payroll_type=Payroll.PayrollType.STANDARD,
+            status=PayrollStatus.APPROVE_FOR_PAYMENT,
             name="Standard reconciliation payroll",
             json_ext={},
         )
@@ -829,6 +833,7 @@ class ReconciliationAuditPolicyTests(TestCase):
         payroll = SimpleNamespace(
             id="payroll-id",
             payroll_type=Payroll.PayrollType.STANDARD,
+            status=PayrollStatus.APPROVE_FOR_PAYMENT,
             name="Standard reconciliation payroll",
             json_ext={},
         )

@@ -1225,11 +1225,24 @@ class CsvReconciliationService:
     def _reconciliation_export_field_mapping(cls):
         """Map the fixed reconciliation fields to this instance's configured headers."""
         configured_mapping = cls._reconciliation_field_mapping()
-        return {
-            field: configured_mapping[field]
-            for field, header in RECONCILIATION_EXPORT_FIELD_MAPPING.items()
-            if field in configured_mapping
-        }
+        export_mapping = {}
+        for fixed_field, default_header in RECONCILIATION_EXPORT_FIELD_MAPPING.items():
+            # A legacy/configured field can own a standard header. For example,
+            # an installation may map ``individual__json_ext__sex`` to
+            # ``Gender``. In that case the KYC snapshot field is deliberately
+            # not added by _reconciliation_field_mapping(), but the export must
+            # still include the configured field that owns the Gender column.
+            field = fixed_field if fixed_field in configured_mapping else next(
+                (
+                    configured_field
+                    for configured_field, header in configured_mapping.items()
+                    if header == default_header
+                ),
+                None,
+            )
+            if field:
+                export_mapping[field] = configured_mapping[field]
+        return export_mapping
 
     @classmethod
     def _reconciliation_export_columns(cls):
@@ -1243,13 +1256,31 @@ class CsvReconciliationService:
             if header and header not in columns:
                 columns.append(header)
 
+        def configured_header(field):
+            header = field_mapping.get(field)
+            if header:
+                return header
+            # A configured legacy field may own the standard heading for this
+            # fixed field (for example, ``sex`` owns ``Gender``).
+            default_header = RECONCILIATION_EXPORT_FIELD_MAPPING.get(field)
+            if default_header:
+                return next(
+                    (
+                        configured_header
+                        for configured_header in field_mapping.values()
+                        if configured_header == default_header
+                    ),
+                    None,
+                )
+            return None
+
         add("Source Payroll")
         for field in (
             "payrollbenefitconsumption__payroll__name",
             "payrollbenefitconsumption__payroll__status",
             "individual__location__parent__parent__parent__name",
         ):
-            add(field_mapping.get(field))
+            add(configured_header(field))
         add(cls._micro_catchment_column())
         for field in (
             "individual__json_ext__form_number",
@@ -1263,12 +1294,12 @@ class CsvReconciliationService:
             "json_ext__kyc_payment_details__bank",
             "code",
         ):
-            add(field_mapping.get(field))
+            add(configured_header(field))
         add(cls._status_column())
-        add(field_mapping.get("amount"))
+        add(configured_header("amount"))
         add(cls._withdrawal_fee_header())
         add(cls._amount_to_pay_header())
-        add(field_mapping.get("type"))
+        add(configured_header("type"))
         add(cls._paid_column())
         return columns
 
