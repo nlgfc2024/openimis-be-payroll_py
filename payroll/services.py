@@ -770,22 +770,30 @@ class BenefitConsumptionService(BaseService):
 
     @check_authentication
     @register_service_signal('benefit_consumption_service.delete')
+    @transaction.atomic
     def delete(self, obj_data):
         benefit_to_delete = BenefitConsumption.objects.get(id=obj_data['id'])
         require_benefit_access(self.user, benefit_to_delete)
         ensure_benefit_is_not_in_active_consolidation(benefit_to_delete, "delete")
+        ownership = task_ownership_for_benefit(benefit_to_delete)
         benefit_to_delete.status = BenefitConsumptionStatus.PENDING_DELETION
         benefit_to_delete.save(user=self.user)
         data = {'id': benefit_to_delete.id}
-        TaskService(self.user, trusted_internal=True).create({
+        task = TaskService(self.user, trusted_internal=True).create({
             'source': 'benefit_delete',
             'entity': benefit_to_delete,
             'status': Task.Status.RECEIVED,
             'executor_action_event': TasksManagementConfig.default_executor_event,
             'business_event': PayrollConfig.benefit_delete_event,
             'data': _get_std_task_data_payload(data),
-            **task_ownership_for_benefit(benefit_to_delete),
+            **ownership,
         })
+        if not task or not task.get("success", False):
+            raise ValidationError(
+                (task.get("detail") if task else None)
+                or "Unable to create Benefit deletion Task."
+            )
+        return task
 
     @check_authentication
     @register_service_signal('benefit_consumption_service.create_or_update_benefit_attachment')
