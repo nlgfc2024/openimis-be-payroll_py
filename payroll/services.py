@@ -362,6 +362,7 @@ class PayrollService(BaseService):
                         # essential: it limits the run to the chosen project instead
                         # of allowing the strategy to calculate every completed
                         # project in the benefit plan.
+                        expected_workers = self._lock_primary_workers(enrollments_queryset)
                         self._generate_benefits(
                             payment_plan,
                             date_valid_from,
@@ -371,7 +372,7 @@ class PayrollService(BaseService):
                             enrollments_queryset=enrollments_queryset,
                         )
                         self._assign_group_benefits_to_primary_recipients(
-                            payroll, enrollments_queryset
+                            payroll, enrollments_queryset, expected_workers
                         )
                     else:
                         beneficiaries_queryset = self._select_beneficiary_based_on_criteria(
@@ -1049,14 +1050,54 @@ class PayrollService(BaseService):
             benefit.json_ext = benefit_json_ext
             benefit.save(user=self.user)
 
-    def _assign_group_benefits_to_primary_recipients(self, payroll, enrollments_queryset):
+    def _lock_primary_workers(self, enrollments_queryset):
+        """Lock the selected households and their members until the payroll is saved,
+        and return each household's primary worker as the calculation will see it.
+
+        Only when benefits are paid to primary workers. The calculation rule and the
+        assignment each look the worker up; the locks stop a member being changed or
+        removed in between, and the assignment compares its lookup with this one to
+        catch a member added in between. Returns None otherwise.
+        """
+        if not self._pays_group_benefits_to_primary_workers():
+            return None
+        group_ids_by_beneficiary = dict(
+            enrollments_queryset.values_list("group_beneficiary_id", "group_beneficiary__group_id")
+        )
+        group_ids = sorted(set(group_ids_by_beneficiary.values()), key=str)
+        group_model = apps.get_model("individual", "Group")
+        group_individual_model = apps.get_model("individual", "GroupIndividual")
+        individual_model = apps.get_model("individual", "Individual")
+        members = group_individual_model.objects.filter(group_id__in=group_ids)
+        # Locked in one order (households, memberships, people) to avoid deadlocks.
+        list(group_model.objects.select_for_update().filter(id__in=group_ids).order_by("id").values_list("id"))
+        list(members.select_for_update().order_by("id").values_list("id"))
+        list(individual_model.objects.select_for_update().filter(
+            id__in=members.values("individual_id")).order_by("id").values_list("id"))
+        return self._primary_worker_by_group(group_ids_by_beneficiary)
+
+    def _assign_group_benefits_to_primary_recipients(self, payroll, enrollments_queryset, expected_workers=None):
         """Make each generated household benefit payable to its payee: the PRIMARY
-        member, or the primary worker when ``group_benefit_payee`` says so."""
+        member, or the primary worker when ``group_benefit_payee`` says so.
+
+        ``expected_workers`` is what _lock_primary_workers returned before the
+        calculation; a household whose worker differs now fails the payroll, so a
+        benefit never moves to another member than the one it was calculated for."""
         group_ids_by_beneficiary = dict(
             enrollments_queryset.values_list("group_beneficiary_id", "group_beneficiary__group_id")
         )
         if self._pays_group_benefits_to_primary_workers():
             primary_recipient_by_group = self._primary_worker_by_group(group_ids_by_beneficiary)
+            if expected_workers is not None:
+                changed = sorted(
+                    str(beneficiary_id) for beneficiary_id, group_id in group_ids_by_beneficiary.items()
+                    if primary_recipient_by_group.get(group_id) != expected_workers.get(group_id)
+                )
+                if changed:
+                    raise ValidationError(
+                        "The primary worker of these households changed while the payroll was being "
+                        "calculated: %s. Create the payroll again." % ", ".join(changed)
+                    )
         else:
             group_individual_model = apps.get_model("individual", "GroupIndividual")
             primary_recipient_by_group = dict(

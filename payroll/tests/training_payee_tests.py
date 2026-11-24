@@ -4,7 +4,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from django.core.exceptions import ValidationError
+from django.db import connection
 from django.test import TestCase
+from django.test.utils import CaptureQueriesContext
 
 from core.test_helpers import LogInHelper
 from individual.models import Group, GroupIndividual
@@ -98,6 +101,56 @@ class GroupPayeeSelectionTest(TestCase):
             {one.id: one.group_id, two.id: two.group_id, none.id: none.group_id})
         self.assertEqual(workers, {one.group_id: members[1].individual_id})
         self.assertNotIn(unverified.id, self.selected(self.work))
+
+    def enrollments(self, *households):
+        return GroupBeneficiaryProjectEnrollment.objects.filter(
+            group_beneficiary__in=households, is_deleted=False)
+
+    @patch.object(PayrollConfig, "group_benefit_payee", "PRIMARY_WORKER")
+    def test_the_worker_is_looked_up_with_the_households_and_members_locked(self):
+        household, members = self.household('PRTP-L', [self.work], primary_recipient=False)
+        with CaptureQueriesContext(connection) as queries:
+            workers = PayrollService(self.user)._lock_primary_workers(self.enrollments(household))
+        self.assertEqual(workers, {household.group_id: members[1].individual_id})
+        locked = [query["sql"] for query in queries.captured_queries if "FOR UPDATE" in query["sql"]]
+        self.assertEqual(len(locked), 3)
+        for table in ('"individual_group"', '"individual_groupindividual"', '"individual_individual"'):
+            self.assertTrue(any(f"FROM {table}" in sql for sql in locked), table)
+
+    def test_nothing_is_locked_when_paying_the_primary_recipient(self):
+        household, _ = self.household('PRTP-M', [self.work])
+        with CaptureQueriesContext(connection) as queries:
+            self.assertIsNone(PayrollService(self.user)._lock_primary_workers(self.enrollments(household)))
+        self.assertEqual(len(queries.captured_queries), 0)
+
+    @patch.object(PayrollConfig, "group_benefit_payee", "PRIMARY_WORKER")
+    def test_a_worker_changed_during_the_calculation_fails_the_payroll(self):
+        """The benefit was calculated for worker A; B is the worker by assignment."""
+        kept, _ = self.household('PRTP-N', [self.work], primary_recipient=False)
+        changed, members = self.household('PRTP-O', [self.work], primary_recipient=False, primary_workers=2)
+        GroupIndividual.objects.filter(id=members[2].id).update(json_ext={})
+        service = PayrollService(self.user)
+        enrollments = self.enrollments(kept, changed)
+        expected = service._lock_primary_workers(enrollments)
+        self.assertEqual(expected[changed.group_id], members[1].individual_id)
+
+        GroupIndividual.objects.filter(id=members[1].id).update(json_ext={})
+        GroupIndividual.objects.filter(id=members[2].id).update(json_ext={"primary_worker": True})
+        with self.assertRaisesMessage(
+                ValidationError, f"changed while the payroll was being calculated: {changed.id}."):
+            service._assign_group_benefits_to_primary_recipients(None, enrollments, expected)
+
+    @patch.object(PayrollConfig, "group_benefit_payee", "PRIMARY_WORKER")
+    def test_a_worker_added_during_the_calculation_fails_the_payroll(self):
+        household, members = self.household('PRTP-P', [self.work], primary_recipient=False, primary_workers=2)
+        GroupIndividual.objects.filter(id=members[2].id).update(json_ext={})
+        service = PayrollService(self.user)
+        enrollments = self.enrollments(household)
+        expected = service._lock_primary_workers(enrollments)
+
+        GroupIndividual.objects.filter(id=members[2].id).update(json_ext={"primary_worker": True})
+        with self.assertRaisesMessage(ValidationError, "changed while the payroll was being calculated"):
+            service._assign_group_benefits_to_primary_recipients(None, enrollments, expected)
 
     @unittest.skipUnless(HAS_PROJECT_TYPE, "needs Project.project_type from the project module")
     def test_trainings_are_selected_whatever_their_status(self):
