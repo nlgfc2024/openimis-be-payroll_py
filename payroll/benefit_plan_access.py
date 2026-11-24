@@ -6,6 +6,7 @@ from django.db.models import Exists, OuterRef, Q
 from uuid import UUID
 
 from social_protection.benefit_plan_access import (
+    benefit_plan_access_control_enabled,
     get_accessible_benefit_plan_ids,
     require_benefit_plan_access as require_shared_benefit_plan_access,
 )
@@ -61,6 +62,8 @@ def require_payment_plan_access(user, payment_plan):
 
 def task_ownership_for_payment_plan(payment_plan):
     """Return the explicit Task ownership for one Payment Plan."""
+    if not benefit_plan_access_control_enabled():
+        return {}
     if payment_plan is None or payment_plan.benefit_plan_type_id is None:
         raise ValidationError("Payroll Task ownership cannot be resolved.")
     if payment_plan.benefit_plan_type_id != _benefit_plan_content_type().id:
@@ -73,10 +76,14 @@ def task_ownership_for_payment_plan(payment_plan):
 
 
 def task_ownership_for_payroll(payroll):
+    if not benefit_plan_access_control_enabled():
+        return {}
     return task_ownership_for_payment_plan(payroll.payment_plan)
 
 
 def task_ownership_for_benefit(benefit):
+    if not benefit_plan_access_control_enabled():
+        return {}
     links = benefit.payrollbenefitconsumption_set.filter(
         is_deleted=False,
     ).select_related("payroll__payment_plan__benefit_plan_type")
