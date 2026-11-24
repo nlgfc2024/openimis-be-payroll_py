@@ -77,6 +77,18 @@ class ReconciliationAuditPolicyTests(TestCase):
             PayrollConfig.csv_reconciliation_warning_mismatch_reasons = original_warnings
             PayrollConfig.csv_reconciliation_blocking_mismatch_reasons = original_blocking
 
+    def test_reconciliation_requires_payment_approval(self):
+        service = CsvReconciliationService(None)
+
+        with self.assertRaisesRegex(ValidationError, "approved for payment"):
+            service._ensure_payroll_ready_for_reconciliation(SimpleNamespace(
+                status=PayrollStatus.PENDING_APPROVAL,
+            ))
+
+        service._ensure_payroll_ready_for_reconciliation(SimpleNamespace(
+            status=PayrollStatus.APPROVE_FOR_PAYMENT,
+        ))
+
     def test_upload_summary_uses_audited_record_keys(self):
         upload = SimpleNamespace(
             id="upload-id",

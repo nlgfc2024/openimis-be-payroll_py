@@ -1550,6 +1550,7 @@ class CsvReconciliationService:
         # Serialise uploads for a payroll.  This makes superseding a pending
         # review deterministic even when corrected files arrive concurrently.
         payroll = Payroll.objects.select_for_update().get(id=payroll.id)
+        self._ensure_payroll_ready_for_reconciliation(payroll)
         ensure_payroll_is_not_consolidated_source(payroll, "upload reconciliation for")
         if not file:
             raise ValueError(_("csv_reconciliation.validation.file_required"))
@@ -1912,6 +1913,7 @@ class CsvReconciliationService:
         upload = CsvReconciliationUpload.objects.select_for_update().get(id=upload.id)
         if upload.status != CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION:
             return
+        self._ensure_payroll_ready_for_reconciliation(payroll)
         if upload.unmatched_records:
             raise ValidationError(
                 "A reconciliation upload with blocking validation errors cannot be applied."
@@ -1985,6 +1987,14 @@ class CsvReconciliationService:
             payroll.save(username=self.user.login_name)
         reconcile_consolidated_sources(payroll, self.user)
         return upload
+
+    @staticmethod
+    def _ensure_payroll_ready_for_reconciliation(payroll):
+        """Reconciliation is only valid once payment has been approved."""
+        if payroll.status != PayrollStatus.APPROVE_FOR_PAYMENT:
+            raise ValidationError(
+                "A payroll must be approved for payment before reconciliation."
+            )
 
     def download_upload_review(self, upload, contents):
         """Return the uploaded CSV with review outcomes and no payment references."""
