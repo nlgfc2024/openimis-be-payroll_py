@@ -684,6 +684,10 @@ class ReconciliationAuditPolicyTests(TestCase):
         task_query.first.return_value = task
 
         with (
+            patch(
+                "payroll.signals.benefit_plan_access_control_enabled",
+                return_value=True,
+            ),
             patch("payroll.signals.Task.objects.filter", return_value=task_query),
             patch(
                 "payroll.signals.get_authorized_payroll",
@@ -714,6 +718,10 @@ class ReconciliationAuditPolicyTests(TestCase):
         )
 
         with (
+            patch(
+                "payroll.signals.benefit_plan_access_control_enabled",
+                return_value=True,
+            ),
             patch("payroll.signals.User.objects.get", return_value=user),
             patch(
                 "payroll.signals.get_authorized_payroll",

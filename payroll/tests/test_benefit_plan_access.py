@@ -5,7 +5,7 @@ from uuid import uuid4
 from graphene import Schema
 from graphene.test import Client
 from django.contrib.contenttypes.models import ContentType
-from django.core.exceptions import PermissionDenied
+from django.core.exceptions import PermissionDenied, ValidationError
 from django.test import TestCase, override_settings
 
 from contribution_plan.models import PaymentPlan
@@ -22,7 +22,9 @@ from payroll.benefit_plan_access import (
     filter_payroll_queryset,
     get_authorized_payroll,
     require_payment_plan_access,
+    task_ownership_for_benefit,
     task_ownership_for_payment_plan,
+    task_ownership_for_payroll,
 )
 from payroll.apps import PayrollConfig
 from payroll.gql_queries import (
@@ -34,13 +36,18 @@ from payroll.gql_queries import (
 from payroll.gql_mutations import DeletePayrollMutation
 from payroll.models import (
     BenefitConsumption,
+    BenefitConsumptionStatus,
     BenefitAttachment,
     CsvReconciliationUpload,
     Payroll,
     PayrollBenefitConsumption,
 )
 from payroll.schema import Query
-from payroll.services import CsvReconciliationService, PayrollService
+from payroll.services import (
+    BenefitConsumptionService,
+    CsvReconciliationService,
+    PayrollService,
+)
 from social_protection.apps import SocialProtectionConfig
 from social_protection.models import BenefitPlan, UserBenefitPlanAccess
 from tasks_management.models import Task, TaskExecutor, TaskGroup
@@ -249,6 +256,124 @@ class PayrollBenefitPlanAccessTest(TestCase):
             {"benefit_plan_is_shared": True},
         )
 
+    def test_feature_off_task_ownership_skips_all_resolution(self):
+        SocialProtectionConfig.enable_benefit_plan_access_control = False
+        null_plan = PaymentPlan(
+            code="PP-NULL-07",
+            name="Feature-off null plan",
+            periodicity=1,
+            calculation=uuid4(),
+            benefit_plan_type=None,
+            benefit_plan_id=None,
+        )
+        null_plan.save(user=self.user)
+        null_payroll = Payroll(name="Feature-off null payroll", payment_plan=null_plan)
+        null_payroll.save(user=self.user)
+        unlinked_benefit = BenefitConsumption(
+            individual=self.individual,
+            code="UNLINKED-OFF-07",
+            amount=10,
+        )
+        unlinked_benefit.save(user=self.user)
+        multi_plan_benefit = BenefitConsumption(
+            individual=self.individual,
+            code="MULTI-OFF-07",
+            amount=20,
+        )
+        multi_plan_benefit.save(user=self.user)
+        PayrollBenefitConsumption(
+            payroll=self.upg_payroll,
+            benefit=multi_plan_benefit,
+        ).save(user=self.user)
+        PayrollBenefitConsumption(
+            payroll=self.rmep_payroll,
+            benefit=multi_plan_benefit,
+        ).save(user=self.user)
+
+        self.assertEqual(task_ownership_for_payment_plan(null_plan), {})
+        self.assertEqual(task_ownership_for_payroll(null_payroll), {})
+        self.assertEqual(task_ownership_for_benefit(unlinked_benefit), {})
+        self.assertEqual(task_ownership_for_benefit(multi_plan_benefit), {})
+
+    def test_feature_on_task_ownership_remains_strict(self):
+        null_plan = SimpleNamespace(
+            benefit_plan_type_id=None,
+            benefit_plan_id=None,
+        )
+        unlinked_benefit = BenefitConsumption(
+            individual=self.individual,
+            code="UNLINKED-ON-07",
+            amount=10,
+        )
+        unlinked_benefit.save(user=self.user)
+        multi_plan_benefit = BenefitConsumption(
+            individual=self.individual,
+            code="MULTI-ON-07",
+            amount=20,
+        )
+        multi_plan_benefit.save(user=self.user)
+        PayrollBenefitConsumption(
+            payroll=self.upg_payroll,
+            benefit=multi_plan_benefit,
+        ).save(user=self.user)
+        PayrollBenefitConsumption(
+            payroll=self.rmep_payroll,
+            benefit=multi_plan_benefit,
+        ).save(user=self.user)
+
+        with self.assertRaises(ValidationError):
+            task_ownership_for_payment_plan(null_plan)
+        with self.assertRaises(ValidationError):
+            task_ownership_for_benefit(unlinked_benefit)
+        with self.assertRaises(ValidationError):
+            task_ownership_for_benefit(multi_plan_benefit)
+
+    def test_failed_benefit_ownership_leaves_status_unchanged(self):
+        self.assign(self.upg)
+        self.assign(self.rmep)
+        benefit = BenefitConsumption(
+            individual=self.individual,
+            code="DELETE-MULTI-07",
+            amount=20,
+        )
+        benefit.save(user=self.user)
+        PayrollBenefitConsumption(
+            payroll=self.upg_payroll,
+            benefit=benefit,
+        ).save(user=self.user)
+        PayrollBenefitConsumption(
+            payroll=self.rmep_payroll,
+            benefit=benefit,
+        ).save(user=self.user)
+
+        with self.assertRaises(ValidationError):
+            BenefitConsumptionService(self.user).delete({"id": benefit.id})
+
+        benefit.refresh_from_db()
+        self.assertEqual(benefit.status, BenefitConsumptionStatus.ACCEPTED)
+        self.assertFalse(Task.objects.filter(
+            source="benefit_delete",
+            entity_id=str(benefit.id),
+            is_deleted=False,
+        ).exists())
+
+    def test_failed_benefit_deletion_task_rolls_back_status(self):
+        self.assign(self.upg)
+        original_status = self.upg_benefit.status
+        with patch(
+            "payroll.services.TaskService.create",
+            return_value={
+                "success": False,
+                "detail": "simulated Task rejection",
+            },
+        ), self.assertRaises(ValidationError):
+            BenefitConsumptionService(self.user).delete({
+                "id": self.upg_benefit.id,
+            })
+
+        self.upg_benefit.refresh_from_db()
+        self.assertEqual(self.upg_benefit.status, original_status)
+
     def test_payroll_approval_producer_sets_explicit_task_ownership(self):
         self.assign(self.upg)
         result = PayrollService(self.user).create_accept_payroll_task(
@@ -395,6 +520,28 @@ class PayrollBenefitPlanAccessTest(TestCase):
             self.rmep_payroll,
             self.user,
         )
+
+    def test_feature_off_completes_task_for_soft_deleted_payroll(self):
+        SocialProtectionConfig.enable_benefit_plan_access_control = False
+        task = self.approval_task(
+            self.rmep_payroll,
+            PayrollConfig.payroll_accept_event,
+            self.upg.id,
+        )
+        Payroll.objects.filter(id=self.rmep_payroll.id).update(is_deleted=True)
+        strategy = SimpleNamespace(accept_payroll=MagicMock())
+
+        with patch(
+            "payroll.signals.PaymentMethodStorage.get_chosen_payment_method",
+            return_value=strategy,
+        ):
+            result = TaskService(self.user).complete_task({"id": task.id})
+
+        self.assertTrue(result["success"], result)
+        task.refresh_from_db()
+        self.assertEqual(task.status, Task.Status.COMPLETED)
+        completed_payroll = strategy.accept_payroll.call_args.args[0]
+        self.assertEqual(completed_payroll.id, self.rmep_payroll.id)
 
     def test_feature_disabled_preserves_existing_behaviour(self):
         SocialProtectionConfig.enable_benefit_plan_access_control = False
