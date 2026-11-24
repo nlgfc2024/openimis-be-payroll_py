@@ -20,7 +20,14 @@ LEGACY_KYC_PAYMENT_DETAILS_FIELD_MAPPING = {
     for field, label in KYC_PAYMENT_RECONCILIATION_FIELDS.items()
 }
 
+GROUP_BENEFIT_PAYEE_PRIMARY_RECIPIENT = "PRIMARY_RECIPIENT"
+GROUP_BENEFIT_PAYEE_PRIMARY_WORKER = "PRIMARY_WORKER"
+GROUP_BENEFIT_PAYEES = (GROUP_BENEFIT_PAYEE_PRIMARY_RECIPIENT, GROUP_BENEFIT_PAYEE_PRIMARY_WORKER)
+
 DEFAULT_CONFIG = {
+    # Who is paid a GROUP (household) benefit: the member whose recipient_type is
+    # PRIMARY, or the verified household's primary worker (training programmes).
+    "group_benefit_payee": GROUP_BENEFIT_PAYEE_PRIMARY_RECIPIENT,
     "gql_payment_point_search_perms": ["201001"],
     "gql_payment_point_create_perms": ["201002"],
     "gql_payment_point_update_perms": ["201003"],
@@ -133,6 +140,8 @@ class PayrollConfig(AppConfig):
     payment_gateway_auth_type = None
     payment_gateway_class = None
     receipt_length = None
+    # A stored configuration without this key keeps today's payee.
+    group_benefit_payee = GROUP_BENEFIT_PAYEE_PRIMARY_RECIPIENT
 
     # Only differences in submitted data may be treated as warnings. Identity,
     # payroll-membership, payment-state and payment-reference failures must
@@ -157,6 +166,12 @@ class PayrollConfig(AppConfig):
         """
         Load all config fields that match current AppConfig class fields, all custom fields have to be loaded separately
         """
+        payee = cfg.get("group_benefit_payee", GROUP_BENEFIT_PAYEE_PRIMARY_RECIPIENT)
+        if payee not in GROUP_BENEFIT_PAYEES:
+            raise ValueError(
+                "payroll group_benefit_payee must be one of %s, got %r"
+                % (", ".join(GROUP_BENEFIT_PAYEES), payee)
+            )
         for field in cfg:
             if hasattr(PayrollConfig, field):
                 setattr(PayrollConfig, field, cfg[field])
