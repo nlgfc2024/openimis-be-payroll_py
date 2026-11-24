@@ -87,8 +87,13 @@ class CSVReconciliationAPIView(views.APIView):
                     review_file = service.download_upload_review(
                         upload, file_handler.get_file_content(),
                     )
+                    suffix = (
+                        "_reconciled"
+                        if upload.status == CsvReconciliationUpload.Status.SUCCESS
+                        else "_review"
+                    )
                     response = Response(
-                        headers={"Content-Disposition": f'attachment; filename="{file_name.rsplit(".", 1)[0]}_review.csv"'},
+                        headers={"Content-Disposition": f'attachment; filename="{file_name.rsplit(".", 1)[0]}{suffix}.csv"'},
                         content_type="text/csv",
                     )
                     response.content = review_file.getvalue()
