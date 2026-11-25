@@ -176,21 +176,23 @@ class WithdrawalFeeBandValidationTests(TestCase):
         self, fee_band_manager, provider_manager,
     ):
         provider = SimpleNamespace(id="provider-id", is_active=False)
-        band = self.make_band(provider=provider)
-        band.id = "band-id"
-        band.provider_id = provider.id
-        band.prepared_benefits = MagicMock()
+        band = SimpleNamespace(
+            id="band-id",
+            provider_id=provider.id,
+            prepared_benefits=MagicMock(),
+            save=MagicMock(),
+        )
         band.prepared_benefits.filter.return_value.exists.return_value = False
-        band.save = MagicMock()
         fee_band_manager.select_for_update.return_value.filter.side_effect = [
             SimpleNamespace(first=MagicMock(return_value=band)),
             [],
         ]
         provider_manager.select_for_update.return_value.filter.return_value.first.return_value = provider
 
-        WithdrawalFeeConfigService(
-            SimpleNamespace(username="tester"),
-        ).update_fee_band("band-id", {})
+        with patch.object(WithdrawalFeeConfigService, "_validate_fee_band"):
+            WithdrawalFeeConfigService(
+                SimpleNamespace(username="tester"),
+            ).update_fee_band("band-id", {})
 
         band.save.assert_called_once_with(username="tester")
 
@@ -242,7 +244,7 @@ class WithdrawalFeePreparationTests(TestCase):
         service = PayrollService(user)
 
         with (
-            patch("payroll.services.Payroll.objects.get", return_value=payroll),
+            patch("payroll.services.get_authorized_payroll", return_value=payroll),
             patch("payroll.services.ensure_payroll_is_not_consolidated_source"),
             patch.object(service, "_prepare_withdrawal_fee_snapshots"),
             patch("payroll.services.transaction.on_commit") as on_commit,
@@ -387,7 +389,8 @@ class WithdrawalFeePreparationTests(TestCase):
 
 
 class PaymentReferenceAccessTests(SimpleTestCase):
-    def test_review_download_uses_configured_export_schema_and_audit_columns(self):
+    @patch("payroll.services.get_authorized_payroll")
+    def test_review_download_preserves_uploaded_schema_and_audit_columns(self, authorize):
         service = CsvReconciliationService(None)
         expected_columns = service._reconciliation_export_columns()
         input_columns = [*expected_columns, "Date of Birth", "receipt", "Extra field"]
@@ -399,17 +402,19 @@ class PaymentReferenceAccessTests(SimpleTestCase):
         writer.writerow([*input_values, "1990-01-01", "ref-1", "extra"])
 
         review = service.download_upload_review(
-            SimpleNamespace(),
+            SimpleNamespace(payroll_id="payroll-id"),
             input_file.getvalue().encode(),
         )
         output = list(csv.reader(StringIO(review.getvalue().decode())))
 
-        self.assertEqual(output[0], [*expected_columns, "Validation Status", "Mismatch Reasons"])
+        authorize.assert_called_once_with(service.user, "payroll-id")
+        self.assertEqual(output[0], [
+            *expected_columns, "Date of Birth", "Extra field",
+            "Validation Status", "Mismatch Reasons",
+        ])
         self.assertEqual(output[1][expected_columns.index("Paid")], "Yes")
-        self.assertEqual(output[1][-2:], ["", ""])
-        self.assertNotIn("Date of Birth", output[0])
+        self.assertEqual(output[1][-4:], ["1990-01-01", "extra", "NOT_VALIDATED", ""])
         self.assertNotIn("receipt", output[0])
-        self.assertNotIn("Extra field", output[0])
         self.assertFalse({
             "Matched Record",
             "Paid Record",
@@ -417,7 +422,8 @@ class PaymentReferenceAccessTests(SimpleTestCase):
             "Unmatched Record",
         } & set(output[0]))
 
-    def test_review_download_includes_persisted_row_validation_outcomes(self):
+    @patch("payroll.services.get_authorized_payroll")
+    def test_review_download_includes_persisted_row_validation_outcomes(self, _authorize):
         service = CsvReconciliationService(None)
         expected_columns = service._reconciliation_export_columns()
         input_file = StringIO()
@@ -430,17 +436,21 @@ class PaymentReferenceAccessTests(SimpleTestCase):
                 (2, "INVALID", ["amount_mismatch", "national_id_mismatch"]),
             ]
             review = service.download_upload_review(
-                SimpleNamespace(id="upload-id"),
+                SimpleNamespace(id="upload-id", payroll_id="payroll-id"),
                 input_file.getvalue().encode(),
             )
 
         output = list(csv.reader(StringIO(review.getvalue().decode())))
         self.assertEqual(output[1][-2:], [
             "INVALID",
-            "amount_mismatch, national_id_mismatch",
+            "amount_mismatch; national_id_mismatch",
         ])
 
-    def test_non_admin_review_download_redacts_reference_column(self):
+    @patch("payroll.services.get_authorized_payroll")
+    @patch("payroll.services.ReconciliationUploadRow.objects.filter", return_value=[])
+    def test_non_admin_review_download_redacts_reference_column(
+        self, _rows, _authorized_payroll,
+    ):
         user = SimpleNamespace(
             is_authenticated=True,
             has_perms=lambda _perms: False,
@@ -448,12 +458,18 @@ class PaymentReferenceAccessTests(SimpleTestCase):
         service = CsvReconciliationService(user)
         contents = b"code,receipt,Paid\nBENEFIT-1,provider-ref-1,Yes\n"
 
-        review = service.download_upload_review(SimpleNamespace(), contents)
+        review = service.download_upload_review(
+            SimpleNamespace(payroll_id="payroll-id"), contents,
+        )
 
         self.assertNotIn(b"receipt", review.getvalue().lower())
         self.assertNotIn(b"provider-ref-1", review.getvalue())
 
-    def test_admin_review_download_also_hides_reference_column(self):
+    @patch("payroll.services.get_authorized_payroll")
+    @patch("payroll.services.ReconciliationUploadRow.objects.filter", return_value=[])
+    def test_admin_review_download_also_hides_reference_column(
+        self, _rows, _authorized_payroll,
+    ):
         user = SimpleNamespace(
             is_authenticated=True,
             has_perms=lambda _perms: True,
@@ -462,7 +478,9 @@ class PaymentReferenceAccessTests(SimpleTestCase):
         contents = b"code,receipt,Paid\nBENEFIT-1,provider-ref-1,Yes\n"
 
         with patch("payroll.apps.PayrollConfig.gql_withdrawal_fee_manage_perms", ["202005"]):
-            review = service.download_upload_review(SimpleNamespace(), contents)
+            review = service.download_upload_review(
+                SimpleNamespace(payroll_id="payroll-id"), contents,
+            )
 
         self.assertNotIn(b"receipt", review.getvalue().lower())
         self.assertNotIn(b"provider-ref-1", review.getvalue())

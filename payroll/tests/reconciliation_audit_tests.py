@@ -7,8 +7,9 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 
 from django.test import TestCase
-from django.core.exceptions import ValidationError
+from django.core.exceptions import PermissionDenied, ValidationError
 
+from core.service_signals import ServiceSignalBindType
 from tasks_management.models import Task
 from payroll.apps import DEFAULT_CONFIG, KYC_PAYMENT_DETAILS_FIELD_MAPPING, PayrollConfig
 from payroll import signals
@@ -413,7 +414,7 @@ class ReconciliationAuditPolicyTests(TestCase):
             service._validate_dataframe(dataframe)
 
     def test_review_download_preserves_uploaded_columns_and_audit_defaults(self):
-        upload = SimpleNamespace(id="upload-id")
+        upload = SimpleNamespace(id="upload-id", payroll_id="payroll-id")
         contents = (
             b"Code,Date of Birth,receipt,Custom field,Paid\n"
             b"BENEFIT-1,1990-01-01,private-reference,shown,Yes\n"
@@ -425,7 +426,9 @@ class ReconciliationAuditPolicyTests(TestCase):
         ]
         service = CsvReconciliationService(None)
 
-        with patch("payroll.services.ReconciliationUploadRow.objects.filter", return_value=rows):
+        with patch("payroll.services.get_authorized_payroll"), patch(
+            "payroll.services.ReconciliationUploadRow.objects.filter", return_value=rows,
+        ):
             review = pd.read_csv(service.download_upload_review(upload, contents), dtype=str)
 
         self.assertIn("Date of Birth", review.columns)
@@ -521,7 +524,12 @@ class ReconciliationAuditPolicyTests(TestCase):
             individual=individual,
         )
 
-        result = BenefitConsumptionGQLType.resolve_project_name(benefit, None)
+        info = SimpleNamespace(context=SimpleNamespace(user=SimpleNamespace()))
+        with patch(
+            "payroll.gql_queries.filter_payroll_queryset",
+            side_effect=lambda queryset, *_args: queryset,
+        ):
+            result = BenefitConsumptionGQLType.resolve_project_name(benefit, info)
 
         self.assertEqual(result, "Source project")
         link_manager.filter.assert_called_once_with(
@@ -959,7 +967,9 @@ class ReconciliationAuditPolicyTests(TestCase):
                 return_value=benefits_query,
             ),
         ):
-            context = CsvReconciliationService._reconciliation_task_context(consolidated_payroll)
+            context = CsvReconciliationService(None)._reconciliation_task_context(
+                consolidated_payroll
+            )
 
         self.assertEqual(context["district"], "Karonga, Mzimba")
         self.assertEqual(
@@ -967,10 +977,128 @@ class ReconciliationAuditPolicyTests(TestCase):
             ["Payroll One", "Payroll Two"],
         )
 
+    def test_reject_approved_consolidated_payroll_uses_user_scoped_context(self):
+        payroll = SimpleNamespace(
+            id="consolidated-id",
+            payroll_type=Payroll.PayrollType.CONSOLIDATED,
+        )
+        user = SimpleNamespace(id="user-id", login_name="user", username="user")
+        task_context = {
+            "included_payrolls": [],
+            "consolidated": True,
+            "district": None,
+            "phase": None,
+        }
+
+        with (
+            patch(
+                "payroll.consolidation.ensure_payroll_is_not_consolidated_source",
+            ),
+            patch(
+                "core.services.utils.serviceUtils.model_representation",
+                return_value={"id": payroll.id},
+            ),
+            patch.object(StrategyOfPaymentInterface, "change_status_of_payroll"),
+            patch.object(
+                CsvReconciliationService,
+                "_reconciliation_task_context",
+                autospec=True,
+                return_value=task_context,
+            ) as context,
+            patch.object(
+                PayrollService,
+                "create_accept_payroll_task",
+            ) as create_task,
+        ):
+            StrategyOfPaymentInterface.reject_approved_payroll(payroll, user)
+
+        service, context_payroll = context.call_args.args
+        self.assertIsInstance(service, CsvReconciliationService)
+        self.assertIs(service.user, user)
+        self.assertIs(context_payroll, payroll)
+        create_task.assert_called_once_with(
+            payroll.id,
+            {"id": payroll.id, **task_context},
+        )
+
     def test_task_failure_handler_has_task_service_available(self):
         # The reconciliation completion signal uses this service to change a
         # checker task to FAILED when applying its upload raises an error.
         self.assertIsNotNone(signals.TaskService)
+
+    def test_payroll_task_authorization_runs_before_completion(self):
+        user = SimpleNamespace(id="user-id")
+        task = SimpleNamespace(
+            id="task-id",
+            business_event=PayrollConfig.payroll_accept_event,
+            entity_id="payroll-id",
+        )
+        task_query = MagicMock()
+        task_query.first.return_value = task
+
+        with (
+            patch(
+                "payroll.signals.benefit_plan_access_control_enabled",
+                return_value=True,
+            ),
+            patch("payroll.signals.Task.objects.filter", return_value=task_query),
+            patch(
+                "payroll.signals.get_authorized_payroll",
+                side_effect=PermissionDenied("unauthorized"),
+            ) as authorize,
+        ):
+            with self.assertRaises(PermissionDenied):
+                signals._authorize_payroll_task_completion(
+                    cls_=SimpleNamespace(user=user),
+                    data=[({"id": task.id},), {}],
+                )
+
+        authorize.assert_called_once_with(user, task.entity_id)
+
+    def test_authorized_payroll_approval_still_runs_after_completion(self):
+        user = SimpleNamespace(id="user-id")
+        payroll = SimpleNamespace(id="payroll-id", payment_method="offline")
+        strategy = SimpleNamespace(accept_payroll=MagicMock())
+        with patch("payroll.signals.bind_service_signal") as bind_service_signal:
+            signals.bind_service_signals()
+        handler = next(
+            call.args[1]
+            for call in bind_service_signal.call_args_list
+            if (
+                call.args[1].__name__ == "on_task_complete_accept_payroll"
+                and call.kwargs["bind_type"] == ServiceSignalBindType.AFTER
+            )
+        )
+
+        with (
+            patch(
+                "payroll.signals.benefit_plan_access_control_enabled",
+                return_value=True,
+            ),
+            patch("payroll.signals.User.objects.get", return_value=user),
+            patch(
+                "payroll.signals.get_authorized_payroll",
+                return_value=payroll,
+            ),
+            patch(
+                "payroll.signals.PaymentMethodStorage.get_chosen_payment_method",
+                return_value=strategy,
+            ),
+        ):
+            handler(result={
+                "success": True,
+                "data": {
+                    "user": {"id": user.id},
+                    "task": {
+                        "id": "task-id",
+                        "business_event": PayrollConfig.payroll_accept_event,
+                        "entity_id": payroll.id,
+                        "status": Task.Status.COMPLETED,
+                    },
+                },
+            })
+
+        strategy.accept_payroll.assert_called_once_with(payroll, user)
 
     def test_completed_offline_reconciliation_rechecks_source_membership(self):
         user = SimpleNamespace(id="user-id", login_name="user")
@@ -1261,7 +1389,9 @@ class ReconciliationPayrollStatusTests(TestCase):
             ).exists(),
         )
         self.assertEqual(
-            CsvReconciliationService._get_source_payrolls_by_benefit(consolidated)[benefit.id],
+            CsvReconciliationService(self.user)._get_source_payrolls_by_benefit(
+                consolidated
+            )[benefit.id],
             source,
         )
 

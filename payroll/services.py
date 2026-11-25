@@ -51,6 +51,15 @@ from payroll.models import (
 )
 from payroll.tasks import send_requests_to_gateway_payment
 from payroll.utils import PayrollNameGenerator
+from payroll.benefit_plan_access import (
+    filter_payroll_queryset,
+    get_authorized_payroll,
+    require_benefit_access,
+    require_payment_plan_access,
+    require_payroll_access,
+    task_ownership_for_benefit,
+    task_ownership_for_payroll,
+)
 from payroll.validation import PaymentPointValidation, PayrollValidation, BenefitConsumptionValidation
 from calculation.services import get_calculation_object
 from core.services.utils import output_exception, check_authentication
@@ -438,22 +447,23 @@ class PayrollService(BaseService):
     @check_authentication
     @register_service_signal('payroll_service.delete')
     def delete(self, obj_data):
-        payroll_to_delete = Payroll.objects.get(id=obj_data['id'])
+        payroll_to_delete = get_authorized_payroll(self.user, obj_data['id'])
         ensure_payroll_is_not_consolidated_source(payroll_to_delete, "delete")
         data = {'id': payroll_to_delete.id}
-        TaskService(self.user).create({
+        TaskService(self.user, trusted_internal=True).create({
             'source': 'payroll_delete',
             'entity': payroll_to_delete,
             'status': Task.Status.RECEIVED,
             'executor_action_event': TasksManagementConfig.default_executor_event,
             'business_event': PayrollConfig.payroll_delete_event,
-            'data': _get_std_task_data_payload(data)
+            'data': _get_std_task_data_payload(data),
+            **task_ownership_for_payroll(payroll_to_delete),
         })
 
     @check_authentication
     @register_service_signal('payroll_service.attach_benefit_to_payroll')
     def attach_benefit_to_payroll(self, payroll_id, benefit_id):
-        payroll = Payroll.objects.get(id=payroll_id, is_deleted=False)
+        payroll = get_authorized_payroll(self.user, payroll_id)
         ensure_payroll_is_not_consolidated_source(payroll, "change")
         active_links = PayrollBenefitConsumption.objects.filter(
             benefit_id=benefit_id,
@@ -470,15 +480,16 @@ class PayrollService(BaseService):
 
     @register_service_signal('payroll_service.create_task')
     def create_accept_payroll_task(self, payroll_id, obj_data):
-        payroll_to_accept = Payroll.objects.get(id=payroll_id)
+        payroll_to_accept = get_authorized_payroll(self.user, payroll_id)
         data = {**obj_data, 'id': payroll_id}
-        task = TaskService(self.user).create({
+        task = TaskService(self.user, trusted_internal=True).create({
             'source': 'payroll',
             'entity': payroll_to_accept,
             'status': Task.Status.RECEIVED,
             'executor_action_event': TasksManagementConfig.default_executor_event,
             'business_event': PayrollConfig.payroll_accept_event,
-            'data': _get_std_task_data_payload(data)
+            'data': _get_std_task_data_payload(data),
+            **task_ownership_for_payroll(payroll_to_accept),
         })
         if not task.get("success", False):
             raise ValueError(task.get("error") or "Unable to create payroll approval task")
@@ -489,6 +500,8 @@ class PayrollService(BaseService):
         """Create a parent payroll without cloning the source benefits."""
         if not source_payroll_ids:
             raise ValidationError("Select at least one approved payroll to consolidate.")
+        from payroll.benefit_plan_access import require_benefit_plan_access
+        require_benefit_plan_access(self.user, benefit_plan_id)
         district = Location.objects.select_for_update().get(
             uuid=district_id,
             validity_to__isnull=True,
@@ -497,13 +510,13 @@ class PayrollService(BaseService):
             raise ValidationError(
                 "You are not allowed to consolidate payrolls in this district."
             )
-        sources = list(Payroll.objects.select_for_update().filter(
+        sources = list(filter_payroll_queryset(Payroll.objects.select_for_update().filter(
             id__in=source_payroll_ids,
             payment_plan__benefit_plan_id=benefit_plan_id,
             status=PayrollStatus.APPROVE_FOR_PAYMENT,
             payroll_type=Payroll.PayrollType.STANDARD,
             is_deleted=False,
-        ))
+        ), self.user))
         # Load related objects separately after locking to avoid "FOR UPDATE cannot be 
         # applied to the nullable side of an outer join" error on PostgreSQL.
         # Fetch payment plans, cycles, and points for all sources in bulk.
@@ -677,34 +690,36 @@ class PayrollService(BaseService):
 
     @register_service_signal('payroll_service.close_payroll')
     def close_payroll(self, obj_data):
-        payroll_to_close = Payroll.objects.get(id=obj_data['id'])
+        payroll_to_close = get_authorized_payroll(self.user, obj_data['id'])
         ensure_payroll_is_not_consolidated_source(payroll_to_close, "reconcile")
         data = {'id': payroll_to_close.id}
-        TaskService(self.user).create({
+        TaskService(self.user, trusted_internal=True).create({
             'source': 'payroll_reconciliation',
             'entity': payroll_to_close,
             'status': Task.Status.RECEIVED,
             'executor_action_event': TasksManagementConfig.default_executor_event,
             'business_event': PayrollConfig.payroll_reconciliation_event,
-            'data': _get_std_task_data_payload(data)
+            'data': _get_std_task_data_payload(data),
+            **task_ownership_for_payroll(payroll_to_close),
         })
 
     @register_service_signal('payroll_service.reject_approve_payroll')
     def reject_approved_payroll(self, obj_data):
-        payroll_to_reject = Payroll.objects.get(id=obj_data['id'])
+        payroll_to_reject = get_authorized_payroll(self.user, obj_data['id'])
         ensure_payroll_is_not_consolidated_source(payroll_to_reject, "reject")
         data = {'id': payroll_to_reject.id}
-        TaskService(self.user).create({
+        TaskService(self.user, trusted_internal=True).create({
             'source': 'payroll_reject',
             'entity': payroll_to_reject,
             'status': Task.Status.RECEIVED,
             'executor_action_event': TasksManagementConfig.default_executor_event,
             'business_event': PayrollConfig.payroll_reject_event,
-            'data': _get_std_task_data_payload(data)
+            'data': _get_std_task_data_payload(data),
+            **task_ownership_for_payroll(payroll_to_reject),
         })
 
     def make_payment_for_payroll(self, obj_data):
-        payroll = Payroll.objects.get(id=obj_data['id'], is_deleted=False)
+        payroll = get_authorized_payroll(self.user, obj_data['id'])
         ensure_payroll_is_not_consolidated_source(payroll, "pay")
         self._prepare_withdrawal_fee_snapshots(payroll)
         transaction.on_commit(
@@ -850,6 +865,7 @@ class PayrollService(BaseService):
     def _get_payment_plan(self, obj_data):
         payment_plan_id = obj_data.get("payment_plan_id")
         payment_plan = PaymentPlan.objects.get(id=payment_plan_id)
+        require_payment_plan_access(self.user, payment_plan)
         return payment_plan
 
     def _get_payment_cycle(self, obj_data):
@@ -1209,7 +1225,8 @@ class PayrollService(BaseService):
 
     @transaction.atomic
     def _move_benefit_consumptions(self, payroll, from_payroll_id):
-        source_payroll = Payroll.objects.select_for_update().get(id=from_payroll_id)
+        require_payroll_access(self.user, payroll)
+        source_payroll = get_authorized_payroll(self.user, from_payroll_id, for_update=True)
         if source_payroll.payroll_type == Payroll.PayrollType.CONSOLIDATED:
             raise ValidationError("Cannot move benefits from a consolidated payroll.")
         ensure_payroll_is_not_consolidated_source(source_payroll, "move benefits from")
@@ -1255,30 +1272,42 @@ class BenefitConsumptionService(BaseService):
     @register_service_signal('benefit_consumption_service.update')
     def update(self, obj_data):
         benefit = BenefitConsumption.objects.get(id=obj_data["id"], is_deleted=False)
+        require_benefit_access(self.user, benefit)
         ensure_benefit_is_not_in_active_consolidation(benefit, "update")
         return super().update(obj_data)
 
     @check_authentication
     @register_service_signal('benefit_consumption_service.delete')
+    @transaction.atomic
     def delete(self, obj_data):
         benefit_to_delete = BenefitConsumption.objects.get(id=obj_data['id'])
+        require_benefit_access(self.user, benefit_to_delete)
         ensure_benefit_is_not_in_active_consolidation(benefit_to_delete, "delete")
+        ownership = task_ownership_for_benefit(benefit_to_delete)
         benefit_to_delete.status = BenefitConsumptionStatus.PENDING_DELETION
         benefit_to_delete.save(user=self.user)
         data = {'id': benefit_to_delete.id}
-        TaskService(self.user).create({
+        task = TaskService(self.user, trusted_internal=True).create({
             'source': 'benefit_delete',
             'entity': benefit_to_delete,
             'status': Task.Status.RECEIVED,
             'executor_action_event': TasksManagementConfig.default_executor_event,
             'business_event': PayrollConfig.benefit_delete_event,
-            'data': _get_std_task_data_payload(data)
+            'data': _get_std_task_data_payload(data),
+            **ownership,
         })
+        if not task or not task.get("success", False):
+            raise ValidationError(
+                (task.get("detail") if task else None)
+                or "Unable to create Benefit deletion Task."
+            )
+        return task
 
     @check_authentication
     @register_service_signal('benefit_consumption_service.create_or_update_benefit_attachment')
     def create_or_update_benefit_attachment(self, bills_queryset, benefit_id):
         benefit = BenefitConsumption.objects.get(id=benefit_id, is_deleted=False)
+        require_benefit_access(self.user, benefit)
         ensure_benefit_is_not_in_active_consolidation(benefit, "change attachments for")
         # remove first old attachments and save the new one
         BenefitAttachment.objects.filter(benefit_id=benefit_id).delete()
@@ -1540,14 +1569,13 @@ class CsvReconciliationService:
         ).select_related("micro_catchment").first()
         return project.micro_catchment.name if project and project.micro_catchment else None
 
-    @staticmethod
-    def _get_source_payrolls_by_benefit(payroll):
+    def _get_source_payrolls_by_benefit(self, payroll):
         if payroll.payroll_type != Payroll.PayrollType.CONSOLIDATED:
             return {}
-        members = list(ConsolidatedPayrollMember.objects.filter(
+        members = list(ConsolidatedPayrollMember.get_queryset(ConsolidatedPayrollMember.objects.filter(
             consolidated_payroll=payroll,
             consolidated_payroll__is_deleted=False,
-        ).exclude(
+        ), self.user).exclude(
             consolidated_payroll__status=PayrollStatus.REJECTED,
         ).select_related("source_payroll"))
         source_payrolls = {member.source_payroll_id: member.source_payroll for member in members}
@@ -1595,9 +1623,9 @@ class CsvReconciliationService:
         upload.status = CsvReconciliationUpload.Status.VALIDATING
         upload.save(username=self.user.login_name)
 
-        duplicate = CsvReconciliationUpload.objects.filter(
+        duplicate = CsvReconciliationUpload.get_queryset(CsvReconciliationUpload.objects.filter(
             checksum=upload.checksum, is_deleted=False,
-        ).exclude(
+        ), self.user).exclude(
             id=upload.id,
         ).exclude(
             status__in=[
@@ -1643,9 +1671,9 @@ class CsvReconciliationService:
         benefits_by_code, contexts_by_benefit_id = self._load_upload_context(payroll, codes)
         source_payroll_by_benefit = {}
         if payroll.payroll_type == Payroll.PayrollType.CONSOLIDATED:
-            member_ids = ConsolidatedPayrollMember.objects.filter(
+            member_ids = ConsolidatedPayrollMember.get_queryset(ConsolidatedPayrollMember.objects.filter(
                 consolidated_payroll=payroll,
-            ).values_list("source_payroll_id", flat=True)
+            ), self.user).values_list("source_payroll_id", flat=True)
             source_payroll_by_benefit = dict(PayrollBenefitConsumption.objects.filter(
                 payroll_id__in=member_ids, is_deleted=False,
             ).values_list("benefit_id", "payroll_id"))
@@ -1751,7 +1779,7 @@ class CsvReconciliationService:
             return BytesIO(contents), errors or None, self._upload_summary(upload)
 
         task_context = self._reconciliation_task_context(payroll)
-        task = TaskService(self.user).create({
+        task = TaskService(self.user, trusted_internal=True).create({
             "source": "payroll_reconciliation", "entity": payroll,
             "status": Task.Status.RECEIVED,
             "executor_action_event": TasksManagementConfig.default_executor_event,
@@ -1766,20 +1794,20 @@ class CsvReconciliationService:
                 "phase": task_context["phase"],
                 "summary": self._upload_summary(upload),
             }),
+            **task_ownership_for_payroll(payroll),
         })
         if not task.get("success", False):
             raise ValueError(task.get("error") or "Unable to create reconciliation review task")
         return BytesIO(contents), errors or None, self._upload_summary(upload)
 
-    @staticmethod
-    def _reconciliation_task_context(payroll):
+    def _reconciliation_task_context(self, payroll):
         """Return the payroll's phase, district, and source-payroll review context."""
         consolidated = payroll.payroll_type == Payroll.PayrollType.CONSOLIDATED
         if consolidated:
-            members = list(ConsolidatedPayrollMember.objects.filter(
+            members = list(ConsolidatedPayrollMember.get_queryset(ConsolidatedPayrollMember.objects.filter(
                 consolidated_payroll=payroll,
                 source_payroll__is_deleted=False,
-            ).select_related("source_payroll").order_by("source_payroll__name"))
+            ), self.user).select_related("source_payroll").order_by("source_payroll__name"))
             source_payrolls = [member.source_payroll for member in members]
         else:
             members = []
@@ -1940,7 +1968,7 @@ class CsvReconciliationService:
 
     @transaction.atomic
     def apply_upload(self, upload):
-        payroll = Payroll.objects.select_for_update().get(id=upload.payroll_id)
+        payroll = get_authorized_payroll(self.user, upload.payroll_id, for_update=True)
         upload = CsvReconciliationUpload.objects.select_for_update().get(id=upload.id)
         if upload.status != CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION:
             return
@@ -2029,6 +2057,7 @@ class CsvReconciliationService:
 
     def download_upload_review(self, upload, contents):
         """Return the uploaded CSV with review outcomes and no payment references."""
+        get_authorized_payroll(self.user, upload.payroll_id)
         try:
             df = pd.read_csv(BytesIO(contents), dtype=str, keep_default_na=False)
         except Exception as exc:
@@ -2256,10 +2285,7 @@ class CsvReconciliationService:
     def _resolve_payroll(self, payroll_id):
         if not payroll_id:
             raise ValueError('csv_reconciliation.validation.payroll_id_required')
-        payroll = Payroll.objects.filter(id=payroll_id, is_deleted=False).first()
-        if not payroll:
-            raise ValueError('csv_reconciliation.validation.payroll_not_found')
-        return payroll
+        return get_authorized_payroll(self.user, payroll_id)
 
     def _reconcile_bc(self, row, bc, reconciliation_fields=None):
         bc.status = BenefitConsumptionStatus.RECONCILED

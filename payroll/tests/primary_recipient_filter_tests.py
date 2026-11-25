@@ -121,6 +121,7 @@ class PrimaryRecipientFilterTests(SimpleTestCase):
                 "account_number": "00123456",
                 "account_name": "Ada Lovelace",
                 "bank": "Example Bank",
+                "payment_provider_code": "example-bank",
             }),
             save=MagicMock(),
         )
@@ -137,6 +138,7 @@ class PrimaryRecipientFilterTests(SimpleTestCase):
                 "account_number": "00123456",
                 "account_name": "Ada Lovelace",
                 "bank": "Example Bank",
+                "payment_provider_code": "example-bank",
             },
         })
 
@@ -163,6 +165,7 @@ class PrimaryRecipientFilterTests(SimpleTestCase):
                 "account_number": None,
                 "account_name": None,
                 "bank": None,
+                "payment_provider_code": None,
             },
         })
         benefit.save.assert_called_once()

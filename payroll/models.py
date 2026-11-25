@@ -115,17 +115,32 @@ class Payroll(HistoryBusinessModel):
     def __str__(self):
         return f"Payroll {self.name} - {self.uuid}"
 
+    @classmethod
+    def get_queryset(cls, queryset, user):
+        from payroll.benefit_plan_access import filter_payroll_queryset
+        return filter_payroll_queryset(queryset, user)
+
 
 class PayrollBill(HistoryModel):
     # 1:n it is ensured by the service
     payroll = models.ForeignKey(Payroll, on_delete=models.DO_NOTHING)
     bill = models.ForeignKey(Bill, on_delete=models.DO_NOTHING)
 
+    @classmethod
+    def get_queryset(cls, queryset, user):
+        from payroll.benefit_plan_access import filter_payroll_queryset
+        return filter_payroll_queryset(queryset, user, "payroll")
+
 
 class PaymentAdaptorHistory(HistoryModel):
     payroll = models.ForeignKey(Payroll, on_delete=models.DO_NOTHING)
     total_amount = models.CharField(max_length=255, blank=True, null=True)
     bills_ids = models.JSONField()
+
+    @classmethod
+    def get_queryset(cls, queryset, user):
+        from payroll.benefit_plan_access import filter_payroll_queryset
+        return filter_payroll_queryset(queryset, user, "payroll")
 
 
 class BenefitConsumption(HistoryBusinessModel):
@@ -162,16 +177,31 @@ class BenefitConsumption(HistoryBusinessModel):
     def __str__(self):
         return f"Benefit Consumption {self.code} - {self.receipt} - {self.amount}"
 
+    @classmethod
+    def get_queryset(cls, queryset, user):
+        from payroll.benefit_plan_access import filter_benefit_queryset
+        return filter_benefit_queryset(queryset, user)
+
 
 class BenefitAttachment(HistoryBusinessModel):
     benefit = models.ForeignKey(BenefitConsumption, on_delete=models.DO_NOTHING)
     bill = models.ForeignKey(Bill, on_delete=models.DO_NOTHING)
+
+    @classmethod
+    def get_queryset(cls, queryset, user):
+        from payroll.benefit_plan_access import filter_benefit_queryset
+        return filter_benefit_queryset(queryset, user, "benefit")
 
 
 class PayrollBenefitConsumption(HistoryModel):
     # Standard payrolls own their benefits; consolidated payrolls share source links.
     payroll = models.ForeignKey(Payroll, on_delete=models.DO_NOTHING)
     benefit = models.ForeignKey(BenefitConsumption, on_delete=models.DO_NOTHING)
+
+    @classmethod
+    def get_queryset(cls, queryset, user):
+        from payroll.benefit_plan_access import filter_payroll_queryset
+        return filter_payroll_queryset(queryset, user, "payroll")
 
 
 class ConsolidatedPayrollMember(HistoryModel):
@@ -184,6 +214,12 @@ class ConsolidatedPayrollMember(HistoryModel):
     )
     beneficiaries_count = models.PositiveIntegerField(default=0)
     total_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+
+    @classmethod
+    def get_queryset(cls, queryset, user):
+        from payroll.benefit_plan_access import filter_payroll_queryset
+        queryset = filter_payroll_queryset(queryset, user, "consolidated_payroll")
+        return filter_payroll_queryset(queryset, user, "source_payroll")
 
 
 class CsvReconciliationUpload(HistoryModel):
@@ -211,6 +247,11 @@ class CsvReconciliationUpload(HistoryModel):
     unpaid_records = models.PositiveIntegerField(default=0)
     unmatched_records = models.PositiveIntegerField(default=0)
 
+    @classmethod
+    def get_queryset(cls, queryset, user):
+        from payroll.benefit_plan_access import filter_payroll_queryset
+        return filter_payroll_queryset(queryset, user, "payroll")
+
 
 class ReconciliationUploadRow(HistoryModel):
     class Status(models.TextChoices):
@@ -225,6 +266,11 @@ class ReconciliationUploadRow(HistoryModel):
     submitted_data = models.JSONField(default=dict)
     mismatch_reasons = models.JSONField(default=list, blank=True)
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.VALID)
+
+    @classmethod
+    def get_queryset(cls, queryset, user):
+        from payroll.benefit_plan_access import filter_payroll_queryset
+        return filter_payroll_queryset(queryset, user, "upload__payroll")
 
 
 class PayrollMutation(UUIDModel, ObjectMutation):

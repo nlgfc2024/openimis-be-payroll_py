@@ -29,6 +29,7 @@ from payment_cycle.gql_queries import PaymentCycleGQLType
 from social_protection.models import BenefitPlan
 from tasks_management.models import Task
 from payroll.utils import get_micro_catchment_name
+from payroll.benefit_plan_access import filter_payroll_queryset, filter_benefit_queryset
 
 
 def _get_withdrawal_fee_preview(benefit, info):
@@ -87,7 +88,7 @@ def _json_ext_value(individual, *keys):
     return None
 
 
-def benefit_consumption_queryset(queryset):
+def benefit_consumption_queryset(queryset, user=None):
     """Load data used by payroll-context resolvers in fixed-size queries."""
     BeneficiaryProjectEnrollment = apps.get_model(
         "project_social_protection", "BeneficiaryProjectEnrollment",
@@ -101,17 +102,20 @@ def benefit_consumption_queryset(queryset):
     beneficiaries = Beneficiary.objects.filter(is_deleted=False).prefetch_related(
         Prefetch("project_enrollments", queryset=enrollments, to_attr="active_project_enrollments"),
     )
-    return queryset.select_related(
+    payroll_links = PayrollBenefitConsumption.objects.filter(
+        is_deleted=False,
+        payroll__is_deleted=False,
+        payroll__payroll_type=Payroll.PayrollType.STANDARD,
+    )
+    if user is not None:
+        payroll_links = filter_payroll_queryset(payroll_links, user, "payroll")
+    return filter_benefit_queryset(queryset, user).select_related(
         "individual__location__parent__parent__parent",
     ).prefetch_related(
         Prefetch("individual__beneficiary_set", queryset=beneficiaries, to_attr="active_beneficiaries"),
         Prefetch(
             "payrollbenefitconsumption_set",
-            queryset=PayrollBenefitConsumption.objects.filter(
-                is_deleted=False,
-                payroll__is_deleted=False,
-                payroll__payroll_type=Payroll.PayrollType.STANDARD,
-            ).select_related("payroll").order_by("-date_created"),
+            queryset=payroll_links.select_related("payroll").order_by("-date_created"),
             to_attr="active_payroll_links",
         ),
     )
@@ -190,6 +194,10 @@ class BenefitAttachmentGQLType(DjangoObjectType):
         }
         connection_class = ExtendedConnection
 
+    @classmethod
+    def get_queryset(cls, queryset, info):
+        return BenefitAttachment.get_queryset(queryset, info)
+
 
 class BenefitConsumptionGQLType(DjangoObjectType):
     uuid = graphene.String(source='uuid')
@@ -236,11 +244,15 @@ class BenefitConsumptionGQLType(DjangoObjectType):
         }
         connection_class = ExtendedConnection
 
+    @classmethod
+    def get_queryset(cls, queryset, info):
+        return BenefitConsumption.get_queryset(queryset, info)
+
     def resolve_benefit_attachment(self, info):
-        return BenefitAttachment.objects.filter(
+        return BenefitAttachment.get_queryset(BenefitAttachment.objects.filter(
             benefit_id=self.id,
             is_deleted=False
-        )
+        ), info)
 
     def resolve_national_id(self, info):
         return _json_ext_value(self.individual, "national_id", "nationalId", "nid")
@@ -320,10 +332,14 @@ class BenefitConsumptionGQLType(DjangoObjectType):
         from project_social_protection.models import Project
 
         payroll_links = getattr(self, "active_payroll_links", None)
-        payroll_link = payroll_links[0] if payroll_links else self.payrollbenefitconsumption_set.filter(
+        fallback_links = self.payrollbenefitconsumption_set.filter(
             is_deleted=False, payroll__is_deleted=False,
             payroll__payroll_type=Payroll.PayrollType.STANDARD,
-        ).select_related("payroll").order_by("-date_created").first()
+        )
+        fallback_links = filter_payroll_queryset(fallback_links, info.context.user, "payroll")
+        payroll_link = payroll_links[0] if payroll_links else fallback_links.select_related(
+            "payroll"
+        ).order_by("-date_created").first()
         project_ids = (
             (payroll_link.payroll.json_ext or {}).get("filter_criteria", {}).get("project_ids", [])
             if payroll_link else []
@@ -388,6 +404,10 @@ class PayrollGQLType(DjangoObjectType):
         }
         connection_class = ExtendedConnection
 
+    @classmethod
+    def get_queryset(cls, queryset, info):
+        return Payroll.get_queryset(queryset, info)
+
     def resolve_benefit_consumption(self, info):
         return benefit_consumption_queryset(BenefitConsumption.objects.filter(
             payrollbenefitconsumption__payroll__id=self.id,
@@ -395,7 +415,7 @@ class PayrollGQLType(DjangoObjectType):
             payrollbenefitconsumption__is_deleted=False,
             individual__groupindividuals__recipient_type="PRIMARY",
             individual__groupindividuals__is_deleted=False,
-        ).distinct())
+        ).distinct(), info.context.user)
 
     def resolve_benefit_plan_name_code(self, info):
         benefit_plan = BenefitPlan.objects.get(id=self.payment_plan.benefit_plan.id, is_deleted=False)
@@ -410,9 +430,9 @@ class PayrollGQLType(DjangoObjectType):
             "source_payroll_status": member.source_payroll.status,
             "beneficiaries_count": member.beneficiaries_count,
             "total_amount": member.total_amount,
-        } for member in ConsolidatedPayrollMember.objects.filter(
+        } for member in ConsolidatedPayrollMember.get_queryset(ConsolidatedPayrollMember.objects.filter(
             consolidated_payroll=self,
-        ).select_related("source_payroll")]
+        ), info).select_related("source_payroll")]
 
 
 class PaymentMethodGQLType(graphene.ObjectType):
@@ -448,6 +468,10 @@ class BenefitAttachmentListGQLType(DjangoObjectType):
             "version": ["exact"],
         }
         connection_class = ExtendedConnection
+
+    @classmethod
+    def get_queryset(cls, queryset, info):
+        return BenefitAttachment.get_queryset(queryset, info)
 
 
 class CsvReconciliationUploadGQLType(DjangoObjectType):
@@ -491,6 +515,10 @@ class CsvReconciliationUploadGQLType(DjangoObjectType):
         }
         connection_class = ExtendedConnection
 
+    @classmethod
+    def get_queryset(cls, queryset, info):
+        return CsvReconciliationUpload.get_queryset(queryset, info)
+
 
 class ReconciliationUploadRowGQLType(DjangoObjectType):
     uuid = graphene.String(source='uuid')
@@ -509,6 +537,10 @@ class ReconciliationUploadRowGQLType(DjangoObjectType):
         }
         connection_class = ExtendedConnection
 
+    @classmethod
+    def get_queryset(cls, queryset, info):
+        return ReconciliationUploadRow.get_queryset(queryset, info)
+
 
 class PayrollBenefitConsumptionGQLType(DjangoObjectType):
 
@@ -525,6 +557,10 @@ class PayrollBenefitConsumptionGQLType(DjangoObjectType):
             "version": ["exact"],
         }
         connection_class = ExtendedConnection
+
+    @classmethod
+    def get_queryset(cls, queryset, info):
+        return PayrollBenefitConsumption.get_queryset(queryset, info)
 
 
 class BenefitsSummaryGQLType(graphene.ObjectType):
