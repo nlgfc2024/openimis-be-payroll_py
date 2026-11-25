@@ -1,5 +1,7 @@
+import csv
 from datetime import date
 from decimal import Decimal
+from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -387,6 +389,63 @@ class WithdrawalFeePreparationTests(TestCase):
 
 
 class PaymentReferenceAccessTests(SimpleTestCase):
+    @patch("payroll.services.get_authorized_payroll")
+    def test_review_download_preserves_uploaded_schema_and_audit_columns(self, authorize):
+        service = CsvReconciliationService(None)
+        expected_columns = service._reconciliation_export_columns()
+        input_columns = [*expected_columns, "Date of Birth", "receipt", "Extra field"]
+        input_file = StringIO()
+        writer = csv.writer(input_file)
+        writer.writerow(input_columns)
+        input_values = ["value"] * len(expected_columns)
+        input_values[expected_columns.index("Paid")] = "Yes"
+        writer.writerow([*input_values, "1990-01-01", "ref-1", "extra"])
+
+        review = service.download_upload_review(
+            SimpleNamespace(payroll_id="payroll-id"),
+            input_file.getvalue().encode(),
+        )
+        output = list(csv.reader(StringIO(review.getvalue().decode())))
+
+        authorize.assert_called_once_with(service.user, "payroll-id")
+        self.assertEqual(output[0], [
+            *expected_columns, "Date of Birth", "Extra field",
+            "Validation Status", "Mismatch Reasons",
+        ])
+        self.assertEqual(output[1][expected_columns.index("Paid")], "Yes")
+        self.assertEqual(output[1][-4:], ["1990-01-01", "extra", "NOT_VALIDATED", ""])
+        self.assertNotIn("receipt", output[0])
+        self.assertFalse({
+            "Matched Record",
+            "Paid Record",
+            "Unpaid Record",
+            "Unmatched Record",
+        } & set(output[0]))
+
+    @patch("payroll.services.get_authorized_payroll")
+    def test_review_download_includes_persisted_row_validation_outcomes(self, _authorize):
+        service = CsvReconciliationService(None)
+        expected_columns = service._reconciliation_export_columns()
+        input_file = StringIO()
+        writer = csv.writer(input_file)
+        writer.writerow(expected_columns)
+        writer.writerow(["value"] * len(expected_columns))
+
+        with patch("payroll.services.ReconciliationUploadRow.objects.filter") as rows:
+            rows.return_value.values_list.return_value = [
+                (2, "INVALID", ["amount_mismatch", "national_id_mismatch"]),
+            ]
+            review = service.download_upload_review(
+                SimpleNamespace(id="upload-id", payroll_id="payroll-id"),
+                input_file.getvalue().encode(),
+            )
+
+        output = list(csv.reader(StringIO(review.getvalue().decode())))
+        self.assertEqual(output[1][-2:], [
+            "INVALID",
+            "amount_mismatch; national_id_mismatch",
+        ])
+
     @patch("payroll.services.get_authorized_payroll")
     @patch("payroll.services.ReconciliationUploadRow.objects.filter", return_value=[])
     def test_non_admin_review_download_redacts_reference_column(

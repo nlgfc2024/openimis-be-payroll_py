@@ -1,8 +1,10 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from django.core.exceptions import ValidationError
 from django.test import SimpleTestCase
 
+from payroll.apps import PayrollConfig
 from payroll.services import CsvReconciliationService, PayrollService
 
 
@@ -58,8 +60,9 @@ class PrimaryRecipientFilterTests(SimpleTestCase):
             enrollments_queryset=enrollments,
         )
 
+    @patch("payroll.services.apps.get_model")
     @patch("payroll.services.Beneficiary.objects.filter")
-    def test_project_payroll_requires_primary_recipient_and_project_enrollment(self, beneficiary_filter):
+    def test_project_payroll_requires_a_payable_individual_and_project_enrollment(self, beneficiary_filter, _get_model):
         initial_queryset = MagicMock()
         project_queryset = MagicMock()
         beneficiary_filter.return_value = initial_queryset
@@ -71,14 +74,10 @@ class PrimaryRecipientFilterTests(SimpleTestCase):
             "json_ext": {"filter_criteria": {"project_ids": ["project-id"]}},
         }, payment_plan)
 
+        # PRIMARY recipients, or individuals who belong to no household.
         initial_queryset.filter.assert_called_once()
-        self.assertEqual(
-            initial_queryset.filter.call_args.kwargs,
-            {
-                "individual__groupindividuals__recipient_type": "PRIMARY",
-                "individual__groupindividuals__is_deleted": False,
-            },
-        )
+        self.assertEqual(len(initial_queryset.filter.call_args.args), 1)
+        self.assertEqual(initial_queryset.filter.call_args.kwargs, {})
         project_queryset.filter.assert_called_once_with(
             project_enrollments__project__id__in=["project-id"],
             project_enrollments__is_deleted=False,
@@ -99,16 +98,19 @@ class PrimaryRecipientFilterTests(SimpleTestCase):
         get_model.assert_called_once_with(
             "project_social_protection", "GroupBeneficiaryProjectEnrollment",
         )
-        get_model.return_value.objects.filter.assert_called_once_with(
+        get_model.return_value.objects.filter.assert_called_once()
+        call = get_model.return_value.objects.filter.call_args
+        self.assertEqual(call.kwargs, dict(
             group_beneficiary__benefit_plan_id="benefit-plan-id",
             group_beneficiary__status="ACTIVE",
             group_beneficiary__is_deleted=False,
             group_beneficiary__group__groupindividuals__recipient_type="PRIMARY",
             group_beneficiary__group__groupindividuals__is_deleted=False,
-            project__status="COMPLETED",
             project__is_deleted=False,
             is_deleted=False,
-        )
+        ))
+        # COMPLETED projects, or TRAINING projects when the project module has them.
+        self.assertIn(("project__status", "COMPLETED"), call.args[0].children)
 
     @patch("payroll.services.BenefitConsumption.objects.filter")
     def test_payment_details_are_snapshotted_once_on_generated_benefits(self, benefit_filter):
@@ -119,6 +121,7 @@ class PrimaryRecipientFilterTests(SimpleTestCase):
                 "account_number": "00123456",
                 "account_name": "Ada Lovelace",
                 "bank": "Example Bank",
+                "payment_provider_code": "example-bank",
             }),
             save=MagicMock(),
         )
@@ -135,6 +138,7 @@ class PrimaryRecipientFilterTests(SimpleTestCase):
                 "account_number": "00123456",
                 "account_name": "Ada Lovelace",
                 "bank": "Example Bank",
+                "payment_provider_code": "example-bank",
             },
         })
 
@@ -161,6 +165,7 @@ class PrimaryRecipientFilterTests(SimpleTestCase):
                 "account_number": None,
                 "account_name": None,
                 "bank": None,
+                "payment_provider_code": None,
             },
         })
         benefit.save.assert_called_once()
@@ -191,6 +196,42 @@ class PrimaryRecipientFilterTests(SimpleTestCase):
 
         self.assertEqual(benefit.individual_id, "recipient-id")
         benefit.save.assert_called_once()
+
+    @patch.object(PayrollConfig, "group_benefit_payee", "PRIMARY_WORKER")
+    @patch("payroll.services.PayrollBenefitConsumption.objects.filter")
+    @patch("payroll.services.BenefitAttachment.objects.filter")
+    @patch("payroll.services.authoritative_primary_worker_memberships")
+    def test_group_benefits_are_reassigned_to_the_primary_worker_when_configured(
+        self, memberships, attachment_filter, payroll_benefit_filter,
+    ):
+        enrollments = MagicMock()
+        enrollments.values_list.return_value = [("beneficiary-id", "group-id")]
+        memberships.return_value.filter.return_value.values_list.return_value = [("group-id", "worker-id")]
+        benefit = SimpleNamespace(id="benefit-id", individual_id="head-id", save=MagicMock())
+        attachment_filter.return_value.select_related.return_value = [SimpleNamespace(
+            benefit=benefit, benefit_id="benefit-id", bill=SimpleNamespace(subject_id="beneficiary-id"),
+        )]
+        payroll_benefit_filter.return_value.values_list.return_value = ["benefit-id"]
+
+        PayrollService(SimpleNamespace(id="user-id"))._assign_group_benefits_to_primary_recipients(
+            SimpleNamespace(id="payroll-id"), enrollments,
+        )
+
+        self.assertEqual(benefit.individual_id, "worker-id")
+
+    @patch.object(PayrollConfig, "group_benefit_payee", "PRIMARY_WORKER")
+    @patch("payroll.services.authoritative_primary_worker_memberships")
+    def test_a_household_without_one_primary_worker_fails_the_payroll_naming_it(self, memberships):
+        enrollments = MagicMock()
+        enrollments.values_list.return_value = [("one-worker", "group-1"), ("two-workers", "group-2")]
+        memberships.return_value.filter.return_value.values_list.return_value = [
+            ("group-1", "worker-1"), ("group-2", "worker-2"), ("group-2", "worker-3"),
+        ]
+
+        with self.assertRaisesMessage(ValidationError, "Households without one: two-workers."):
+            PayrollService(SimpleNamespace(id="user-id"))._assign_group_benefits_to_primary_recipients(
+                SimpleNamespace(id="payroll-id"), enrollments,
+            )
 
     @patch("payroll.services.BenefitConsumption.objects.filter")
     def test_reconciliation_export_uses_saved_payroll_benefits(self, benefit_filter):

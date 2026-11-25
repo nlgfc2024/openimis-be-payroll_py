@@ -9,7 +9,7 @@ from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError
 from django.db import transaction
 from simple_history.utils import bulk_create_with_history
-from django.db.models import Count, Q, Sum
+from django.db.models import Count, Exists, OuterRef, Q, Sum
 from django.utils import timezone
 from django.utils.translation import gettext as _
 
@@ -24,6 +24,7 @@ from invoice.services import PaymentInvoiceService
 from individual.data_source import KYC_PAYMENT_DETAILS_FIELDS
 from payment_cycle.models import PaymentCycle
 from payroll.apps import (
+    GROUP_BENEFIT_PAYEE_PRIMARY_WORKER,
     LEGACY_KYC_PAYMENT_DETAILS_FIELD_MAPPING,
     PayrollConfig,
     KYC_PAYMENT_DETAILS_FIELD_MAPPING,
@@ -63,12 +64,37 @@ from payroll.validation import PaymentPointValidation, PayrollValidation, Benefi
 from calculation.services import get_calculation_object
 from core.services.utils import output_exception, check_authentication
 from contribution_plan.models import PaymentPlan
+from individual.primary_recipients import authoritative_primary_worker_memberships
 from social_protection.models import Beneficiary, BeneficiaryStatus
 from tasks_management.apps import TasksManagementConfig
 from tasks_management.models import Task
 from tasks_management.services import TaskService, _get_std_task_data_payload
 
 logger = logging.getLogger(__name__)
+
+RECONCILIATION_EXPORT_FIELD_MAPPING = {
+    "payrollbenefitconsumption__payroll__name": "Payroll Name",
+    "payrollbenefitconsumption__payroll__status": "Payroll Status",
+    "individual__location__parent__parent__parent__name": "District Name",
+    "individual__json_ext__form_number": "Form Number",
+    "individual__json_ext__household_mobile_number": "Phone Number",
+    "individual__first_name": "First Name",
+    "individual__last_name": "Last Name",
+    "individual__json_ext__national_id": "National ID",
+    "json_ext__kyc_payment_details__gender": "Gender",
+    "json_ext__kyc_payment_details__account_number": "Account Number",
+    "json_ext__kyc_payment_details__account_name": "Account Name",
+    "json_ext__kyc_payment_details__bank": "Bank",
+    "code": "Code",
+    "status": "Status",
+    "amount": "Amount",
+    "type": "Type",
+}
+RECONCILIATION_PAID_COLUMN = "Paid"
+RECONCILIATION_REVIEW_COLUMNS = {
+    "Validation Status",
+    "Mismatch Reasons",
+}
 
 
 class WithdrawalFeeConfigService:
@@ -361,14 +387,16 @@ class PayrollService(BaseService):
                         )
                         if selected_projects and not enrollments_queryset.exists():
                             raise ValidationError(
-                                "No active household beneficiaries are assigned to the selected completed "
-                                "project. Ensure the household assignments were saved before creating the payroll."
+                                "No active household beneficiaries are assigned to the selected project, "
+                                "or the project is a work project that is not completed yet. Ensure the "
+                                "household assignments were saved before creating the payroll."
                             )
                         # The timesheet GROUP strategy creates one benefit per group
                         # enrollment. Passing the explicit enrollment queryset is
                         # essential: it limits the run to the chosen project instead
                         # of allowing the strategy to calculate every completed
                         # project in the benefit plan.
+                        expected_workers = self._lock_primary_workers(enrollments_queryset)
                         self._generate_benefits(
                             payment_plan,
                             date_valid_from,
@@ -378,7 +406,7 @@ class PayrollService(BaseService):
                             enrollments_queryset=enrollments_queryset,
                         )
                         self._assign_group_benefits_to_primary_recipients(
-                            payroll, enrollments_queryset
+                            payroll, enrollments_queryset, expected_workers
                         )
                     else:
                         beneficiaries_queryset = self._select_beneficiary_based_on_criteria(
@@ -881,27 +909,55 @@ class PayrollService(BaseService):
     def _is_group_payment_plan(payment_plan):
         return payment_plan.benefit_plan.type == "GROUP"
 
+    @staticmethod
+    def _pays_group_benefits_to_primary_workers():
+        return PayrollConfig.group_benefit_payee == GROUP_BENEFIT_PAYEE_PRIMARY_WORKER
+
+    @staticmethod
+    def _payable_project_filter(enrollment_model):
+        """WORK projects are paid once COMPLETED. A training is paid whatever its
+        status: its calculation rule decides which status counts."""
+        payable = Q(project__status="COMPLETED")
+        project_model = enrollment_model._meta.get_field("project").related_model
+        if any(field.name == "project_type" for field in project_model._meta.get_fields()):
+            payable |= Q(project__project_type="TRAINING")
+        return payable
+
+    @staticmethod
+    def _households_with_one_primary_worker():
+        """Group IDs whose verified household has exactly one primary worker, as
+        resolved for enrolment and KYC."""
+        return authoritative_primary_worker_memberships().values("group_id").annotate(
+            workers=Count("id"),
+        ).filter(workers=1).values("group_id")
+
     def _select_group_enrollments_based_on_criteria(self, obj_data, payment_plan):
         """Return the eligible household enrollments for a GROUP payroll.
 
-        A household is paid once, through its primary recipient, so the unit of
-        selection must be ``GroupBeneficiaryProjectEnrollment`` rather than the
-        individual ``Beneficiary`` model used by individual benefit plans.
+        A household is paid once, through its payee (``group_benefit_payee``), so
+        the unit of selection must be ``GroupBeneficiaryProjectEnrollment`` rather
+        than the individual ``Beneficiary`` model used by individual benefit plans.
         """
         enrollment_model = apps.get_model(
             "project_social_protection", "GroupBeneficiaryProjectEnrollment"
         )
         json_ext = obj_data.get("json_ext", {})
         filter_criteria = json_ext.get("filter_criteria", {})
+        if self._pays_group_benefits_to_primary_workers():
+            payee_filter = {"group_beneficiary__group_id__in": self._households_with_one_primary_worker()}
+        else:
+            payee_filter = {
+                "group_beneficiary__group__groupindividuals__recipient_type": "PRIMARY",
+                "group_beneficiary__group__groupindividuals__is_deleted": False,
+            }
         enrollments_queryset = enrollment_model.objects.filter(
+            self._payable_project_filter(enrollment_model),
             group_beneficiary__benefit_plan_id=payment_plan.benefit_plan.id,
             group_beneficiary__status=BeneficiaryStatus.ACTIVE,
             group_beneficiary__is_deleted=False,
-            group_beneficiary__group__groupindividuals__recipient_type="PRIMARY",
-            group_beneficiary__group__groupindividuals__is_deleted=False,
-            project__status="COMPLETED",
             project__is_deleted=False,
             is_deleted=False,
+            **payee_filter,
         )
 
         project_ids = filter_criteria.get("project_ids", [])
@@ -930,9 +986,22 @@ class PayrollService(BaseService):
 
         filter_criteria = json_ext.get("filter_criteria", {})
 
+        # A household member is paid only as its PRIMARY recipient, never as one
+        # of several members. An individual who belongs to no household (an
+        # INDIVIDUAL programme such as UMEP enrols only those) is paid directly.
+        group_individual_model = apps.get_model("individual", "GroupIndividual")
+        is_primary_recipient = Exists(group_individual_model.objects.filter(
+            individual_id=OuterRef("individual_id"),
+            recipient_type="PRIMARY",
+            is_deleted=False,
+        ))
+        belongs_to_a_household = Exists(group_individual_model.objects.filter(
+            individual_id=OuterRef("individual_id"),
+            is_deleted=False,
+            group__is_deleted=False,
+        ))
         beneficiaries_queryset = beneficiaries_queryset.filter(
-            individual__groupindividuals__recipient_type="PRIMARY",
-            individual__groupindividuals__is_deleted=False,
+            is_primary_recipient | ~belongs_to_a_household
         )
 
         project_ids = filter_criteria.get("project_ids", [])
@@ -1018,24 +1087,79 @@ class PayrollService(BaseService):
             benefit.json_ext = benefit_json_ext
             benefit.save(user=self.user)
 
-    def _assign_group_benefits_to_primary_recipients(self, payroll, enrollments_queryset):
-        """Make each generated household benefit payable to its PRIMARY member."""
-        group_individual_model = apps.get_model("individual", "GroupIndividual")
+    def _lock_primary_workers(self, enrollments_queryset):
+        """Lock the selected households and their members until the payroll is saved,
+        and return each household's primary worker as the calculation will see it.
+
+        Only when benefits are paid to primary workers. The calculation rule and the
+        assignment each look the worker up; the locks stop a member being changed or
+        removed in between, and the assignment compares its lookup with this one to
+        catch a member added in between. Returns None otherwise.
+        """
+        if not self._pays_group_benefits_to_primary_workers():
+            return None
         group_ids_by_beneficiary = dict(
             enrollments_queryset.values_list("group_beneficiary_id", "group_beneficiary__group_id")
         )
-        primary_recipient_by_group = dict(
-            group_individual_model.objects.filter(
-                group_id__in=group_ids_by_beneficiary.values(),
-                recipient_type="PRIMARY",
-                is_deleted=False,
-            ).values_list("group_id", "individual_id")
+        group_ids = sorted(set(group_ids_by_beneficiary.values()), key=str)
+        group_model = apps.get_model("individual", "Group")
+        group_individual_model = apps.get_model("individual", "GroupIndividual")
+        individual_model = apps.get_model("individual", "Individual")
+        members = group_individual_model.objects.filter(group_id__in=group_ids)
+        # Locked in one order (households, memberships, people) to avoid deadlocks.
+        list(group_model.objects.select_for_update().filter(id__in=group_ids).order_by("id").values_list("id"))
+        list(members.select_for_update().order_by("id").values_list("id"))
+        list(individual_model.objects.select_for_update().filter(
+            id__in=members.values("individual_id")).order_by("id").values_list("id"))
+        return self._primary_worker_by_group(group_ids_by_beneficiary)
+
+    def _assign_group_benefits_to_primary_recipients(self, payroll, enrollments_queryset, expected_workers=None):
+        """Make each generated household benefit payable to its payee: the PRIMARY
+        member, or the primary worker when ``group_benefit_payee`` says so.
+
+        ``expected_workers`` is what _lock_primary_workers returned before the
+        calculation; a household whose worker differs now fails the payroll, so a
+        benefit never moves to another member than the one it was calculated for."""
+        group_ids_by_beneficiary = dict(
+            enrollments_queryset.values_list("group_beneficiary_id", "group_beneficiary__group_id")
         )
+        if self._pays_group_benefits_to_primary_workers():
+            primary_recipient_by_group = self._primary_worker_by_group(group_ids_by_beneficiary)
+            if expected_workers is not None:
+                changed = {
+                    group_id for group_id in group_ids_by_beneficiary.values()
+                    if primary_recipient_by_group.get(group_id) != expected_workers.get(group_id)
+                }
+                if changed:
+                    codes = apps.get_model("individual", "Group").objects.filter(
+                        id__in=changed).values_list("code", flat=True)
+                    raise ValidationError(
+                        "The primary worker of these households changed while the payroll was being "
+                        "calculated: %s. Create the payroll again." % ", ".join(sorted(map(str, codes)))
+                    )
+        else:
+            group_individual_model = apps.get_model("individual", "GroupIndividual")
+            primary_recipient_by_group = dict(
+                group_individual_model.objects.filter(
+                    group_id__in=group_ids_by_beneficiary.values(),
+                    recipient_type="PRIMARY",
+                    is_deleted=False,
+                ).values_list("group_id", "individual_id")
+            )
         primary_recipient_by_beneficiary = {
             str(group_beneficiary_id): primary_recipient_by_group.get(group_id)
             for group_beneficiary_id, group_id in group_ids_by_beneficiary.items()
         }
         if any(recipient_id is None for recipient_id in primary_recipient_by_beneficiary.values()):
+            if self._pays_group_benefits_to_primary_workers():
+                missing = sorted(
+                    beneficiary_id for beneficiary_id, recipient_id in primary_recipient_by_beneficiary.items()
+                    if recipient_id is None
+                )
+                raise ValidationError(
+                    "Every household selected for payroll must have exactly one verified "
+                    "primary worker. Households without one: %s." % ", ".join(missing)
+                )
             raise ValidationError(
                 "Every household selected for payroll must have a primary recipient."
             )
@@ -1064,6 +1188,17 @@ class PayrollService(BaseService):
             raise ValidationError(
                 "Unable to assign every household benefit to its primary recipient."
             )
+
+    @staticmethod
+    def _primary_worker_by_group(group_ids_by_beneficiary):
+        """The single verified primary worker of each household; a household with
+        none or several has no entry."""
+        workers = {}
+        for group_id, individual_id in authoritative_primary_worker_memberships().filter(
+                group_id__in=group_ids_by_beneficiary.values(),
+        ).values_list("group_id", "individual_id"):
+            workers.setdefault(group_id, set()).add(individual_id)
+        return {group_id: ids.pop() for group_id, ids in workers.items() if len(ids) == 1}
 
     @staticmethod
     def _enforce_beneficiary_scope(payroll, beneficiaries_queryset):
@@ -1188,6 +1323,10 @@ class CsvReconciliationService:
 
     @property
     def micro_catchment_column(self):
+        return self._micro_catchment_column()
+
+    @classmethod
+    def _micro_catchment_column(cls):
         # Existing deployments can have a persisted module configuration that
         # predates this setting, so retain the historical header until it is
         # explicitly configured.
@@ -1212,6 +1351,96 @@ class CsvReconciliationService:
         return f"Amount to pay (gross + fee) ({cls._currency_label()})"
 
     @classmethod
+    def _paid_column(cls):
+        return PayrollConfig.csv_reconciliation_paid_extra_field or RECONCILIATION_PAID_COLUMN
+
+    @classmethod
+    def _status_column(cls):
+        return PayrollConfig.csv_reconciliation_status_column or "Status"
+
+    @classmethod
+    def _reconciliation_export_field_mapping(cls):
+        """Map the fixed reconciliation fields to this instance's configured headers."""
+        configured_mapping = cls._reconciliation_field_mapping()
+        export_mapping = {}
+        for fixed_field, default_header in RECONCILIATION_EXPORT_FIELD_MAPPING.items():
+            # A legacy/configured field can own a standard header. For example,
+            # an installation may map ``individual__json_ext__sex`` to
+            # ``Gender``. In that case the KYC snapshot field is deliberately
+            # not added by _reconciliation_field_mapping(), but the export must
+            # still include the configured field that owns the Gender column.
+            field = fixed_field if fixed_field in configured_mapping else next(
+                (
+                    configured_field
+                    for configured_field, header in configured_mapping.items()
+                    if header == default_header
+                ),
+                None,
+            )
+            if field:
+                export_mapping[field] = configured_mapping[field]
+        return export_mapping
+
+    @classmethod
+    def _reconciliation_export_columns(cls):
+        field_mapping = cls._reconciliation_export_field_mapping()
+        columns = []
+
+        def add(header):
+            # A legacy mapping may intentionally use a default heading for a
+            # different field. Keep the first configured occurrence instead
+            # of emitting ambiguous duplicate CSV headers.
+            if header and header not in columns:
+                columns.append(header)
+
+        def configured_header(field):
+            header = field_mapping.get(field)
+            if header:
+                return header
+            # A configured legacy field may own the standard heading for this
+            # fixed field (for example, ``sex`` owns ``Gender``).
+            default_header = RECONCILIATION_EXPORT_FIELD_MAPPING.get(field)
+            if default_header:
+                return next(
+                    (
+                        configured_header
+                        for configured_header in field_mapping.values()
+                        if configured_header == default_header
+                    ),
+                    None,
+                )
+            return None
+
+        add("Source Payroll")
+        for field in (
+            "payrollbenefitconsumption__payroll__name",
+            "payrollbenefitconsumption__payroll__status",
+            "individual__location__parent__parent__parent__name",
+        ):
+            add(configured_header(field))
+        add(cls._micro_catchment_column())
+        for field in (
+            "individual__json_ext__form_number",
+            "individual__json_ext__household_mobile_number",
+            "individual__first_name",
+            "individual__last_name",
+            "individual__json_ext__national_id",
+            "json_ext__kyc_payment_details__gender",
+            "json_ext__kyc_payment_details__account_number",
+            "json_ext__kyc_payment_details__account_name",
+            "json_ext__kyc_payment_details__bank",
+            "code",
+        ):
+            add(configured_header(field))
+        add(cls._status_column())
+        add(configured_header("amount"))
+        add(cls._withdrawal_fee_header())
+        add(cls._amount_to_pay_header())
+        add(configured_header("type"))
+        add(cls._paid_column())
+        return columns
+
+    @classmethod
     def _reconciliation_field_mapping(cls):
         """Return configured fields, adding KYC fields for older installations."""
         field_mapping = dict(PayrollConfig.csv_reconciliation_field_mapping or {})
@@ -1230,9 +1459,16 @@ class CsvReconciliationService:
             if field not in mapped_fields and header not in mapped_headers:
                 mapped_fields[field] = header
                 mapped_headers.add(header)
+        # The exported file must always be accepted by the uploader.  Retain
+        # custom headings, but add defaults for omitted reconciliation fields.
+        for field, header in RECONCILIATION_EXPORT_FIELD_MAPPING.items():
+            if field not in mapped_fields and header not in mapped_headers:
+                mapped_fields[field] = header
+                mapped_headers.add(header)
         mapped_fields["withdrawal_fee"] = cls._withdrawal_fee_header()
         if not mapped_fields.get("type"):
             mapped_fields["type"] = "Type"
+        mapped_fields["status"] = cls._status_column()
         code_field = PayrollConfig.csv_reconciliation_code_column or "code"
         if code_field not in mapped_fields:
             mapped_fields[code_field] = "Code"
@@ -1250,26 +1486,9 @@ class CsvReconciliationService:
         payroll = self._resolve_payroll(payroll_id)
         ensure_payroll_is_not_consolidated_source(payroll, "download a reconciliation file for")
         bc_qs = self._get_benefit_consumption_qs(payroll)
-        # Module configuration is persisted by deployment. Merge the KYC
-        # fields at export time as well as defining them in DEFAULT_CONFIG so
-        # existing installations do not need a manual configuration migration.
-        field_mapping = self._reconciliation_field_mapping()
-        reference_headers = {
-            header.lower() for header in self._payment_reference_headers()
-        }
-        field_mapping = {
-            field: header
-            for field, header in field_mapping.items()
-            if (
-                field.rsplit("__", 1)[-1].lower() != "receipt"
-                and header.strip().lower() not in reference_headers
-            )
-        }
+        field_mapping = self._reconciliation_export_field_mapping()
         fee_header = self._withdrawal_fee_header()
         amount_to_pay_header = self._amount_to_pay_header()
-        field_mapping["withdrawal_fee"] = fee_header
-        if not field_mapping.get("type"):
-            field_mapping["type"] = "Type"
         records = list(bc_qs.values(*field_mapping.keys()))
         fee_preview_catalog = None
         benefits_by_code = {
@@ -1279,30 +1498,25 @@ class CsvReconciliationService:
             )
         }
 
-        extra_info_keys = set()
-        extra_info_dicts = []
-        hidden_reference_headers = self._payment_reference_headers()
-        mapped_headers = (
-            set(field_mapping)
-            | set(field_mapping.values())
-            | {self.micro_catchment_column, amount_to_pay_header}
-            | hidden_reference_headers
-        )
-        hidden_reference_headers_lower = {header.lower() for header in hidden_reference_headers}
         source_payroll_by_benefit = self._get_source_payrolls_by_benefit(payroll)
         project_micro_catchments = {}
         for record in records:
             benefit = benefits_by_code[record["code"]]
-            source_payroll = source_payroll_by_benefit.get(benefit.id, payroll)
-            if source_payroll.id not in project_micro_catchments:
-                project_micro_catchments[source_payroll.id] = self._get_payroll_micro_catchment(
-                    source_payroll
+            source_payroll = source_payroll_by_benefit.get(benefit.id)
+            payroll_for_context = source_payroll or payroll
+            record["Source Payroll"] = source_payroll.name if source_payroll else ""
+            record["payrollbenefitconsumption__payroll__name"] = payroll.name
+            record["payrollbenefitconsumption__payroll__status"] = payroll.status
+            if payroll_for_context.id not in project_micro_catchments:
+                project_micro_catchments[payroll_for_context.id] = self._get_payroll_micro_catchment(
+                    payroll_for_context
                 )
             # The payroll's project is the work location. A recipient may live
             # in a different catchment, but that must not make a one-project
             # payroll look as though it contains several project catchments.
-            record["micro_catchment"] = (
-                project_micro_catchments[source_payroll.id] or self._get_micro_catchment(benefit)
+            record[self.micro_catchment_column] = (
+                project_micro_catchments[payroll_for_context.id]
+                or self._get_micro_catchment(benefit)
             )
             if (
                 getattr(benefit, "withdrawal_fee", None) is None
@@ -1321,61 +1535,19 @@ class CsvReconciliationService:
                     fee_error,
                 )
             amount = getattr(benefit, "amount", None)
-            record["withdrawal_fee"] = withdrawal_fee
+            record[fee_header] = withdrawal_fee
             record[amount_to_pay_header] = (
                 amount + withdrawal_fee
                 if amount is not None and withdrawal_fee is not None
                 else None
             )
-            extra_info = benefit.json_ext.get("extra_info", {}) if benefit.json_ext else {}
-            extra_info_keys.update(
-                key for key in extra_info
-                if key not in mapped_headers and key.lower() not in hidden_reference_headers_lower
-            )
-            extra_info_dicts.append(extra_info)
-            if source_payroll_by_benefit:
-                record["Source Payroll"] = source_payroll.name
 
         df = pd.DataFrame.from_records(records)
-        df[PayrollConfig.csv_reconciliation_paid_extra_field] = df.apply(
+        df.rename(columns=field_mapping, inplace=True)
+        df[self._paid_column()] = df.apply(
             lambda row: self._fill_paid_column(row), axis=1
         )
-        df.rename(
-            columns={**field_mapping, "micro_catchment": self.micro_catchment_column},
-            inplace=True,
-        )
-        export_columns = [
-            header
-            for field, header in field_mapping.items()
-            if field not in {"withdrawal_fee", "type"}
-        ]
-        amount_header = field_mapping.get("amount")
-        fee_insert_index = (
-            export_columns.index(amount_header) + 1
-            if amount_header in export_columns
-            else len(export_columns)
-        )
-        export_columns[fee_insert_index:fee_insert_index] = [
-            fee_header,
-            amount_to_pay_header,
-            field_mapping["type"],
-        ]
-        if source_payroll_by_benefit:
-            export_columns.insert(0, "Source Payroll")
-        if self.micro_catchment_column not in export_columns:
-            try:
-                export_columns.insert(
-                    export_columns.index("District Name") + 1,
-                    self.micro_catchment_column,
-                )
-            except ValueError:
-                export_columns.append(self.micro_catchment_column)
-        if PayrollConfig.csv_reconciliation_paid_extra_field not in export_columns:
-            export_columns.append(PayrollConfig.csv_reconciliation_paid_extra_field)
-        for key in extra_info_keys:
-            df[key] = [extra_info.get(key) for extra_info in extra_info_dicts]
-            export_columns.append(key)
-        df = df.reindex(columns=export_columns)
+        df = df.reindex(columns=self._reconciliation_export_columns())
 
         in_memory_file = BytesIO()
         df.to_csv(in_memory_file, index=False)
@@ -1437,6 +1609,7 @@ class CsvReconciliationService:
         # Serialise uploads for a payroll.  This makes superseding a pending
         # review deterministic even when corrected files arrive concurrently.
         payroll = Payroll.objects.select_for_update().get(id=payroll.id)
+        self._ensure_payroll_ready_for_reconciliation(payroll)
         ensure_payroll_is_not_consolidated_source(payroll, "upload reconciliation for")
         if not file:
             raise ValueError(_("csv_reconciliation.validation.file_required"))
@@ -1481,11 +1654,9 @@ class CsvReconciliationService:
             inplace=True,
         )
         code_column = PayrollConfig.csv_reconciliation_code_column
-        national_id_column = next(
-            (field for field, header in field_mapping.items()
-             if header == "National ID"),
-            None,
-        )
+        # Columns are renamed to their field keys above, so this must not rely
+        # on the default display heading (which deployments may customize).
+        national_id_column = "individual__json_ext__national_id"
         codes = df[code_column].map(self._clean_value)
         national_ids = (
             df[national_id_column].map(self._clean_value)
@@ -1544,7 +1715,7 @@ class CsvReconciliationService:
             else:
                 valid_indexes.append(index)
 
-        paid_column = PayrollConfig.csv_reconciliation_paid_extra_field
+        paid_column = self._paid_column()
         valid_rows = df.loc[valid_indexes]
         upload.total_records = len(df)
         upload.unmatched_records = len(errors)
@@ -1801,6 +1972,7 @@ class CsvReconciliationService:
         upload = CsvReconciliationUpload.objects.select_for_update().get(id=upload.id)
         if upload.status != CsvReconciliationUpload.Status.WAITING_FOR_VERIFICATION:
             return
+        self._ensure_payroll_ready_for_reconciliation(payroll)
         if upload.unmatched_records:
             raise ValidationError(
                 "A reconciliation upload with blocking validation errors cannot be applied."
@@ -1830,9 +2002,10 @@ class CsvReconciliationService:
                 raise ValidationError(
                     "A reconciliation upload contains benefits no longer linked to its consolidated payroll."
                 )
+        paid_column = self._paid_column()
         paid_rows = [
             row for row in rows
-            if self._clean_value(row.submitted_data.get(PayrollConfig.csv_reconciliation_paid_extra_field))
+            if self._clean_value(row.submitted_data.get(paid_column))
             == PayrollConfig.csv_reconciliation_paid_yes
         ]
         locked_benefits = {
@@ -1846,7 +2019,7 @@ class CsvReconciliationService:
         reconciliation_fields = (
             set(field_mapping)
             | set(field_mapping.values())
-            | {self._amount_to_pay_header()}
+            | set(self._reconciliation_export_columns())
         )
         for row in paid_rows:
             benefit = locked_benefits.get(row.benefit_id)
@@ -1874,8 +2047,16 @@ class CsvReconciliationService:
         reconcile_consolidated_sources(payroll, self.user)
         return upload
 
+    @staticmethod
+    def _ensure_payroll_ready_for_reconciliation(payroll):
+        """Reconciliation is only valid once payment has been approved."""
+        if payroll.status != PayrollStatus.APPROVE_FOR_PAYMENT:
+            raise ValidationError(
+                "A payroll must be approved for payment before reconciliation."
+            )
+
     def download_upload_review(self, upload, contents):
-        """Return the original CSV annotated with its saved validation result."""
+        """Return the uploaded CSV with review outcomes and no payment references."""
         get_authorized_payroll(self.user, upload.payroll_id)
         try:
             df = pd.read_csv(BytesIO(contents), dtype=str, keep_default_na=False)
@@ -1893,37 +2074,24 @@ class CsvReconciliationService:
             inplace=True,
             errors="ignore",
         )
-
-        row_results = {
-            row.row_number: row
-            for row in ReconciliationUploadRow.objects.filter(upload=upload, is_deleted=False)
-        }
-        validation_status = []
-        mismatch_reasons = []
-        matched_records = []
-        paid_records = []
-        unpaid_records = []
-        unmatched_records = []
-        paid_column = PayrollConfig.csv_reconciliation_paid_extra_field
-
-        for index, row in df.iterrows():
-            result = row_results.get(index + 2)
-            reasons = result.mismatch_reasons if result else []
-            is_valid = result and result.status == ReconciliationUploadRow.Status.VALID
-            paid_value = self._clean_value(row.get(paid_column))
-            validation_status.append(result.status if result else "NOT_VALIDATED")
-            mismatch_reasons.append("; ".join(reasons) if reasons else "")
-            matched_records.append("Yes" if is_valid else "")
-            paid_records.append("Yes" if is_valid and paid_value == PayrollConfig.csv_reconciliation_paid_yes else "")
-            unpaid_records.append("Yes" if is_valid and paid_value == PayrollConfig.csv_reconciliation_paid_no else "")
-            unmatched_records.append("Yes" if result and not is_valid else "")
-
-        df["Validation Status"] = validation_status
-        df["Mismatch Reasons"] = mismatch_reasons
-        df["Matched Record"] = matched_records
-        df["Paid Record"] = paid_records
-        df["Unpaid Record"] = unpaid_records
-        df["Unmatched Record"] = unmatched_records
+        audit_by_row = {}
+        upload_id = getattr(upload, "id", None)
+        if upload_id:
+            audit_by_row = {
+                row_number: (status, mismatch_reasons)
+                for row_number, status, mismatch_reasons in ReconciliationUploadRow.objects.filter(
+                    upload_id=upload_id,
+                    is_deleted=False,
+                ).values_list("row_number", "status", "mismatch_reasons")
+            }
+        df["Validation Status"] = [
+            audit_by_row.get(index + 2, ("NOT_VALIDATED", []))[0]
+            for index in df.index
+        ]
+        df["Mismatch Reasons"] = [
+            "; ".join(audit_by_row.get(index + 2, ("NOT_VALIDATED", []))[1] or [])
+            for index in df.index
+        ]
         review_file = BytesIO()
         df.to_csv(review_file, index=False)
         review_file.seek(0)
@@ -1977,7 +2145,7 @@ class CsvReconciliationService:
                 row.get(self.micro_catchment_column), context.get("micro_catchment")):
             reasons.append("micro_catchment_mismatch")
 
-        paid = self._clean_value(row.get(PayrollConfig.csv_reconciliation_paid_extra_field))
+        paid = self._clean_value(row.get(self._paid_column()))
         if paid not in [PayrollConfig.csv_reconciliation_paid_yes, PayrollConfig.csv_reconciliation_paid_no]:
             reasons.append("invalid_paid_value")
         return benefit, reasons
@@ -2070,23 +2238,29 @@ class CsvReconciliationService:
             raise ValueError(_("Import file is empty"))
         if PayrollConfig.csv_reconciliation_errors_column in df.columns:
             raise ValueError(_("Column errors in csv."))
-        kyc_fields = (
-            set(KYC_PAYMENT_DETAILS_FIELD_MAPPING)
-            | set(LEGACY_KYC_PAYMENT_DETAILS_FIELD_MAPPING)
-        )
-        kyc_headers = set(KYC_PAYMENT_DETAILS_FIELD_MAPPING.values())
+        field_mapping = self._reconciliation_field_mapping()
+        # Require the fields needed for identity and payment validation even
+        # when a saved configuration uses alternate headings. This prevents a
+        # minimal Code/Paid file from bypassing the comparison checks.
+        validation_fields = {
+            "payrollbenefitconsumption__payroll__name",
+            "payrollbenefitconsumption__payroll__status",
+            "individual__first_name",
+            "individual__last_name",
+            "individual__json_ext__national_id",
+            "code",
+            "status",
+            "amount",
+            "type",
+        }
         required_columns = {
-            header
-            for field, header in (PayrollConfig.csv_reconciliation_field_mapping or {}).items()
-            if (
-                field not in kyc_fields
-                and header not in kyc_headers
-                and field.rsplit("__", 1)[-1].lower() != "receipt"
-                and header.strip().lower() not in {
-                    item.lower() for item in self._payment_reference_headers()
-                }
-            )
-        } | {PayrollConfig.csv_reconciliation_paid_extra_field}
+            field_mapping[field]
+            for field in validation_fields
+            if field in field_mapping
+        } | {self._paid_column()}
+        # A missing micro-catchment would silently skip the row-level
+        # comparison, so it is required for every reconciliation upload.
+        required_columns.add(self._micro_catchment_column())
         missing_columns = required_columns - set(df.columns)
         if missing_columns:
             raise ValueError(
@@ -2094,13 +2268,16 @@ class CsvReconciliationService:
                     "columns": ", ".join(sorted(missing_columns)),
                 }
             )
-        if 'Status' in df.columns:
-            if (df[PayrollConfig.csv_reconciliation_status_column] == BenefitConsumptionStatus.RECONCILED).all():
+        status_column = self._status_column()
+        if status_column in df.columns:
+            if (df[status_column] == BenefitConsumptionStatus.RECONCILED).all():
                 raise ValueError(_("All of the Benefit Consumptions have been already reconciled."))
 
     def _fill_paid_column(self, row):
-        if (PayrollConfig.csv_reconciliation_status_column in row
-                and row[PayrollConfig.csv_reconciliation_status_column] == BenefitConsumptionStatus.RECONCILED):
+        if (
+            self._status_column() in row
+            and row[self._status_column()] == BenefitConsumptionStatus.RECONCILED
+        ):
             return PayrollConfig.csv_reconciliation_paid_yes
         else:
             return None
@@ -2120,11 +2297,12 @@ class CsvReconciliationService:
             reconciliation_fields = (
                 set(field_mapping)
                 | set(field_mapping.values())
-                | {self._amount_to_pay_header()}
+                | set(self._reconciliation_export_columns())
             )
         extra_info = {
             k: row[k] for k in row.index
             if k not in reconciliation_fields
+            and k not in RECONCILIATION_REVIEW_COLUMNS
             and k != self.micro_catchment_column
             and not pd.isna(row[k])
         }
